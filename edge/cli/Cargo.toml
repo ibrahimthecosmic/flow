@@ -1,0 +1,23 @@
+[package]
+name = "flow"
+version = "0.1.0"
+edition = "2021"
+description = "flow — a drop-in Deno binary with the edge-runtime layer (eszip tooling + hardened user workers)"
+
+[[bin]]
+name = "flow"
+path = "src/main.rs"
+
+[dependencies]
+base.workspace = true
+deno.workspace = true
+deno_facade.workspace = true
+ext_workers.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+color-print.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+
+env_logger = "=0.10.0"

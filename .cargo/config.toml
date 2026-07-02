@@ -27,6 +27,10 @@ rustflags = [
 # ld64.lld bumped to LLD 20 (LLD 17 segfaults on -fixup_chains; see tools/util.js).
 [env]
 MACOSX_DEPLOYMENT_TARGET = "12.0"
+# Consume the flow rusty_v8 fork's prebuilt static lib + src_binding (adds the
+# V8 Locker binding for multi-isolate support) instead of building V8 from
+# source. Paired with `[patch.crates-io] v8 = { path = "../rusty_v8" }`.
+RUSTY_V8_MIRROR = "https://github.com/ibrahimthecosmic/rusty_v8/releases/download"
 
 [target.x86_64-apple-darwin]
 rustflags = [

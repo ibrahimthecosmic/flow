@@ -138,13 +138,12 @@ impl<TSys: DiskCacheSys> DiskCache<TSys> {
 mod tests {
   #[allow(clippy::disallowed_types, reason = "ok in tests")]
   use sys_traits::impls::RealSys;
-  use test_util::TempDir;
 
   use super::*;
 
   #[test]
   fn test_set_get_cache_file() {
-    let temp_dir = TempDir::new();
+    let temp_dir = tempfile::TempDir::new().unwrap();
     let sub_dir = temp_dir.path().join("sub_dir");
     let cache = DiskCache::new(RealSys, sub_dir.to_path_buf());
     let path = PathBuf::from("foo/bar.txt");

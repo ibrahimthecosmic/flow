@@ -897,6 +897,10 @@ function structuredClone(value, options) {
 }
 
 return {
+  // flow: wrap an existing MessagePort resource id into a `MessagePort` JS
+  // object. Used to surface the cross-isolate main<->user-worker ports created
+  // in Rust (edge user workers) on both sides.
+  createMessagePort,
   deserializeJsMessageData,
   markAsUncloneable,
   markNotSerializable,

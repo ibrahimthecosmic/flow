@@ -1,0 +1,184 @@
+import { core, primordials } from "ext:core/mod.js";
+
+import { MAIN_WORKER_API, USER_WORKER_API } from "ext:ai/ai.js";
+import { FLOW_USER_WORKERS } from "ext:user_workers/user_workers.js";
+import { applyFlowTag } from "ext:runtime/http.js";
+import { waitUntil } from "ext:runtime/async_hook.js";
+const {
+  builtinTracer,
+  enterSpan,
+  METRICS_ENABLED,
+  TRACING_ENABLED,
+} = core.loadExtScript("ext:deno_telemetry/telemetry.ts");
+import { exit as osExit } from "ext:os/exit.js";
+
+const ops = core.ops;
+const { ObjectDefineProperty } = primordials;
+
+let trexMod;
+function loadTrex() {
+  if (trexMod === undefined) {
+    try {
+      trexMod = ops.op_lazy_load_esm("ext:trex/trex_lib.js");
+    } catch {
+      trexMod = null;
+    }
+  }
+  return trexMod;
+}
+
+/**
+ * @param {"user" | "main" | "event"} kind
+ * @param {number} terminationRequestTokenRid
+ */
+function installTrexNamespace(kind, terminationRequestTokenRid) {
+  /** TREX */
+
+  const mod = loadTrex();
+
+  let propsTrex = {
+    scheduleTermination: () =>
+      ops.op_cancel_drop_token(terminationRequestTokenRid),
+  };
+
+  switch (kind) {
+    case "main":
+      propsTrex = {
+        ai: MAIN_WORKER_API,
+        userWorkers: FLOW_USER_WORKERS,
+        getRuntimeMetrics: () => /* async */ ops.op_runtime_metrics(),
+        applyFlowTag: (src, dest) => applyFlowTag(src, dest),
+        systemMemoryInfo: () => ops.op_system_memory_info(),
+        raiseSegfault: () => ops.op_raise_segfault(),
+        ...(mod
+          ? {
+            PluginManager: mod.PluginManager,
+            DatabaseManager: mod.DatabaseManager,
+            userDatabaseManager: () => {
+              return new mod.UserDatabaseManager(FLOW_USER_WORKERS);
+            },
+            TrexDB: mod.TrexDB,
+            req: mod.req,
+            createRequestListener: mod.createRequestListener,
+            httpClient: (service) => {
+              return new mod.TrexHttpClient(service);
+            },
+          }
+          : {}),
+        exit: (c) => osExit(c),
+        ...propsTrex,
+      };
+      break;
+
+    case "event":
+      propsTrex = {
+        ...propsTrex,
+      };
+      break;
+
+    case "user":
+      propsTrex = {
+        waitUntil,
+        ...(mod
+          ? {
+            req: mod.req,
+            httpClient: (service) => {
+              return new mod.TrexHttpClient(service);
+            },
+            tokioChannel: (service) => {
+              return new mod.TrexHttpClient(service);
+            },
+            databaseManager: () => {
+              return new mod.UserDatabaseManager(FLOW_USER_WORKERS);
+            },
+          }
+          : {}),
+      };
+      break;
+  }
+
+  if (propsTrex === void 0) {
+    return;
+  }
+
+  ObjectDefineProperty(globalThis, "Trex", {
+    get() {
+      return propsTrex;
+    },
+    configurable: true,
+  });
+}
+
+/*
+ * @param {"user" | "main" | "event"} kind
+ * @param {number} terminationRequestTokenRid
+ */
+function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
+  let props = {
+    scheduleTermination: () =>
+      ops.op_cancel_drop_token(terminationRequestTokenRid),
+  };
+
+  switch (kind) {
+    case "main":
+      props = {
+        ai: MAIN_WORKER_API,
+        userWorkers: FLOW_USER_WORKERS,
+        getRuntimeMetrics: () => /* async */ ops.op_runtime_metrics(),
+        applyFlowTag: (src, dest) => applyFlowTag(src, dest),
+        systemMemoryInfo: () => ops.op_system_memory_info(),
+        raiseSegfault: () => ops.op_raise_segfault(),
+        ...props,
+      };
+      break;
+
+    case "event":
+      props = {
+        builtinTracer,
+        enterSpan,
+        METRICS_ENABLED,
+        TRACING_ENABLED,
+        ...props,
+      };
+      break;
+
+    case "user":
+      props = {
+        waitUntil,
+      };
+      break;
+  }
+
+  if (props === void 0) {
+    return;
+  }
+
+  ObjectDefineProperty(globalThis, "EdgeRuntime", {
+    get() {
+      return props;
+    },
+    configurable: true,
+  });
+}
+
+/**
+ * @param {"user" | "main" | "event"} _kind
+ */
+function installFlowNamespace(_kind) {
+  const props = {
+    ai: USER_WORKER_API,
+  };
+
+  ObjectDefineProperty(globalThis, "Flow", {
+    get() {
+      return props;
+    },
+    configurable: true,
+  });
+}
+
+export {
+  installEdgeRuntimeNamespace,
+  installFlowNamespace,
+  installTrexNamespace,
+};

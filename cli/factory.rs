@@ -1253,7 +1253,13 @@ impl CliFactory {
       // This optimization is only available for "run" subcommand
       // because we need to register new ops for testing and jupyter
       // integration.
-      skip_op_registration: cli_options.sub_command().is_run(),
+      //
+      // flow: also disabled when additive main-worker extensions are
+      // registered — their ops are not in the CLI snapshot, so they must be
+      // registered at startup (skipping would leave `Deno.core.ops` without
+      // them). No-op for plain Deno.
+      skip_op_registration: cli_options.sub_command().is_run()
+        && !crate::embed::has_main_worker_extensions(),
       log_level: cli_options.log_level().unwrap_or(log::Level::Info).into(),
       enable_testing_features: cli_options.enable_testing_features(),
       has_node_modules_dir: workspace_factory
@@ -1285,6 +1291,14 @@ impl CliFactory {
       serve_host: cli_options.serve_host(),
       otel_config: cli_options.otel_config(),
       no_legacy_abort: cli_options.no_legacy_abort(),
+      // NOTE(flow): the CLI snapshot is used as-is even when flow's additive
+      // ops-only extensions are registered. Since `skip_op_registration` is
+      // disabled above in that case, boot rebinds ALL ops — including the
+      // flow ops — onto the `core.ops` object, which is how flow's
+      // post-bootstrap JS reaches them (the snapshot-baked `ext:core/ops`
+      // module export list is frozen, so runtime-added ops are NOT importable
+      // from it — the same limitation upstream's 40_test.js works around via
+      // `core.ops`).
       startup_snapshot: deno_snapshots::CLI_SNAPSHOT,
       residual_lazy_js_sources: deno_snapshots::RESIDUAL_LAZY_JS,
       residual_lazy_esm_sources: deno_snapshots::RESIDUAL_LAZY_ESM,

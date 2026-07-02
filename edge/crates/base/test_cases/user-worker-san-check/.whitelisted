@@ -1,0 +1,11 @@
+mkdirSync
+readDirSync
+removeSync
+lstatSync
+statSync
+writeFileSync
+writeTextFileSync
+readTextFileSync
+readFileSync
+makeTempDirSync
+makeTempFileSync

@@ -1,0 +1,3932 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::future::Future;
+use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::task::Poll;
+use std::time::Duration;
+
+use anyhow::Context;
+use anyhow::Error;
+use anyhow::anyhow;
+use anyhow::bail;
+use arc_swap::ArcSwapOption;
+use base_mem_check::MemCheckState;
+use base_mem_check::WorkerHeapStatistics;
+use base_rt::BlockingScopeCPUUsage;
+use base_rt::DenoRuntimeDropToken;
+use base_rt::DropToken;
+use base_rt::RuntimeOtelExtraAttributes;
+use base_rt::RuntimeState;
+use base_rt::RuntimeWaker;
+use base_rt::get_current_cpu_time_ns;
+use cooked_waker::IntoWaker;
+use cooked_waker::WakeRef;
+use cpu_timer::CPUTimer;
+use deno::args::CacheSetting;
+use deno::args::TypeCheckMode;
+use deno::deno_crypto;
+use deno::deno_fetch;
+use deno::deno_fs;
+use deno::deno_http;
+use deno::deno_io;
+use deno::deno_net;
+use deno::deno_telemetry;
+use deno::deno_telemetry::OtelConfig;
+use deno::deno_tls;
+use deno::deno_web;
+use deno::deno_webidl;
+use deno::deno_websocket;
+use deno_core::JsRuntime;
+use deno_core::ModuleId;
+use deno_core::ModuleLoader;
+use deno_core::ModuleSpecifier;
+use deno_core::OpState;
+use deno_core::PollEventLoopOptions;
+use deno_core::ResolutionKind;
+use deno_core::RuntimeOptions;
+use deno_core::error::AnyError;
+use deno_core::error::JsError;
+use deno_core::serde_json;
+use deno_core::url::Url;
+use deno_core::v8;
+use deno_core::v8::GCCallbackFlags;
+use deno_core::v8::GCType;
+use deno_core::v8::Isolate;
+use deno_core::v8::Locker;
+use deno_facade::DenoOptionsBuilder;
+use deno_facade::EmitterFactory;
+use deno_facade::EszipPayloadKind;
+use deno_facade::Metadata;
+use deno_facade::cert_provider::get_root_cert_store_provider;
+use deno_facade::generate_binary_eszip;
+use deno_facade::metadata::Entrypoint;
+use deno_facade::migrate::MigrateOptions;
+use deno_facade::module_loader::RuntimeProviders;
+use deno_facade::module_loader::standalone::create_module_loader_for_standalone_from_eszip_kind;
+use deno_resolver::npm;
+use ext_event_worker::events::WorkerEventWithMetadata;
+use ext_runtime::MemCheckWaker;
+use ext_runtime::PromiseMetrics;
+use ext_runtime::WasmMemoryTracker;
+use ext_runtime::external_memory::CustomAllocator;
+use ext_workers::context::UserWorkerMsgs;
+use ext_workers::context::WorkerContextInitOpts;
+use ext_workers::context::WorkerKind;
+use ext_workers::context::WorkerRuntimeOpts;
+use fs::VfsSys;
+use fs::deno_compile_fs::DenoCompileFileSystem;
+use fs::prefix_fs::PrefixFs;
+use fs::s3_fs::S3Fs;
+use fs::static_fs::StaticFs;
+use fs::tmp_fs::TmpFs;
+use futures_util::FutureExt;
+use futures_util::future::poll_fn;
+use futures_util::task::AtomicWaker;
+use log::error;
+use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
+use permissions::get_default_permissions;
+use scopeguard::ScopeGuard;
+use serde::Serialize;
+use strum::IntoStaticStr;
+use tokio::sync::mpsc;
+use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
+use tracing::Span;
+use tracing::debug;
+use tracing::instrument;
+use tracing::trace;
+
+use crate::inspector_server::Inspector;
+use crate::snapshot;
+use crate::utils::json;
+use crate::utils::units::bytes_to_display;
+use crate::utils::units::mib_to_bytes;
+use crate::utils::units::percentage_value;
+
+/// Debug state for tracking V8 isolate lock ownership without calling back into V8.
+#[allow(
+  dead_code,
+  reason = "locker debugging helper; only referenced when diagnosing isolate lock issues"
+)]
+#[derive(Debug, Default)]
+struct LockDebugState {
+  depth: u32,
+  ever_locked: bool,
+}
+
+thread_local! {
+  static LOCK_DEBUG_STATES: RefCell<HashMap<usize, LockDebugState>> =
+    RefCell::new(HashMap::new());
+}
+
+#[inline]
+fn isolate_debug_key(isolate: &v8::Isolate) -> usize {
+  isolate as *const v8::Isolate as usize
+}
+
+#[allow(
+  dead_code,
+  reason = "locker debugging helper; only referenced when diagnosing isolate lock issues"
+)]
+#[inline]
+fn log_locker_event(isolate_key: usize, stage: &'static str, depth: u32) {
+  debug!(
+    target = "edge::runtime::locker",
+    stage,
+    isolate = format_args!("{isolate_key:#x}"),
+    thread = ?std::thread::current().id(),
+    depth,
+  );
+}
+use crate::worker::DuplexStreamEntry;
+use crate::worker::Worker;
+use crate::worker::supervisor::CPUUsage;
+use crate::worker::supervisor::CPUUsageMetrics;
+use crate::worker::supervisor::as_interrupt_callback;
+
+mod ops;
+mod unsync;
+
+pub mod permissions;
+pub mod thread_utils;
+
+const DEFAULT_ALLOC_CHECK_INT_MSEC: u64 = 1000;
+
+static ALLOC_CHECK_DUR: Lazy<Duration> = Lazy::new(|| {
+  std::env::var("EDGE_RUNTIME_ALLOC_CHECK_INT")
+    .ok()
+    .and_then(|it| it.parse::<u64>().ok().map(Duration::from_millis))
+    .unwrap_or_else(|| Duration::from_millis(DEFAULT_ALLOC_CHECK_INT_MSEC))
+});
+
+// Following static variables are initialized in the cli crate.
+
+pub static SHOULD_DISABLE_DEPRECATED_API_WARNING: OnceCell<bool> =
+  OnceCell::new();
+pub static SHOULD_USE_VERBOSE_DEPRECATED_API_WARNING: OnceCell<bool> =
+  OnceCell::new();
+pub static SHOULD_INCLUDE_MALLOCED_MEMORY_ON_MEMCHECK: OnceCell<bool> =
+  OnceCell::new();
+
+pub static MAIN_WORKER_INITIAL_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
+pub static MAIN_WORKER_MAX_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
+pub static EVENT_WORKER_INITIAL_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
+pub static EVENT_WORKER_MAX_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
+
+// NOTE: This used to be a `#[ctor]` that initialized the V8 platform before
+// `main`. In flow, the binary delegates to `deno::main()`, which performs its
+// own V8 flag + platform initialization — running this at startup froze V8's
+// flags before Deno could set them (`Check failed: !IsFrozen()`). The edge
+// user-worker runtime should call this explicitly when it needs the platform
+// initialized independently of Deno's main worker (deferred with the
+// comms/server redesign).
+#[allow(
+  dead_code,
+  reason = "flow boots V8 via Deno's main worker; standalone init is deferred with the comms/server redesign"
+)]
+fn init_v8_platform() {
+  set_v8_flags();
+
+  // NOTE(denoland/deno/20495): Due to the new PKU (Memory Protection Keys)
+  // feature introduced in V8 11.6, We need to initialize the V8 platform on
+  // the main thread that spawns V8 isolates.
+  JsRuntime::init_platform(None);
+}
+
+struct MemCheck {
+  lifecycle: Arc<base_rt::IsolateLifecycle>,
+  exceeded_token: CancellationToken,
+  limit: Option<usize>,
+  waker: Arc<AtomicWaker>,
+  state: Arc<RwLock<MemCheckState>>,
+  wasm_tracker: WasmMemoryTracker,
+}
+
+impl Default for MemCheck {
+  fn default() -> Self {
+    Self {
+      lifecycle: Arc::new(base_rt::IsolateLifecycle::new(
+        CancellationToken::new(),
+      )),
+      exceeded_token: CancellationToken::new(),
+      limit: None,
+      waker: Arc::new(AtomicWaker::new()),
+      state: Arc::new(RwLock::new(MemCheckState::default())),
+      wasm_tracker: WasmMemoryTracker::default(),
+    }
+  }
+}
+
+impl MemCheck {
+  fn check(&self, isolate: &mut Isolate) -> usize {
+    let Some(limit) = self.limit else {
+      return 0;
+    };
+
+    let stats = isolate.get_heap_statistics();
+    let malloced_bytes = if SHOULD_INCLUDE_MALLOCED_MEMORY_ON_MEMCHECK
+      .get()
+      .copied()
+      .unwrap_or_default()
+    {
+      stats.malloced_memory()
+    } else {
+      0
+    };
+
+    // XXX(Nyannyacha): Should we instead apply a size that reflects the
+    // committed heap? (but it can be bloated)
+    let used_heap_bytes = stats.used_heap_size();
+    let external_bytes = stats.external_memory();
+    // WebAssembly linear memory is invisible to HeapStatistics on v8 147;
+    // see ext/runtime/js/wasm_memory_tracker.js for how it gets here.
+    let wasm_bytes = self.wasm_tracker.bytes() as usize;
+
+    let total_bytes = malloced_bytes
+      .saturating_add(used_heap_bytes)
+      .saturating_add(external_bytes)
+      .saturating_add(wasm_bytes);
+
+    let heap_stats = WorkerHeapStatistics::from(&stats);
+    let mut state = self.state.write().unwrap();
+
+    if !state.exceeded {
+      state.current = heap_stats;
+
+      if total_bytes >= limit {
+        state.exceeded = true;
+
+        drop(state);
+        self.exceeded_token.cancel();
+      }
+    }
+
+    trace!(malloced_mb = bytes_to_display(total_bytes as u64));
+    total_bytes
+  }
+
+  fn is_exceeded(&self) -> bool {
+    self.exceeded_token.is_cancelled()
+  }
+}
+
+pub trait GetRuntimeContext {
+  fn get_runtime_context(
+    conf: &WorkerRuntimeOpts,
+    use_inspector: bool,
+    migrated: bool,
+    otel_config: Option<OtelConfig>,
+  ) -> impl Serialize {
+    serde_json::json!({
+      "target": env!("TARGET"),
+      "kind": conf.to_worker_kind().to_string(),
+      "debug": cfg!(debug_assertions),
+      "inspector": use_inspector,
+      "migrated": migrated,
+      "version": {
+        "runtime": env!("CARGO_PKG_VERSION"),
+        "deno": deno::deno_lib::version::DENO_VERSION_INFO.deno,
+      },
+      "flags": {
+        "SHOULD_DISABLE_DEPRECATED_API_WARNING":
+          SHOULD_DISABLE_DEPRECATED_API_WARNING
+            .get()
+            .copied()
+            .unwrap_or_default(),
+        "SHOULD_USE_VERBOSE_DEPRECATED_API_WARNING":
+          SHOULD_USE_VERBOSE_DEPRECATED_API_WARNING
+            .get()
+            .copied()
+            .unwrap_or_default()
+      },
+      "otel": otel_config.unwrap_or_default().as_v8(),
+    })
+  }
+
+  fn get_extra_context() -> impl Serialize {
+    serde_json::json!({})
+  }
+}
+
+type DefaultRuntimeContext = ();
+
+impl GetRuntimeContext for DefaultRuntimeContext {}
+
+#[derive(Debug, Clone)]
+struct GlobalMainContext(v8::Global<v8::Context>);
+
+impl GlobalMainContext {
+  #[allow(
+    dead_code,
+    reason = "locker debugging helper; only referenced when diagnosing isolate lock issues"
+  )]
+  fn to_local_context<'s, 'i>(
+    &self,
+    scope: &mut v8::PinCallbackScope<'s, 'i, ()>,
+  ) -> v8::Local<'s, v8::Context> {
+    v8::Local::new(scope, &self.0)
+  }
+}
+
+#[derive(Clone)]
+struct DispatchEventFunctions {
+  dispatch_load_event_fn_global: v8::Global<v8::Function>,
+  dispatch_beforeunload_event_fn_global: v8::Global<v8::Function>,
+  dispatch_unload_event_fn_global: v8::Global<v8::Function>,
+  dispatch_drain_event_fn_global: v8::Global<v8::Function>,
+}
+
+#[derive(IntoStaticStr, Debug, Clone, Copy)]
+#[strum(serialize_all = "snake_case")]
+pub enum WillTerminateReason {
+  CPU,
+  Memory,
+  WallClock,
+  EarlyDrop,
+  Termination,
+}
+
+#[derive(Debug)]
+pub struct RunOptions {
+  wait_termination_request_token: bool,
+  duplex_stream_rx: mpsc::UnboundedReceiver<DuplexStreamEntry>,
+  maybe_cpu_usage_metrics_tx: Option<mpsc::UnboundedSender<CPUUsageMetrics>>,
+}
+
+pub struct RunOptionsBuilder {
+  wait_termination_request_token: bool,
+  duplex_stream_rx: Option<mpsc::UnboundedReceiver<DuplexStreamEntry>>,
+  maybe_cpu_usage_metrics_tx: Option<mpsc::UnboundedSender<CPUUsageMetrics>>,
+}
+
+impl Default for RunOptionsBuilder {
+  fn default() -> Self {
+    Self {
+      wait_termination_request_token: true,
+      duplex_stream_rx: None,
+      maybe_cpu_usage_metrics_tx: None,
+    }
+  }
+}
+
+impl RunOptionsBuilder {
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  pub fn wait_termination_request_token(mut self, val: bool) -> Self {
+    self.wait_termination_request_token = val;
+    self
+  }
+
+  pub fn stream_rx(
+    mut self,
+    val: mpsc::UnboundedReceiver<DuplexStreamEntry>,
+  ) -> Self {
+    self.duplex_stream_rx = Some(val);
+    self
+  }
+
+  pub fn cpu_usage_metrics_tx(
+    mut self,
+    val: Option<mpsc::UnboundedSender<CPUUsageMetrics>>,
+  ) -> Self {
+    self.maybe_cpu_usage_metrics_tx = val;
+    self
+  }
+
+  pub fn build(self) -> Result<RunOptions, AnyError> {
+    let Self {
+      wait_termination_request_token,
+      duplex_stream_rx,
+      maybe_cpu_usage_metrics_tx,
+    } = self;
+
+    // TODO(Nyannyacha): Make this as optional.
+    let Some(duplex_stream_rx) = duplex_stream_rx else {
+      return Err(anyhow!("stream_rx can't be empty"));
+    };
+
+    Ok(RunOptions {
+      wait_termination_request_token,
+      duplex_stream_rx,
+      maybe_cpu_usage_metrics_tx,
+    })
+  }
+}
+
+fn cleanup_js_runtime(runtime: &mut JsRuntime) {
+  let isolate = runtime.v8_isolate();
+  let isolate_key = isolate_debug_key(isolate);
+
+  LOCK_DEBUG_STATES.with(|states| {
+    states.borrow_mut().remove(&isolate_key);
+  });
+
+  // Don't call isolate.exit() - JsRuntime::drop handles cleanup properly.
+  // Calling exit() causes HandleScope crashes during cross-thread task processing.
+}
+
+pub struct DenoRuntime<RuntimeContext = DefaultRuntimeContext> {
+  pub runtime_state: Arc<RuntimeState>,
+  pub js_runtime: ManuallyDrop<JsRuntime>,
+
+  pub drop_token: CancellationToken,
+  pub disposed_token: CancellationToken,
+  pub(crate) termination_request_token: CancellationToken,
+
+  pub conf: WorkerRuntimeOpts,
+  pub s3_fs: Option<S3Fs>,
+
+  entrypoint: Option<Entrypoint>,
+  main_module_url: Url,
+  main_module_id: Option<ModuleId>,
+
+  worker: Worker,
+  promise_metrics: PromiseMetrics,
+
+  mem_check: Arc<MemCheck>,
+  pub waker: Arc<AtomicWaker>,
+
+  beforeunload_mem_threshold: Arc<ArcSwapOption<u64>>,
+  beforeunload_cpu_threshold: Arc<ArcSwapOption<u64>>,
+
+  _phantom_runtime_context: PhantomData<RuntimeContext>,
+}
+
+impl<RuntimeContext> Drop for DenoRuntime<RuntimeContext> {
+  fn drop(&mut self) {
+    self.drop_token.cancel();
+    self.mem_check.lifecycle.begin_drop();
+
+    if self.conf.is_user_worker() {
+      self.js_runtime.v8_isolate().remove_gc_prologue_callback(
+        mem_check_gc_prologue_callback_fn as _,
+        Arc::as_ptr(&self.mem_check) as *mut _,
+      );
+    }
+
+    cleanup_js_runtime(&mut self.js_runtime);
+
+    // SAFETY: this is the Drop impl, so the runtime is dropped exactly once
+    // and never touched afterwards.
+    unsafe {
+      ManuallyDrop::drop(&mut self.js_runtime);
+    }
+    self.disposed_token.cancel();
+  }
+}
+
+struct ScopedFuture<F> {
+  future: F,
+  isolate: *mut v8::Isolate,
+  context: v8::Global<v8::Context>,
+}
+
+impl<F: Future> Future for ScopedFuture<F> {
+  type Output = F::Output;
+
+  fn poll(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> Poll<Self::Output> {
+    debug_assert!(!self.isolate.is_null());
+    // SAFETY: ScopedFuture is created and polled while its DenoRuntime (and
+    // thus the isolate) is alive on this thread.
+    let isolate = unsafe { &mut *self.isolate };
+    let scope_storage = std::pin::pin!(v8::HandleScope::new(isolate));
+    let mut scope = scope_storage.init();
+    let context = v8::Local::new(&scope, &self.context);
+    let _context_scope = v8::ContextScope::new(&mut scope, context);
+    // SAFETY: structural pin projection; `future` is never moved out of the
+    // pinned wrapper.
+    let inner = unsafe { self.map_unchecked_mut(|s| &mut s.future) };
+    inner.poll(cx)
+  }
+}
+
+impl<RuntimeContext> DenoRuntime<RuntimeContext> {
+  #[allow(
+    dead_code,
+    reason = "locker debugging helper; only referenced when diagnosing isolate lock issues"
+  )]
+  #[inline]
+  fn assert_isolate_not_locked(&mut self) {
+    assert_isolate_not_locked(self.js_runtime.v8_isolate());
+  }
+}
+
+#[allow(
+  dead_code,
+  reason = "locker debugging helper; only referenced when diagnosing isolate lock issues"
+)]
+#[inline]
+fn assert_isolate_not_locked(isolate: &v8::Isolate) {
+  // Only check the lock state if we've ever taken the lock on this thread.
+  // This avoids calling into V8's ThreadManager before it's initialized,
+  // which would segfault in v8::Locker::IsLocked during bootstrap.
+  let isolate_key = isolate_debug_key(isolate);
+  LOCK_DEBUG_STATES.with(|states| {
+    if let Some(state) = states.borrow().get(&isolate_key) {
+      if state.ever_locked {
+        assert_eq!(
+          state.depth, 0,
+          "isolate must not be locked when entering this scope"
+        );
+      }
+    }
+  });
+}
+
+impl<RuntimeContext> DenoRuntime<RuntimeContext>
+where
+  RuntimeContext: GetRuntimeContext,
+{
+  #[allow(
+    clippy::unnecessary_literal_unwrap,
+    clippy::arc_with_non_send_sync,
+    reason = "ported edge-runtime constructor; single-threaded runtime setup"
+  )]
+  pub(crate) async fn new(mut worker: Worker) -> Result<Self, Error> {
+    let init_opts = worker.init_opts.take();
+    let flags = worker.flags.clone();
+    let event_metadata = worker.event_metadata.clone();
+
+    debug_assert!(init_opts.is_some(), "init_opts must not be None");
+
+    let WorkerContextInitOpts {
+      mut conf,
+      service_path,
+      no_module_cache,
+      no_npm,
+      env_vars,
+      maybe_eszip,
+      maybe_entrypoint,
+      maybe_module_code,
+      static_patterns,
+      maybe_s3_fs_config,
+      maybe_tmp_fs_config,
+      maybe_otel_config,
+      ..
+    } = init_opts.unwrap();
+
+    let waker = Arc::<AtomicWaker>::default();
+    let drop_token = CancellationToken::default();
+    let disposed_token = CancellationToken::default();
+    let is_user_worker = conf.is_user_worker();
+    let is_some_entry_point = maybe_entrypoint.is_some();
+    let termination_request_token = CancellationToken::default();
+    let promise_metrics = PromiseMetrics::default();
+    let runtime_state = Arc::<RuntimeState>::default();
+
+    let maybe_user_conf = conf.as_user_worker();
+    // flow: the worker's unique pool key, used to give this worker a distinct
+    // inspector target (see the `register_inspector` call below).
+    let user_worker_key = maybe_user_conf.and_then(|c| c.key);
+    let context = conf.context().cloned().unwrap_or_default();
+
+    let permissions_options = maybe_user_conf
+      .and_then(|it| it.permissions.clone())
+      .unwrap_or_else(|| get_default_permissions(conf.to_worker_kind()));
+
+    struct Bootstrap {
+      migrated: bool,
+      waker: Arc<AtomicWaker>,
+      js_runtime: JsRuntime,
+      mem_check: Arc<MemCheck>,
+      has_inspector: bool,
+      main_module_url: Url,
+      entrypoint: Option<Entrypoint>,
+      context: Option<serde_json::Map<String, serde_json::Value>>,
+      s3_fs: Option<S3Fs>,
+      beforeunload_cpu_threshold: ArcSwapOption<u64>,
+      beforeunload_mem_threshold: ArcSwapOption<u64>,
+    }
+
+    let bootstrap_fn = || {
+      async {
+        let base_dir_path = {
+          let path = if service_path.is_absolute() {
+            service_path.to_path_buf()
+          } else {
+            std::env::current_dir()?.join(&service_path)
+          };
+          path.canonicalize().unwrap_or(path)
+        };
+
+        let maybe_import_map_path = context
+          .get("importMapPath")
+          .and_then(|it| it.as_str())
+          .map(str::to_string);
+
+        let eszip = if let Some(eszip_payload) = maybe_eszip {
+          eszip_payload
+        } else {
+          let Ok(base_dir_url) = Url::from_directory_path(&base_dir_path)
+          else {
+            bail!(
+              "malformed base directory: {}",
+              base_dir_path.to_string_lossy()
+            );
+          };
+
+          let mut main_module_url = None;
+          let only_module_code = maybe_module_code.is_some()
+            && maybe_eszip.is_none()
+            && !is_some_entry_point;
+
+          if only_module_code {
+            main_module_url = None;
+          } else {
+            static POTENTIAL_EXTS: &[&str] = &["ts", "tsx", "js", "mjs", "jsx"];
+
+            let mut found = false;
+            for ext in POTENTIAL_EXTS.iter() {
+              let url = base_dir_url.join(format!("index.{}", ext).as_str())?;
+              if url.to_file_path().unwrap().exists() {
+                found = true;
+                main_module_url = Some(url);
+                break;
+              }
+            }
+            if !is_some_entry_point && !found {
+              main_module_url = Some(base_dir_url.clone());
+            }
+          }
+          if is_some_entry_point {
+            let entrypoint_str = maybe_entrypoint.as_ref().unwrap();
+            main_module_url = Some(if Url::parse(entrypoint_str).is_ok() {
+              Url::parse(entrypoint_str)?
+            } else {
+              let entrypoint_path = base_dir_path.join(entrypoint_str);
+              Url::from_file_path(&entrypoint_path).map_err(|_| {
+                anyhow::anyhow!(
+                  "failed to convert entrypoint to file URL: {}",
+                  entrypoint_path.display()
+                )
+              })?
+            });
+          }
+
+          let mut emitter_factory = EmitterFactory::new();
+
+          let cache_strategy = if no_module_cache {
+            CacheSetting::ReloadAll
+          } else {
+            CacheSetting::Use
+          };
+
+          emitter_factory
+            .set_permissions_options(Some(permissions_options.clone()));
+
+          emitter_factory.set_file_fetcher_allow_remote(
+            maybe_user_conf
+              .map(|it| it.allow_remote_modules)
+              .unwrap_or(true),
+          );
+          emitter_factory.set_cache_strategy(Some(cache_strategy));
+
+          let maybe_code = if only_module_code {
+            maybe_module_code
+          } else {
+            None
+          };
+
+          let mut builder = DenoOptionsBuilder::new();
+
+          // Extract unstableSloppyImports from context if provided
+          if let Some(unstable_sloppy_imports) = context.get("unstableSloppyImports")
+            .and_then(|v| v.as_bool()) {
+            builder.set_unstable_sloppy_imports(Some(unstable_sloppy_imports));
+          }
+
+          if let Some(module_url) = main_module_url.as_ref() {
+            builder.set_entrypoint(Some(module_url.to_file_path().unwrap()));
+          }
+          builder
+            .set_type_check_mode(is_user_worker.then_some(TypeCheckMode::Local))
+            .set_no_npm(no_npm)
+            .set_import_map_path(maybe_import_map_path.clone());
+
+          emitter_factory.set_deno_options(builder.build().await?);
+
+          let deno_options = emitter_factory.deno_options()?;
+          if !is_some_entry_point
+            && main_module_url.is_some_and(|it| it == base_dir_url)
+            && deno_options
+              .workspace()
+              .root_pkg_json()
+              .and_then(|it| it.main.as_ref())
+              .is_none()
+          {
+            bail!("could not find an appropriate entrypoint");
+          }
+          let mut metadata = Metadata::default();
+          let eszip = generate_binary_eszip(
+            &mut metadata,
+            Arc::new(emitter_factory),
+            maybe_code,
+            // here we don't want to add extra cost, so we won't use a checksum
+            None,
+            Some(static_patterns.iter().map(|s| s.as_str()).collect()),
+          )
+          .await?;
+
+          EszipPayloadKind::Eszip(eszip)
+        };
+
+        let _root_cert_store_provider = get_root_cert_store_provider()?;
+        let stdio = if is_user_worker {
+          let stdio_pipe = deno_io::StdioPipe::file(
+            tokio::fs::File::create("/dev/null").await?.into_std().await,
+          );
+
+          deno_io::Stdio {
+            stdin: stdio_pipe.clone(),
+            stdout: stdio_pipe.clone(),
+            stderr: stdio_pipe,
+          }
+        } else {
+          Default::default()
+        };
+
+        let has_inspector = worker.inspector.is_some();
+        let need_source_map = context
+          .get("sourceMap")
+          .and_then(serde_json::Value::as_bool)
+          .unwrap_or_default();
+
+        let should_block_fs = if is_user_worker {
+          let allow_fs_access = maybe_user_conf
+            .and_then(|conf| conf.allow_host_fs_access)
+            .unwrap_or(false);
+          if allow_fs_access && flags.restrict_host_fs {
+            bail!("allowHostFsAccess cannot be enabled when restrict_host_fs is set");
+          }
+          !allow_fs_access
+        } else {
+          false
+        };
+
+        let rt_provider = create_module_loader_for_standalone_from_eszip_kind(
+          eszip,
+          permissions_options,
+          has_inspector || need_source_map,
+          Some(MigrateOptions {
+            maybe_import_map_path,
+          }),
+          Some(base_dir_path.to_string_lossy().as_ref()),
+          should_block_fs || flags.restrict_host_fs,
+        )
+        .await?;
+
+        let RuntimeProviders {
+          migrated,
+          module_loader,
+          node_services,
+          npm_snapshot,
+          permissions,
+          metadata,
+          static_files,
+          vfs,
+          vfs_path,
+          base_url,
+        } = rt_provider;
+
+        let node_modules = metadata
+          .node_modules()
+          .ok()
+          .flatten();
+        let entrypoint = metadata.entrypoint.clone();
+        let main_module_url = match entrypoint.as_ref() {
+          Some(Entrypoint::Key(key)) => base_url.join(key)?,
+          Some(Entrypoint::ModuleCode(_)) | None => Url::parse(
+            maybe_entrypoint
+              .as_ref()
+              .with_context(|| "could not find entrypoint key")?,
+          )?,
+        };
+
+        let build_file_system_fn = |base_fs: Arc<dyn deno_fs::FileSystem>| -> Result<
+          (Arc<dyn deno_fs::FileSystem>, Option<S3Fs>),
+          AnyError,
+        > {
+          let tmp_fs =
+            TmpFs::try_from(maybe_tmp_fs_config.unwrap_or_default())?;
+          let tmp_fs_actual_path = tmp_fs.actual_path().to_path_buf();
+          let mut fs = PrefixFs::new("/tmp", tmp_fs.clone(), Some(base_fs))
+            .tmp_dir("/tmp")
+            .add_fs(tmp_fs_actual_path, tmp_fs);
+
+          fs.set_runtime_state(&runtime_state);
+
+          Ok(
+            if let Some(s3_fs) =
+              maybe_s3_fs_config.map(S3Fs::new).transpose()?
+            {
+              let mut s3_prefix_fs = fs.add_fs("/s3", s3_fs.clone());
+
+              s3_prefix_fs.set_check_sync_api(is_user_worker);
+
+              (Arc::new(s3_prefix_fs), Some(s3_fs))
+            } else {
+              (Arc::new(fs), None)
+            },
+          )
+        };
+
+        let static_files = if is_some_entry_point {
+          let entrypoint_path = main_module_url
+            .to_file_path()
+            .map_err(|_| anyhow!("failed to convert entrypoint to path"))?;
+          let static_root_path = entrypoint_path
+            .parent()
+            .ok_or_else(|| anyhow!("could not resolve parent of entrypoint"))?
+            .to_path_buf();
+
+          metadata
+            .static_assets_lookup(static_root_path)
+            .into_iter()
+            .chain(static_files)
+            .collect()
+        } else {
+          static_files
+        };
+
+        let (fs, s3_fs) = build_file_system_fn(if is_user_worker && should_block_fs {
+          let compile_base_dir = if matches!(entrypoint, Some(Entrypoint::ModuleCode(_)) | None)
+              && is_some_entry_point
+            {
+              // it is eszip from before v2
+              base_url
+                .to_file_path()
+                .map_err(|_| anyhow!("failed to resolve base url"))?
+            } else {
+              main_module_url
+                .to_file_path()
+                .map_err(|_| {
+                  anyhow!("failed to resolve base dir using main module url")
+                })
+                .and_then(|it| {
+                  it.parent()
+                    .map(Path::to_path_buf)
+                    .with_context(|| "failed to determine parent directory")
+                })?
+            };
+
+          // Compute path mapping between real source and compile-target paths
+          let compile_root = base_url
+            .to_file_path()
+            .map_err(|_| anyhow!("failed to resolve compile root"))?;
+          let source_root = main_module_url
+            .to_file_path()
+            .ok()
+            .and_then(|main_path| {
+              let relative_dir = main_path.parent()?.strip_prefix(&compile_root).ok()?;
+              let depth = relative_dir.components().count();
+              let mut root = base_dir_path.clone();
+              for _ in 0..depth {
+                root = root.parent()?.to_path_buf();
+              }
+              Some(root)
+            });
+
+          let mut static_fs = StaticFs::new(
+            node_modules,
+            static_files,
+            compile_base_dir,
+            vfs_path,
+            vfs,
+            npm_snapshot,
+          );
+          if let Some(source_root) = source_root {
+            static_fs = static_fs.set_path_mapping(source_root, compile_root);
+          }
+          Arc::new(static_fs)
+        } else {
+          // Use DenoCompileFileSystem for main workers and user workers with filesystem access enabled
+          Arc::new(DenoCompileFileSystem::from_rc(vfs))
+        })?;
+
+        let extensions = vec![
+          deno_telemetry::deno_telemetry::init(),
+          deno_webidl::deno_webidl::init(),
+          deno_web::deno_web::lazy_init(),
+          deno_webgpu::deno_webgpu::init(),
+          deno_image::deno_image::init(),
+          // flow: deno_canvas (OffscreenCanvas/createImageBitmap surface) — kept
+          // for image processing in user workers. `02_surface.js` moved here from
+          // deno_webgpu in Deno 2.9.0.
+          deno_canvas::deno_canvas::init(),
+          deno_fetch::deno_fetch::lazy_init(),
+          deno_websocket::deno_websocket::lazy_init(),
+          // TODO: support providing a custom seed for crypto
+          deno_crypto::deno_crypto::lazy_init(),
+          deno_net::deno_net::lazy_init(),
+          deno_tls::deno_tls::init(),
+          deno_node_crypto::deno_node_crypto::init(),
+          deno_node_sqlite::deno_node_sqlite::init(),
+          deno_http::deno_http::lazy_init(),
+          deno_io::deno_io::lazy_init(),
+          deno_fs::deno_fs::lazy_init(),
+          ext_ai::ai::init(),
+          ext_env::env::init(),
+          deno_process::deno_process::init(None),
+          ext_workers::user_workers::init(),
+          ext_event_worker::user_event_worker::init(),
+          ext_event_worker::js_interceptors::js_interceptors::init(),
+          ext_runtime::runtime_bootstrap::init(
+            Some(main_module_url.clone()),
+          ),
+          ext_runtime::runtime_net::init(),
+          ext_runtime::runtime_http::init(),
+          ext_runtime::runtime_http_start::init(),
+          // NOTE(AndresP): Order is matters. Otherwise, it will lead to hard
+          // errors such as SIGBUS depending on the platform.
+          ext_node::deno_node::lazy_init::<
+            deno_resolver::npm::DenoInNpmPackageChecker,
+            npm::NpmResolver<VfsSys>,
+            VfsSys,
+          >(),
+          deno_cache::deno_cache::lazy_init(),
+          deno::deno_runtime::ops::permissions::deno_permissions::init(),
+          ext_os::os::init(None),
+          ext_os::deno_os::init(),
+          ext_runtime::runtime::init(),
+          // Must come AFTER every snapshotted extension: it is state-only
+          // (zero ops, zero JS) and NOT in the worker snapshot (defined in
+          // this crate, unreachable from build.rs), and deno_core validates
+          // snapshot extension order positionally.
+          ops::permissions::base_runtime_permissions::init(
+            permissions,
+          ),
+        ];
+
+        let mut create_params = None;
+        let mut mem_check = MemCheck {
+          lifecycle: Arc::new(base_rt::IsolateLifecycle::new(drop_token.clone())),
+          ..Default::default()
+        };
+
+        let beforeunload_cpu_threshold =
+          ArcSwapOption::<u64>::from_pointee(None);
+        let beforeunload_mem_threshold =
+          ArcSwapOption::<u64>::from_pointee(None);
+
+        match conf.to_worker_kind() {
+          WorkerKind::UserWorker => {
+            let conf = maybe_user_conf.unwrap();
+            let memory_limit_bytes = mib_to_bytes(conf.memory_limit_mb) as usize;
+
+            beforeunload_mem_threshold.store(
+              flags
+                .beforeunload_memory_pct
+                .and_then(|it| percentage_value(memory_limit_bytes as u64, it))
+                .map(Arc::new),
+            );
+
+            if conf.cpu_time_hard_limit_ms > 0 {
+              beforeunload_cpu_threshold.store(
+                flags
+                  .beforeunload_cpu_pct
+                  .and_then(|it| {
+                    percentage_value(conf.cpu_time_hard_limit_ms, it)
+                  })
+                  .map(Arc::new),
+              );
+            }
+
+            let allocator = CustomAllocator::new(memory_limit_bytes);
+
+            allocator.set_waker(mem_check.waker.clone());
+
+            mem_check.limit = Some(memory_limit_bytes);
+            create_params = Some(
+              v8::CreateParams::default()
+                .heap_limits(mib_to_bytes(0) as usize, memory_limit_bytes)
+                .array_buffer_allocator(allocator.into_v8_allocator()),
+            )
+          }
+
+          kind => {
+            assert_ne!(kind, WorkerKind::UserWorker);
+            let initial_heap_size = match kind {
+              WorkerKind::MainWorker => &MAIN_WORKER_INITIAL_HEAP_SIZE_MIB,
+              WorkerKind::EventsWorker => &EVENT_WORKER_INITIAL_HEAP_SIZE_MIB,
+              _ => unreachable!(),
+            };
+            let max_heap_size = match kind {
+              WorkerKind::MainWorker => &MAIN_WORKER_MAX_HEAP_SIZE_MIB,
+              WorkerKind::EventsWorker => &EVENT_WORKER_MAX_HEAP_SIZE_MIB,
+              _ => unreachable!(),
+            };
+
+            let initial_heap_size = initial_heap_size.get().cloned().unwrap_or_default();
+            let max_heap_size = max_heap_size.get().cloned().unwrap_or_default();
+
+            if max_heap_size > 0 {
+              create_params = Some(v8::CreateParams::default().heap_limits(
+                mib_to_bytes(initial_heap_size) as usize,
+                mib_to_bytes(max_heap_size) as usize,
+              ));
+            }
+          }
+        }
+
+        let mem_check = Arc::new(mem_check);
+        let runtime_options = RuntimeOptions {
+          extensions,
+          is_main: true,
+          inspector: has_inspector,
+          create_params,
+          // flow: same store as the flow main isolate, so ArrayBuffers can be
+          // TRANSFERRED (zero-copy) over the main<->worker MessagePorts. See
+          // FLOW_SHARED_ARRAY_BUFFER_STORE for the shared-memory caveat.
+          shared_array_buffer_store: Some(
+            ext_workers::FLOW_SHARED_ARRAY_BUFFER_STORE.clone(),
+          ),
+          compiled_wasm_module_store: None,
+          startup_snapshot: snapshot::snapshot(),
+          // Lazy extension sources not consumed into the snapshot; served to
+          // `core.loadExtScript()` / `createLazyLoader` at runtime.
+          residual_lazy_js_sources: snapshot::RESIDUAL_LAZY_JS,
+          residual_lazy_esm_sources: snapshot::RESIDUAL_LAZY_ESM,
+          module_loader: Some(module_loader),
+          extension_transpiler: Some(std::rc::Rc::new(|specifier, source| {
+            deno::deno_runtime::transpile::maybe_transpile_source(
+              specifier, source,
+            )
+          })),
+          ..Default::default()
+        };
+
+        let mut js_runtime = JsRuntime::new(runtime_options);
+
+        js_runtime.lazy_init_extensions(vec![
+          deno_web::deno_web::args(
+            deno_web::BlobStore::default_arc(),
+            None,
+            false,
+            deno_web::InMemoryBroadcastChannel::default(),
+          ),
+          deno_fetch::deno_fetch::args(
+            deno_fetch::Options {
+              user_agent: "flow-edge-runtime".to_string(),
+              root_cert_store_provider: None,
+              unsafely_ignore_certificate_errors: None,
+              file_fetch_handler: std::rc::Rc::new(deno_fetch::FsFetchHandler),
+              ..Default::default()
+            },
+          ),
+          deno_websocket::deno_websocket::args(),
+          deno_crypto::deno_crypto::args(None),
+          deno_net::deno_net::args(None, None),
+          deno_http::deno_http::args(deno_http::Options::default()),
+          deno_io::deno_io::args(Some(stdio.clone())),
+          deno_fs::deno_fs::args(
+            if should_block_fs || s3_fs.is_some() || flags.restrict_host_fs {
+              fs.clone()
+            } else {
+              Arc::new(deno_fs::RealFs) as Arc<dyn deno_fs::FileSystem>
+            },
+          ),
+          ext_node::deno_node::args::<
+            deno_resolver::npm::DenoInNpmPackageChecker,
+            npm::NpmResolver<VfsSys>,
+            VfsSys,
+          >(Some(node_services), if should_block_fs || s3_fs.is_some() || flags.restrict_host_fs {
+            fs.clone()
+          } else {
+            Arc::new(deno_fs::RealFs) as Arc<dyn deno_fs::FileSystem>
+          }),
+          deno_cache::deno_cache::args(Some(deno_cache::CreateCache(
+            Arc::new(|| {
+              let storage_dir = std::env::temp_dir().join("trex-cache");
+              let sqlite = deno_cache::SqliteBackedCache::new(storage_dir)?;
+              Ok(deno_cache::CacheImpl::Sqlite(sqlite))
+            }),
+          ))),
+        ]).map_err(|e| anyhow::anyhow!("Failed to lazy init extensions: {:#}", e))?;
+
+        let dispatch_fns = {
+          let context = js_runtime.main_context();
+          // New V8 API requires pinning scopes
+          let scope_storage = std::pin::pin!(v8::HandleScope::new(js_runtime.v8_isolate()));
+          let mut handle_scope = scope_storage.init();
+          let context_local = v8::Local::new(&handle_scope, context);
+          // Create ContextScope to get HandleScope<Context> instead of HandleScope<()>
+          let mut context_scope = v8::ContextScope::new(&mut handle_scope, context_local);
+          let scope = &mut context_scope;
+          let global_obj = context_local.global(scope);
+          let bootstrap_str =
+            v8::String::new_external_onebyte_static(scope, b"bootstrap")
+              .unwrap();
+          let bootstrap_ns = global_obj
+            .get(scope, bootstrap_str.into())
+            .unwrap()
+            .to_object(scope)
+            .unwrap();
+
+          macro_rules! get_global {
+            ($name:expr) => {{
+              let dispatch_fn_str =
+                v8::String::new_external_onebyte_static(scope, $name).unwrap();
+              let dispatch_fn = v8::Local::<v8::Function>::try_from(
+                bootstrap_ns.get(scope, dispatch_fn_str.into()).unwrap(),
+              )
+              .unwrap();
+              v8::Global::new(scope, dispatch_fn)
+            }};
+          }
+
+          DispatchEventFunctions {
+            dispatch_load_event_fn_global: get_global!(b"dispatchLoadEvent"),
+            dispatch_beforeunload_event_fn_global: get_global!(
+              b"dispatchBeforeUnloadEvent"
+            ),
+            dispatch_unload_event_fn_global: get_global!(
+              b"dispatchUnloadEvent"
+            ),
+            dispatch_drain_event_fn_global: get_global!(b"dispatchDrainEvent"),
+          }
+        };
+
+        {
+          let main_context = js_runtime.main_context();
+          let op_state = js_runtime.op_state();
+          let mut op_state = op_state.borrow_mut();
+
+          op_state.put(dispatch_fns);
+          op_state.put(promise_metrics.clone());
+          op_state.put(runtime_state.clone());
+          op_state.put(GlobalMainContext(main_context));
+          op_state.put(RuntimeWaker(waker.clone()));
+        }
+
+        {
+          let op_state_rc = js_runtime.op_state();
+          let mut op_state = op_state_rc.borrow_mut();
+
+          // NOTE(Andreespirela): We do this because "NODE_DEBUG" is trying to be
+          // read during initialization, But we need the gotham state to be
+          // up-to-date.
+          op_state.put(ext_env::EnvVars::default());
+        }
+
+        if let Some(inspector) = worker.inspector.as_ref() {
+          // flow: register user workers under a per-worker synthetic target id
+          // (keyed by the unique pool key) rather than the module URL, so
+          // multiple workers sharing a `servicePath` get distinct DevTools
+          // targets. `op_user_worker_inspect` recomputes the same id from the
+          // key. Non-user workers keep the module URL.
+          let target = match user_worker_key {
+            Some(key) => ext_workers::inspector_target_id(&key),
+            None => main_module_url.to_string(),
+          };
+          let generation = inspector.server.register_inspector(
+            target,
+            &mut js_runtime,
+            inspector.should_wait_for_session(),
+          );
+          inspector.set_generation(generation);
+        }
+
+        if is_user_worker {
+          js_runtime.v8_isolate().add_gc_prologue_callback(
+            mem_check_gc_prologue_callback_fn as _,
+            Arc::as_ptr(&mem_check) as *mut _,
+            GCType::kGCTypeAll,
+          );
+
+          {
+            let op_state = js_runtime.op_state();
+            let mut op_state = op_state.borrow_mut();
+            op_state.put(MemCheckWaker::from(mem_check.waker.clone()));
+            op_state.put(mem_check.wasm_tracker.clone());
+          }
+        }
+
+        // V8 isolate stays entered on this thread.
+        // With Deno 2.5.6, we no longer use v8::Locker, so the isolate
+        // remains on its creation thread and never needs to exit/re-enter.
+
+        Ok(Bootstrap {
+          migrated,
+          waker,
+          js_runtime,
+          mem_check,
+          has_inspector,
+          main_module_url,
+          entrypoint,
+          context: Some(context),
+          s3_fs,
+          beforeunload_cpu_threshold,
+          beforeunload_mem_threshold,
+        })
+      }
+      .in_current_span()
+    };
+
+    let _span = Span::current().entered();
+
+    // Execute bootstrap directly on this thread (no spawn_blocking needed)
+    let bootstrap_ret: Result<Bootstrap, Error> = {
+      let mut bootstrap = bootstrap_fn()
+        .await
+        .context("failed to bootstrap runtime")?;
+
+      debug!("bootstrap");
+
+      let has_inspector = bootstrap.has_inspector;
+      let migrated = bootstrap.migrated;
+      let context = bootstrap.context.take().unwrap_or_default();
+      let mut bootstrap = scopeguard::guard(bootstrap, |mut it| {
+        cleanup_js_runtime(&mut it.js_runtime);
+      });
+
+      {
+        // Prepare data that doesn't need V8 scope
+        let runtime_context =
+          serde_json::json!(RuntimeContext::get_runtime_context(
+            &conf,
+            has_inspector,
+            migrated,
+            maybe_otel_config,
+          ));
+
+        let tokens = {
+          let op_state_rc = bootstrap.js_runtime.op_state();
+          let mut op_state = op_state_rc.borrow_mut();
+
+          // flow: install the worker's MessagePort half (created by
+          // op_user_worker_create, handed over via the global registry) BEFORE
+          // `bootstrapSBEdge` runs below, so `op_flow_parent_port_rid` can give
+          // the bootstrap the rid to expose as `EdgeRuntime.parentPort`.
+          if let Some(token) = conf
+            .as_user_worker()
+            .and_then(|c| c.maybe_parent_port_token)
+          {
+            if let Some(port) = ext_workers::take_parent_port(token) {
+              let rid = ext_workers::add_message_port(&mut op_state, port);
+              op_state.put(ext_workers::FlowParentPortRid(rid));
+            }
+
+            // flow: open the delivery channel for ADDITIONAL parent ports,
+            // handed over when the pool answers a later create() with this
+            // already-running worker (reuse). Unregisters itself when this
+            // op_state is dropped.
+            if let Some(key) = conf.as_user_worker().and_then(|c| c.key) {
+              op_state.put(ext_workers::FlowPortDelivery::register(key));
+            }
+          }
+
+          let resource_table = &mut op_state.resource_table;
+          serde_json::json!({
+            "terminationRequestToken":
+              resource_table
+                .add(DropToken(termination_request_token.clone()))
+          })
+        };
+
+        let extra_context = {
+          let mut extra_context =
+            serde_json::json!(RuntimeContext::get_extra_context());
+
+          json::merge_object(
+            &mut extra_context,
+            &serde_json::Value::Object(context),
+          );
+          json::merge_object(&mut extra_context, &tokens);
+
+          extra_context
+        };
+
+        let context_global = bootstrap.js_runtime.main_context();
+
+        // Now create V8 scope for bootstrap operations
+        // deno_core::scope!(scope, &mut bootstrap.js_runtime);
+        let scope_storage = std::pin::pin!(v8::HandleScope::new(
+          bootstrap.js_runtime.v8_isolate()
+        ));
+        let mut handle_scope = scope_storage.init();
+
+        // Bootstrapping stage
+        let (runtime_context, extra_context, bootstrap_fn) = {
+          let context = context_global.clone();
+          let context_local = v8::Local::new(&handle_scope, context);
+          let mut context_scope =
+            v8::ContextScope::new(&mut handle_scope, context_local);
+          let scope = &mut context_scope;
+
+          let global_obj = context_local.global(scope);
+          let bootstrap_str =
+            v8::String::new_external_onebyte_static(scope, b"bootstrapSBEdge")
+              .unwrap();
+          let bootstrap_fn = v8::Local::<v8::Function>::try_from(
+            global_obj.get(scope, bootstrap_str.into()).unwrap(),
+          )
+          .unwrap();
+
+          let runtime_context_local =
+            deno_core::serde_v8::to_v8(scope, runtime_context)
+              .context("failed to convert to v8 value")?;
+          let runtime_context_global =
+            v8::Global::new(scope, runtime_context_local);
+          let extra_context_local =
+            deno_core::serde_v8::to_v8(scope, extra_context)
+              .context("failed to convert to v8 value")?;
+          let extra_context_global =
+            v8::Global::new(scope, extra_context_local);
+          let bootstrap_fn_global = v8::Global::new(scope, bootstrap_fn);
+
+          (
+            runtime_context_global,
+            extra_context_global,
+            bootstrap_fn_global,
+          )
+        };
+
+        // Call bootstrap function directly on this thread
+        // No need for locker.call_with_args() - we're on the same thread as the isolate
+        {
+          let context = context_global;
+          let context_local = v8::Local::new(&handle_scope, context);
+          let mut context_scope =
+            v8::ContextScope::new(&mut handle_scope, context_local);
+          let scope = &mut context_scope;
+
+          let bootstrap_fn_local = v8::Local::new(scope, &bootstrap_fn);
+          let runtime_context_local = v8::Local::new(scope, &runtime_context);
+          let extra_context_local = v8::Local::new(scope, &extra_context);
+          let undefined = v8::undefined(scope);
+
+          bootstrap_fn_local
+            .call(
+              scope,
+              undefined.into(),
+              &[runtime_context_local, extra_context_local],
+            )
+            .context("failed to execute bootstrap script")?;
+        }
+      }
+
+      // Bootstrap complete - no longer using v8::Locker
+      let res = ScopeGuard::into_inner(bootstrap);
+      Ok(res)
+    };
+
+    let Bootstrap {
+      waker,
+      js_runtime,
+      mem_check,
+      main_module_url,
+      entrypoint,
+      s3_fs,
+      beforeunload_cpu_threshold,
+      beforeunload_mem_threshold,
+      ..
+    } = match bootstrap_ret {
+      Ok(v) => v,
+      Err(err) => {
+        return Err(err.context("failed to bootstrap runtime"));
+      }
+    };
+
+    let otel_attributes = event_metadata.otel_attributes.clone();
+    let _span = Span::current().entered();
+
+    // Execute post-bootstrap tasks directly on this thread (no spawn_blocking needed)
+    debug!("bootstrap post task");
+
+    {
+      // Access op_state directly - no Locker needed on same thread
+      // run inside a closure, so op_state_rc is released
+      let op_state_rc = js_runtime.op_state();
+      let mut op_state = op_state_rc.borrow_mut();
+
+      let mut env_vars = env_vars.clone();
+
+      if let Some(opts) = conf.as_events_worker_mut() {
+        op_state.put::<mpsc::UnboundedReceiver<WorkerEventWithMetadata>>(
+          opts.events_msg_rx.take().unwrap(),
+        );
+      }
+
+      if conf.is_main_worker() || conf.is_user_worker() {
+        op_state.put::<HashMap<usize, CancellationToken>>(HashMap::new());
+      }
+
+      if conf.is_user_worker() {
+        let conf = conf.as_user_worker().unwrap();
+        let key = conf.key.map_or("".to_string(), |k| k.to_string());
+
+        // set execution id for user workers
+        env_vars.insert("SB_EXECUTION_ID".to_string(), key.clone());
+
+        if let Some(events_msg_tx) = conf.events_msg_tx.clone() {
+          op_state.put::<mpsc::UnboundedSender<WorkerEventWithMetadata>>(
+            events_msg_tx,
+          );
+          op_state.put(event_metadata);
+        }
+
+        // flow: claim this worker's MessagePort half (created by
+        // op_user_worker_create) and register it so `op_flow_parent_port_rid`
+        // can hand the rid to the worker bootstrap for main<->worker comms.
+      }
+
+      op_state.put(ext_env::EnvVars(env_vars));
+
+      op_state.put(DenoRuntimeDropToken(DropToken(drop_token.clone())));
+
+      // Store IsolateLifecycle for spawn_cpu_accumul_blocking_scope to use
+      op_state.put(mem_check.lifecycle.clone());
+
+      op_state.put(RuntimeOtelExtraAttributes(
+        otel_attributes
+          .unwrap_or_default()
+          .into_iter()
+          .map(|(k, v)| (k.into(), v.into()))
+          .collect(),
+      ));
+    }
+
+    if is_user_worker {
+      drop(base_rt::SUPERVISOR_RT.spawn({
+        let drop_token = drop_token.clone();
+        let waker = mem_check.waker.clone();
+
+        async move {
+          // TODO(Nyannyacha): Should we introduce exponential backoff?
+          let mut int = interval(*ALLOC_CHECK_DUR);
+          loop {
+            tokio::select! {
+              _ = int.tick() => {
+                waker.wake();
+              }
+
+              _ = drop_token.cancelled() => {
+                break;
+              }
+            }
+          }
+        }
+      }));
+    }
+
+    // Post-bootstrap tasks complete - continue with runtime initialization
+
+    Ok(Self {
+      runtime_state,
+      js_runtime: ManuallyDrop::new(js_runtime),
+
+      drop_token,
+      disposed_token,
+      termination_request_token,
+
+      conf,
+      s3_fs,
+
+      entrypoint,
+      main_module_url,
+      main_module_id: None,
+
+      worker,
+      promise_metrics,
+
+      mem_check,
+      waker,
+
+      beforeunload_cpu_threshold: Arc::new(beforeunload_cpu_threshold),
+      beforeunload_mem_threshold: Arc::new(beforeunload_mem_threshold),
+
+      _phantom_runtime_context: PhantomData,
+    })
+  }
+
+  pub(crate) async fn init_main_module(&mut self) -> Result<(), Error> {
+    if self.main_module_id.is_some() {
+      return Ok(());
+    }
+
+    let entrypoint = self.entrypoint.take();
+    let url = self.main_module_url.clone();
+
+    let id = match entrypoint {
+      Some(Entrypoint::Key(_)) | None => {
+        let isolate_ptr = {
+          let isolate_ref: &mut v8::Isolate = self.js_runtime.v8_isolate();
+          isolate_ref as *mut v8::Isolate
+        };
+        let context = self.js_runtime.main_context();
+        let future = self.js_runtime.load_main_es_module(&url);
+        ScopedFuture {
+          future,
+          isolate: isolate_ptr,
+          context,
+        }
+        .await?
+      }
+      Some(Entrypoint::ModuleCode(module_code)) => {
+        let isolate_ptr = {
+          let isolate_ref: &mut v8::Isolate = self.js_runtime.v8_isolate();
+          isolate_ref as *mut v8::Isolate
+        };
+        let context = self.js_runtime.main_context();
+        let future = self
+          .js_runtime
+          .load_main_es_module_from_code(&url, module_code);
+        let id = ScopedFuture {
+          future,
+          isolate: isolate_ptr,
+          context,
+        }
+        .await?;
+        id
+      }
+    };
+
+    self.main_module_id = Some(id);
+    Ok(())
+  }
+
+  pub async fn run(&mut self, options: RunOptions) -> (Result<(), Error>, i64) {
+    // self.assert_isolate_not_locked();
+
+    let RunOptions {
+      wait_termination_request_token,
+      duplex_stream_rx,
+      maybe_cpu_usage_metrics_tx,
+    } = options;
+
+    {
+      let op_state_rc = self.js_runtime.op_state();
+      let mut op_state = op_state_rc.borrow_mut();
+
+      op_state
+        .put::<mpsc::UnboundedReceiver<DuplexStreamEntry>>(duplex_stream_rx);
+
+      if self.conf.is_main_worker() {
+        op_state.put::<mpsc::UnboundedSender<UserWorkerMsgs>>(
+          self.conf.as_main_worker().unwrap().worker_pool_tx.clone(),
+        );
+      }
+    }
+
+    let _terminate_guard =
+      scopeguard::guard(self.runtime_state.terminated.clone(), |v| {
+        v.raise();
+      });
+
+    self.runtime_state.init.raise();
+    let _init_guard = scopeguard::guard(self.runtime_state.init.clone(), |v| {
+      v.lower();
+    });
+
+    let mut accumulated_cpu_time_ns = 0i64;
+
+    macro_rules! get_accumulated_cpu_time_ms {
+      () => {
+        accumulated_cpu_time_ns / 1_000_000
+      };
+    }
+
+    let inspector = self.inspector();
+
+    if let Err(err) = self.init_main_module().await {
+      return (Err(err), 0i64);
+    }
+
+    let Some(main_module_id) = self.main_module_id else {
+      return (Err(anyhow!("failed to get main module id")), 0);
+    };
+
+    if inspector.is_some() {
+      let state = self.runtime_state.clone();
+      let _guard = scopeguard::guard_on_unwind((), |_| {
+        state.terminated.raise();
+      });
+
+      {
+        let _guard =
+          scopeguard::guard(state.found_inspector_session.clone(), |v| {
+            v.raise();
+          });
+
+        // XXX(Nyannyacha): Suppose the user skips this function by
+        // passing the `--inspect` argument. In that case, the runtime
+        // may terminate before the inspector session is connected if
+        // the function doesn't have a long execution time. Should we
+        // wait for an inspector session to connect with the V8?
+        self.wait_for_inspector_session();
+      }
+
+      if self.termination_request_token.is_cancelled() {
+        state.terminated.raise();
+        return (Ok(()), 0i64);
+      }
+    }
+
+    {
+      let evaluating_mod =
+        scopeguard::guard(self.runtime_state.evaluating_mod.clone(), |v| {
+          v.lower();
+        });
+
+      evaluating_mod.raise();
+
+      // CRITICAL: Create CPU metrics guard BEFORE mod_evaluate() is called!
+      // The mod_evaluate() call synchronously evaluates the module (runs top-level
+      // code) even though it returns a future. The top-level code runs immediately
+      // when the future is created, not when it's polled. We must start CPU tracking
+      // BEFORE this happens.
+      let mut mod_eval_cpu_time_ns = 0i64;
+      let cpu_metrics_guard_for_mod_eval = get_cpu_metrics_guard_inner(
+        "mod_eval",
+        self.js_runtime.op_state(),
+        &maybe_cpu_usage_metrics_tx,
+        &mut mod_eval_cpu_time_ns,
+      );
+
+      // Create the mod_evaluate future wrapped in ScopedFuture so it has a HandleScope when polled
+      let isolate_ptr = {
+        let isolate_ref: &mut v8::Isolate = self.js_runtime.v8_isolate();
+        isolate_ref as *mut v8::Isolate
+      };
+      let context = self.js_runtime.main_context();
+      let mod_evaluate_future = self.js_runtime.mod_evaluate(main_module_id);
+      let mut mod_fut = ScopedFuture {
+        future: mod_evaluate_future,
+        isolate: isolate_ptr,
+        context,
+      };
+
+      let event_loop_fut = self.run_event_loop(
+        wait_termination_request_token,
+        &maybe_cpu_usage_metrics_tx,
+        &mut accumulated_cpu_time_ns,
+      );
+
+      let mod_result = tokio::select! {
+        // Not using biased mode leads to non-determinism for relatively
+        // simple programs.
+        biased;
+
+        maybe_mod_result = &mut mod_fut => {
+          debug!("received module evaluate {:#?}", maybe_mod_result);
+          maybe_mod_result.map_err(Into::into)
+        }
+
+        event_loop_result = event_loop_fut => {
+          if let Err(err) = event_loop_result {
+            Err(
+              anyhow!(
+                "event loop error while evaluating the module: {}",
+                err
+              )
+            )
+          } else {
+            let result = mod_fut.await.map_err(Into::into);
+            result
+          }
+        }
+      };
+
+      // Drop the CPU metrics guard after module evaluation completes
+      // to send CPUUsageMetrics::Leave
+      drop(cpu_metrics_guard_for_mod_eval);
+      // Add module evaluation CPU time to the main accumulator
+      accumulated_cpu_time_ns += mod_eval_cpu_time_ns;
+
+      if let Err(err) = mod_result {
+        return (Err(err), get_accumulated_cpu_time_ms!());
+      }
+      if self.conf.is_user_worker()
+        && self.runtime_state.is_event_loop_completed()
+        && self.promise_metrics.have_all_promises_been_resolved()
+      {
+        return (Ok(()), get_accumulated_cpu_time_ms!());
+      }
+
+      {
+        if !self.termination_request_token.is_cancelled() {
+          if let Err(err) = with_cpu_metrics_guard(
+            "load_event",
+            self.js_runtime.op_state(),
+            &maybe_cpu_usage_metrics_tx,
+            &mut accumulated_cpu_time_ns,
+            || MaybeDenoRuntime::DenoRuntime(self).dispatch_load_event(),
+          ) {
+            return (Err(err), get_accumulated_cpu_time_ms!());
+          }
+        }
+      }
+    }
+
+    self.runtime_state.init.lower();
+    self.runtime_state.event_loop_completed.lower();
+
+    if let Err(err) = self
+      .run_event_loop(
+        wait_termination_request_token,
+        &maybe_cpu_usage_metrics_tx,
+        &mut accumulated_cpu_time_ns,
+      )
+      .await
+    {
+      return (
+        Err(anyhow!("event loop error: {}", err)),
+        get_accumulated_cpu_time_ms!(),
+      );
+    }
+
+    if !self.conf.is_user_worker() {
+      let mut guard = self.get_v8_termination_guard();
+
+      if let Err(err) = with_cpu_metrics_guard(
+        "unload_event",
+        guard.js_runtime.op_state(),
+        &maybe_cpu_usage_metrics_tx,
+        &mut accumulated_cpu_time_ns,
+        || MaybeDenoRuntime::DenoRuntime(&mut guard).dispatch_unload_event(),
+      ) {
+        return (Err(err), get_accumulated_cpu_time_ms!());
+      }
+
+      // TODO(Nyannyacha): Here we also need to trigger the event for node
+      // platform (i.e; exit)
+    }
+
+    (Ok(()), get_accumulated_cpu_time_ms!())
+  }
+
+  fn run_event_loop<'l>(
+    &'l mut self,
+    wait_termination_request_token: bool,
+    maybe_cpu_usage_metrics_tx: &'l Option<
+      mpsc::UnboundedSender<CPUUsageMetrics>,
+    >,
+    accumulated_cpu_time_ns: &'l mut i64,
+  ) -> impl Future<Output = Result<(), AnyError>> + 'l {
+    let has_inspector = self.inspector().is_some();
+    let is_user_worker = self.conf.is_user_worker();
+    let global_waker = self.waker.clone();
+
+    let mut termination_request_fut = self
+      .termination_request_token
+      .clone()
+      .cancelled_owned()
+      .boxed();
+
+    let beforeunload_cpu_threshold = self.beforeunload_cpu_threshold.clone();
+    let beforeunload_mem_threshold = self.beforeunload_mem_threshold.clone();
+
+    let state = self.runtime_state.clone();
+    let mem_check_state = is_user_worker.then(|| self.mem_check.clone());
+
+    poll_fn(move |cx| {
+      let waker = cx.waker();
+      let woked = global_waker.take().is_none();
+
+      global_waker.register(waker);
+
+      // let mut this = {
+      //   self.assert_isolate_not_locked();
+      //   unsafe { self.with_locker() }
+      // };
+      let this = &mut *self;
+
+      if woked {
+        unsafe extern "C" fn dummy(
+          _: v8::UnsafeRawIsolatePtr,
+          _: *mut std::ffi::c_void,
+        ) {
+        }
+        this
+          .js_runtime
+          .v8_isolate()
+          .thread_safe_handle()
+          .request_interrupt(
+            as_interrupt_callback(dummy),
+            std::ptr::null_mut(),
+          );
+      }
+
+      let op_state = this.js_runtime.op_state();
+      let cpu_metrics_guard = get_cpu_metrics_guard_inner(
+        "event_loop_poll",
+        op_state.clone(),
+        maybe_cpu_usage_metrics_tx,
+        accumulated_cpu_time_ns,
+      );
+
+      // Don't pin the event loop open for an inspector session once the
+      // supervisor has decided to kill us. Otherwise the worker thread stays
+      // alive holding onto the runtime, the runtime never drops, and the
+      // inspector never deregisters — leaving any attached DevTools
+      // WebSocket hanging until the client times out.
+      //
+      // We sample two kill signals (`state.is_terminated()` and
+      // `termination_request_token.is_cancelled()`) and we poll the
+      // termination future on the outer waker. Polling here matters: it
+      // registers `cx`'s waker against the cancellation token, so if the
+      // supervisor cancels the token while we are parked inside
+      // `poll_event_loop` (with `wait_for_inspector = true`), we get woken
+      // up immediately and the next iteration of this poll_fn recomputes
+      // `wait_for_inspector` with the fresh signal, breaking the TOCTOU.
+      let termination_requested =
+        termination_request_fut.poll_unpin(cx).is_ready();
+      let wait_for_inspector =
+        if has_inspector && !state.is_terminated() && !termination_requested {
+          let inspector = this.js_runtime.inspector();
+          let sessions_state = inspector.sessions_state();
+          sessions_state.has_active || sessions_state.has_blocking
+        } else {
+          false
+        };
+
+      let need_pool_event_loop = !is_user_worker || woked;
+      let poll_result = if need_pool_event_loop {
+        struct JsRuntimeWaker(Arc<AtomicWaker>);
+
+        impl WakeRef for JsRuntimeWaker {
+          fn wake_by_ref(&self) {
+            self.0.wake();
+          }
+        }
+
+        let waker = if is_user_worker {
+          Cow::Owned(
+            Arc::new(JsRuntimeWaker(global_waker.clone())).into_waker(),
+          )
+        } else {
+          Cow::Borrowed(waker)
+        };
+
+        let isolate_ptr = {
+          let isolate_ref: &mut v8::Isolate = this.js_runtime.v8_isolate();
+          isolate_ref as *mut v8::Isolate
+        };
+
+        // SAFETY: the pointer was taken from the live js_runtime just above
+        // and is only used within this poll on the same thread; the raw
+        // round-trip merely detaches the borrow from `this.js_runtime` so the
+        // runtime can be borrowed again for poll_event_loop below.
+        let isolate = unsafe { &mut *isolate_ptr };
+        let scope_storage = std::pin::pin!(v8::HandleScope::new(isolate));
+        let mut scope = scope_storage.init();
+        let context = this.js_runtime.main_context();
+        let context_local = v8::Local::new(&scope, context);
+        let _context_scope = v8::ContextScope::new(&mut scope, context_local);
+
+        this.js_runtime.poll_event_loop(
+          &mut std::task::Context::from_waker(waker.as_ref()),
+          PollEventLoopOptions { wait_for_inspector },
+        )
+      } else {
+        Poll::Pending
+      };
+
+      drop(cpu_metrics_guard);
+
+      if is_user_worker {
+        let mem_state = mem_check_state.as_ref().unwrap();
+        let total_malloced_bytes =
+          mem_state.check(this.js_runtime.v8_isolate().as_mut());
+
+        mem_state.waker.register(waker);
+
+        if let Some(threshold_ms) =
+          beforeunload_cpu_threshold.load().as_deref().copied()
+        {
+          let threshold_ns = (threshold_ms as i128) * 1_000_000;
+          if (*accumulated_cpu_time_ns as i128) >= threshold_ns {
+            beforeunload_cpu_threshold.store(None);
+
+            if !state.is_terminated() {
+              let _cpu_metrics_guard = get_cpu_metrics_guard_inner(
+                "beforeunload_cpu",
+                op_state.clone(),
+                maybe_cpu_usage_metrics_tx,
+                accumulated_cpu_time_ns,
+              );
+
+              if let Err(err) = MaybeDenoRuntime::DenoRuntime(&mut *this)
+                .dispatch_beforeunload_event(WillTerminateReason::CPU)
+              {
+                if state.is_terminated() {
+                  return Poll::Ready(Err(anyhow!("execution terminated")));
+                }
+                return Poll::Ready(Err(err));
+              }
+            }
+          }
+        }
+
+        if let Some(limit) = mem_state.limit {
+          if total_malloced_bytes >= limit / 2 {
+            state.mem_reached_half.raise();
+          } else {
+            state.mem_reached_half.lower();
+          }
+        }
+
+        if let Some(threshold_bytes) =
+          beforeunload_mem_threshold.load().as_deref().copied()
+        {
+          let total_malloced_bytes = total_malloced_bytes as u64;
+
+          if total_malloced_bytes >= threshold_bytes {
+            beforeunload_mem_threshold.store(None);
+
+            if !state.is_terminated() && !mem_state.is_exceeded() {
+              let _cpu_metrics_guard = get_cpu_metrics_guard_inner(
+                "beforeunload_mem",
+                op_state,
+                maybe_cpu_usage_metrics_tx,
+                accumulated_cpu_time_ns,
+              );
+
+              if let Err(err) = MaybeDenoRuntime::DenoRuntime(&mut *this)
+                .dispatch_beforeunload_event(WillTerminateReason::Memory)
+              {
+                if state.is_terminated() {
+                  return Poll::Ready(Err(anyhow!("execution terminated")));
+                }
+                return Poll::Ready(Err(err));
+              }
+            }
+          }
+        }
+
+        // Check if wall clock beforeunload was triggered by the supervisor
+        if state.wall_clock_beforeunload_triggered.is_raised() {
+          state.wall_clock_beforeunload_triggered.lower();
+
+          if !state.is_terminated() {
+            if let Err(err) = MaybeDenoRuntime::DenoRuntime(&mut *this)
+              .dispatch_beforeunload_event(WillTerminateReason::WallClock)
+            {
+              if state.is_terminated() {
+                return Poll::Ready(Err(anyhow!("execution terminated")));
+              }
+              return Poll::Ready(Err(err));
+            }
+          }
+        }
+
+        // Check if drain was triggered by the supervisor
+        if state.drain_triggered.is_raised() {
+          state.drain_triggered.lower();
+
+          if !state.is_terminated() {
+            if let Err(err) =
+              MaybeDenoRuntime::DenoRuntime(&mut *this).dispatch_drain_event()
+            {
+              if state.is_terminated() {
+                return Poll::Ready(Err(anyhow!("execution terminated")));
+              }
+              return Poll::Ready(Err(err));
+            }
+          }
+        }
+      }
+
+      if need_pool_event_loop
+        && poll_result.is_pending()
+        && termination_request_fut.poll_unpin(cx).is_ready()
+      {
+        if state.is_evaluating_mod() {
+          return Poll::Ready(Err(anyhow!("execution terminated")));
+        }
+
+        return Poll::Ready(Ok(()));
+      }
+
+      match poll_result {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
+        Poll::Ready(Ok(())) => {
+          if !state.is_event_loop_completed() {
+            state.event_loop_completed.raise();
+          }
+          if wait_termination_request_token
+            && !termination_request_fut.poll_unpin(cx).is_ready()
+          {
+            return Poll::Pending;
+          }
+
+          Poll::Ready(Ok(()))
+        }
+      }
+    })
+  }
+
+  pub fn inspector(&self) -> Option<Inspector> {
+    self.worker.inspector.clone()
+  }
+
+  pub fn main_module_url(&self) -> &Url {
+    &self.main_module_url
+  }
+
+  pub fn promise_metrics(&self) -> PromiseMetrics {
+    self.promise_metrics.clone()
+  }
+
+  pub fn mem_check_state(&self) -> Arc<RwLock<MemCheckState>> {
+    self.mem_check.state.clone()
+  }
+
+  pub fn mem_check_lifecycle(&self) -> Arc<base_rt::IsolateLifecycle> {
+    self.mem_check.lifecycle.clone()
+  }
+
+  pub fn add_memory_limit_callback<C>(&self, cb: C)
+  where
+    // XXX(Nyannyacha): Should we relax bounds a bit more?
+    C: FnOnce(MemCheckState) + Send + 'static,
+  {
+    let runtime_token = self.drop_token.clone();
+    let exceeded_token = self.mem_check.exceeded_token.clone();
+    let state = self.mem_check_state();
+
+    drop(base_rt::SUPERVISOR_RT.spawn(async move {
+      tokio::select! {
+        _ = runtime_token.cancelled_owned() => {}
+        _ = exceeded_token.cancelled_owned() => {
+          let state = tokio::task::spawn_blocking({
+            let state = state.clone();
+            move || {
+              *state.read().unwrap()
+            }
+          }).await.unwrap();
+
+          cb(state);
+        }
+      }
+    }));
+  }
+
+  #[instrument(level = "debug", skip(self))]
+  fn wait_for_inspector_session(&mut self) {
+    debug!(has_inspector = self.worker.inspector.is_some());
+    if let Some(inspector) = self.worker.inspector.as_ref() {
+      debug!(
+        addr = %inspector.server.host,
+        server.inspector = ?inspector.option
+      );
+      let inspector_impl = self.js_runtime.inspector();
+
+      if inspector.option.is_with_break() {
+        inspector_impl.wait_for_session_and_break_on_next_statement();
+      } else if inspector.option.is_with_wait() {
+        inspector_impl.wait_for_session();
+      }
+    }
+  }
+
+  fn terminate_execution_if_cancelled(
+    &mut self,
+  ) -> ScopeGuard<CancellationToken, Box<dyn FnOnce(CancellationToken)>> {
+    terminate_execution_if_cancelled(
+      self.js_runtime.v8_isolate(),
+      self.termination_request_token.clone(),
+    )
+  }
+
+  fn get_v8_termination_guard<'l>(
+    &'l mut self,
+  ) -> scopeguard::ScopeGuard<
+    &'l mut DenoRuntime<RuntimeContext>,
+    impl FnOnce(&'l mut DenoRuntime<RuntimeContext>) + 'l,
+  > {
+    let was_terminating_execution =
+      self.js_runtime.v8_isolate().is_execution_terminating();
+    let mut guard = scopeguard::guard(self, move |v| {
+      if was_terminating_execution {
+        v.js_runtime.v8_isolate().terminate_execution();
+      }
+
+      v.js_runtime
+        .v8_isolate()
+        .set_microtasks_policy(v8::MicrotasksPolicy::Auto);
+    });
+
+    guard.js_runtime.v8_isolate().cancel_terminate_execution();
+    guard
+      .js_runtime
+      .v8_isolate()
+      .set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+    guard
+  }
+}
+
+#[allow(
+  dead_code,
+  reason = "locker debugging helper; only referenced when diagnosing isolate lock issues"
+)]
+trait JsRuntimeLockerGuard {
+  fn js_runtime(&mut self) -> &mut JsRuntime;
+
+  unsafe fn with_locker<'l>(
+    &'l mut self,
+  ) -> scopeguard::ScopeGuard<&'l mut Self, impl FnOnce(&'l mut Self) + 'l> {
+    let js_runtime = self.js_runtime();
+    let isolate = js_runtime.v8_isolate();
+
+    let isolate_key = isolate_debug_key(isolate);
+    let depth_after_increment = LOCK_DEBUG_STATES.with(|states| {
+      let mut states = states.borrow_mut();
+      let state = states.entry(isolate_key).or_default();
+      state.ever_locked = true;
+      state.depth = state.depth.saturating_add(1);
+      state.depth
+    });
+    log_locker_event(isolate_key, "acquire_start", depth_after_increment);
+
+    let locker =
+      Locker::new(std::mem::transmute::<&mut Isolate, &mut Isolate>(isolate));
+    log_locker_event(isolate_key, "acquire_complete", depth_after_increment);
+
+    scopeguard::guard(self, move |_guard| {
+      // Update debug state on exit
+      let depth_before_release = LOCK_DEBUG_STATES.with(|states| {
+        if let Some(state) = states.borrow_mut().get_mut(&isolate_key) {
+          let before = state.depth;
+          state.depth = state.depth.saturating_sub(1);
+          before
+        } else {
+          0
+        }
+      });
+      log_locker_event(isolate_key, "release", depth_before_release);
+      drop(locker);
+    })
+  }
+}
+
+impl<C> JsRuntimeLockerGuard for DenoRuntime<C> {
+  fn js_runtime(&mut self) -> &mut JsRuntime {
+    &mut self.js_runtime
+  }
+}
+
+impl JsRuntimeLockerGuard for JsRuntime {
+  fn js_runtime(&mut self) -> &mut JsRuntime {
+    self
+  }
+}
+
+#[allow(
+  dead_code,
+  reason = "locker debugging helper; only referenced when diagnosing isolate lock issues"
+)]
+async unsafe fn spawn_blocking_non_send<F, R>(
+  non_send_fn: F,
+) -> Result<R, tokio::task::JoinError>
+where
+  F: FnOnce() -> R,
+  R: 'static,
+{
+  let span = Span::current();
+  let caller_thread_id = std::thread::current().id();
+  debug!(
+    target = "edge::runtime::blocking",
+    action = "schedule",
+    caller_thread = ?caller_thread_id,
+  );
+  let disguised_fn = unsync::MaskValueAsSend { value: non_send_fn };
+  let (mut scope, ..) = async_scoped::TokioScope::scope(|s| {
+    let span = span.clone();
+    s.spawn_blocking(move || {
+      let worker_thread_id = std::thread::current().id();
+      debug!(
+        target = "edge::runtime::blocking",
+        action = "start",
+        caller_thread = ?caller_thread_id,
+        worker_thread = ?worker_thread_id,
+      );
+      let _span = span.entered();
+
+      let result = unsync::MaskValueAsSend {
+        value: disguised_fn.into_inner()(),
+      };
+
+      debug!(
+        target = "edge::runtime::blocking",
+        action = "finish",
+        worker_thread = ?worker_thread_id,
+      );
+      result
+    });
+  });
+
+  assert_eq!(scope.len(), 1);
+  let stream = {
+    let stream = scope.collect().await;
+
+    drop(scope);
+    stream
+  };
+
+  let mut iter = stream
+    .into_iter()
+    .map(|it| it.map(unsync::MaskValueAsSend::into_inner));
+
+  let ret = iter.next();
+  assert!(iter.next().is_none());
+
+  match ret {
+    Some(v) => v,
+    None => unreachable!("scope.len() == 1"),
+  }
+}
+
+type TerminateExecutionIfCancelledReturnType =
+  ScopeGuard<CancellationToken, Box<dyn FnOnce(CancellationToken)>>;
+
+pub struct IsolateWithCancellationToken<'l>(
+  &'l mut v8::Isolate,
+  CancellationToken,
+);
+
+impl std::ops::Deref for IsolateWithCancellationToken<'_> {
+  type Target = v8::Isolate;
+
+  fn deref(&self) -> &Self::Target {
+    &*self.0
+  }
+}
+
+impl std::ops::DerefMut for IsolateWithCancellationToken<'_> {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    self.0
+  }
+}
+
+impl IsolateWithCancellationToken<'_> {
+  fn terminate_execution_if_cancelled(
+    &mut self,
+  ) -> ScopeGuard<CancellationToken, Box<dyn FnOnce(CancellationToken)>> {
+    terminate_execution_if_cancelled(self.0, self.1.clone())
+  }
+}
+
+pub enum MaybeDenoRuntime<'l, RuntimeContext> {
+  DenoRuntime(&'l mut DenoRuntime<RuntimeContext>),
+  Isolate(&'l mut v8::Isolate),
+  IsolateWithCancellationToken(IsolateWithCancellationToken<'l>),
+}
+
+impl<'l, RuntimeContext> MaybeDenoRuntime<'l, RuntimeContext>
+where
+  RuntimeContext: GetRuntimeContext,
+{
+  #[allow(unused, reason = "used only by some supervisor strategies")]
+  fn v8_isolate(&mut self) -> &mut v8::Isolate {
+    match self {
+      Self::DenoRuntime(v) => v.js_runtime.v8_isolate(),
+      Self::Isolate(v) => v,
+      Self::IsolateWithCancellationToken(v) => v.0,
+    }
+  }
+
+  fn op_state(&mut self) -> Rc<RefCell<OpState>> {
+    match self {
+      Self::DenoRuntime(v) => v.js_runtime.op_state(),
+      Self::Isolate(v) => JsRuntime::op_state_from(v),
+      Self::IsolateWithCancellationToken(v) => JsRuntime::op_state_from(v.0),
+    }
+  }
+
+  fn terminate_execution_if_cancelled(
+    &mut self,
+  ) -> Option<TerminateExecutionIfCancelledReturnType> {
+    match self {
+      Self::DenoRuntime(v) => Some(v.terminate_execution_if_cancelled()),
+      Self::IsolateWithCancellationToken(v) => {
+        Some(v.terminate_execution_if_cancelled())
+      }
+      Self::Isolate(_) => None,
+    }
+  }
+
+  /// Dispatches "load" event to the JavaScript runtime.
+  ///
+  /// Does not poll event loop, and thus not await any of the "load" event
+  /// handlers.
+  pub fn dispatch_load_event(&mut self) -> Result<(), AnyError> {
+    let _guard = self.terminate_execution_if_cancelled();
+
+    let op_state = self.op_state();
+    let dispatch_fns = {
+      let op_state_ref = op_state.borrow();
+      op_state_ref
+        .try_borrow::<DispatchEventFunctions>()
+        .unwrap()
+        .clone()
+    };
+    let global_context = {
+      let op_state_ref = op_state.borrow();
+      op_state_ref
+        .try_borrow::<GlobalMainContext>()
+        .unwrap()
+        .clone()
+    };
+    drop(op_state);
+
+    let isolate = self.v8_isolate();
+
+    // Create a proper HandleScope with context using the scope_with_context! macro
+    v8::scope_with_context!(scope, isolate, &global_context.0);
+
+    v8::tc_scope!(let tc_scope, scope);
+
+    let event_fn =
+      v8::Local::new(tc_scope, &dispatch_fns.dispatch_load_event_fn_global);
+
+    let undefined = v8::undefined(tc_scope);
+    let fn_args = vec![];
+    let _ = event_fn.call(tc_scope, undefined.into(), &fn_args);
+
+    if tc_scope.has_caught() {
+      if tc_scope.has_terminated() {
+        return Ok(());
+      }
+      if let Some(ex) = tc_scope.exception() {
+        let err = JsError::from_v8_exception(tc_scope, ex);
+        return Err(err.into());
+      }
+    }
+
+    Ok(())
+  }
+
+  /// Dispatches "beforeunload" event to the JavaScript runtime. Returns a
+  /// boolean indicating if the event was prevented and thus event loop should
+  /// continue running.
+  pub fn dispatch_beforeunload_event(
+    &mut self,
+    reason: WillTerminateReason,
+  ) -> Result<bool, AnyError> {
+    let _guard = self.terminate_execution_if_cancelled();
+
+    let op_state = self.op_state();
+    let dispatch_fns = {
+      let op_state_ref = op_state.borrow();
+      op_state_ref
+        .try_borrow::<DispatchEventFunctions>()
+        .unwrap()
+        .clone()
+    };
+    let global_context = {
+      let op_state_ref = op_state.borrow();
+      op_state_ref
+        .try_borrow::<GlobalMainContext>()
+        .unwrap()
+        .clone()
+    };
+    drop(op_state);
+
+    let isolate = self.v8_isolate();
+
+    // Create a proper HandleScope with context using the scope_with_context! macro
+    v8::scope_with_context!(scope, isolate, &global_context.0);
+
+    v8::tc_scope!(let tc_scope, scope);
+
+    let event_fn = v8::Local::new(
+      tc_scope,
+      &dispatch_fns.dispatch_beforeunload_event_fn_global,
+    );
+
+    let undefined = v8::undefined(tc_scope);
+    let fn_args = vec![
+      v8::String::new_external_onebyte_static(
+        tc_scope,
+        <&'static str>::from(reason).as_bytes(),
+      )
+      .unwrap()
+      .into(),
+    ];
+    let fn_ret = event_fn.call(tc_scope, undefined.into(), &fn_args);
+
+    if tc_scope.has_caught() {
+      if tc_scope.has_terminated() {
+        return Ok(false);
+      }
+      if let Some(ex) = tc_scope.exception() {
+        let err = JsError::from_v8_exception(tc_scope, ex);
+        return Err(err.into());
+      }
+    }
+
+    match fn_ret {
+      Some(ret_val) => Ok(ret_val.is_false()),
+      None => Ok(false),
+    }
+  }
+
+  /// Dispatches "unload" event to the JavaScript runtime.
+  ///
+  /// Does not poll event loop, and thus not await any of the "unload" event
+  /// handlers.
+  pub fn dispatch_unload_event(&mut self) -> Result<(), AnyError> {
+    // NOTE(Nyannyacha): It is currently not possible to dispatch this event
+    // because the supervisor has forcibly pulled the isolate out of the running
+    // state and the `CancellationToken` prevents function invocation.
+    //
+    // If we want to dispatch this event, we may need to provide an extra margin
+    // for the invocation.
+
+    // self.v8_isolate().cancel_terminate_execution();
+    let _guard = self.terminate_execution_if_cancelled();
+
+    let op_state = self.op_state();
+    let dispatch_fns = {
+      let op_state_ref = op_state.borrow();
+      op_state_ref
+        .try_borrow::<DispatchEventFunctions>()
+        .unwrap()
+        .clone()
+    };
+    let global_context = {
+      let op_state_ref = op_state.borrow();
+      op_state_ref
+        .try_borrow::<GlobalMainContext>()
+        .unwrap()
+        .clone()
+    };
+    drop(op_state);
+
+    let isolate = self.v8_isolate();
+
+    // Create a proper HandleScope with context using the scope_with_context! macro
+    v8::scope_with_context!(scope, isolate, &global_context.0);
+
+    v8::tc_scope!(let tc_scope, scope);
+
+    let event_fn =
+      v8::Local::new(tc_scope, &dispatch_fns.dispatch_unload_event_fn_global);
+
+    let undefined = v8::undefined(tc_scope);
+    let fn_args = vec![];
+    let _ = event_fn.call(tc_scope, undefined.into(), &fn_args);
+
+    if tc_scope.has_caught() {
+      if tc_scope.has_terminated() {
+        return Ok(());
+      }
+      if let Some(ex) = tc_scope.exception() {
+        let err = JsError::from_v8_exception(tc_scope, ex);
+        return Err(err.into());
+      }
+    }
+
+    Ok(())
+  }
+
+  /// Dispatches "drain" event to the JavaScript runtime.
+  ///
+  /// Does not poll event loop, and thus not await any of the "drain" event
+  /// handlers.
+  pub fn dispatch_drain_event(&mut self) -> Result<(), AnyError> {
+    let _guard = self.terminate_execution_if_cancelled();
+
+    let op_state = self.op_state();
+    let dispatch_fns = {
+      let op_state_ref = op_state.borrow();
+      op_state_ref
+        .try_borrow::<DispatchEventFunctions>()
+        .unwrap()
+        .clone()
+    };
+    let global_context = {
+      let op_state_ref = op_state.borrow();
+      op_state_ref
+        .try_borrow::<GlobalMainContext>()
+        .unwrap()
+        .clone()
+    };
+    drop(op_state);
+
+    let isolate = self.v8_isolate();
+
+    // Create a proper HandleScope with context using the scope_with_context! macro
+    v8::scope_with_context!(scope, isolate, &global_context.0);
+
+    v8::tc_scope!(let tc_scope, scope);
+
+    let event_fn =
+      v8::Local::new(tc_scope, &dispatch_fns.dispatch_drain_event_fn_global);
+
+    let undefined = v8::undefined(tc_scope);
+    let fn_args = vec![];
+    let _ = event_fn.call(tc_scope, undefined.into(), &fn_args);
+
+    if tc_scope.has_caught() {
+      if tc_scope.has_terminated() {
+        return Ok(());
+      }
+      if let Some(ex) = tc_scope.exception() {
+        let err = JsError::from_v8_exception(tc_scope, ex);
+        return Err(err.into());
+      }
+    }
+
+    Ok(())
+  }
+}
+
+pub fn import_meta_resolve_callback(
+  loader: &dyn ModuleLoader,
+  specifier: String,
+  referrer: String,
+) -> Result<ModuleSpecifier, AnyError> {
+  loader
+    .resolve(&specifier, &referrer, ResolutionKind::DynamicImport)
+    .map_err(Into::into)
+}
+
+fn with_cpu_metrics_guard<'l, F, R>(
+  call_site: &'static str,
+  op_state: Rc<RefCell<OpState>>,
+  maybe_cpu_usage_metrics_tx: &'l Option<
+    mpsc::UnboundedSender<CPUUsageMetrics>,
+  >,
+  accumulated_cpu_time_ns: &'l mut i64,
+  work_fn: F,
+) -> R
+where
+  F: FnOnce() -> R,
+{
+  let _cpu_metrics_guard = get_cpu_metrics_guard_inner(
+    call_site,
+    op_state,
+    maybe_cpu_usage_metrics_tx,
+    accumulated_cpu_time_ns,
+  );
+
+  work_fn()
+}
+
+fn get_cpu_metrics_guard_inner<'l>(
+  _call_site: &'static str,
+  op_state: Rc<RefCell<OpState>>,
+  maybe_cpu_usage_metrics_tx: &'l Option<
+    mpsc::UnboundedSender<CPUUsageMetrics>,
+  >,
+  accumulated_cpu_time_ns: &'l mut i64,
+) -> scopeguard::ScopeGuard<(), Box<dyn FnOnce(()) + 'l>> {
+  let Some(cpu_usage_metrics_tx) = maybe_cpu_usage_metrics_tx.as_ref() else {
+    return scopeguard::guard((), Box::new(|_| {}));
+  };
+
+  #[derive(Clone)]
+  struct CurrentCPUTimer {
+    thread_id: std::thread::ThreadId,
+    timer: CPUTimer,
+  }
+
+  let current_thread_id = std::thread::current().id();
+  let send_cpu_metrics_fn = move |metric: CPUUsageMetrics| {
+    let _ = cpu_usage_metrics_tx.send(metric);
+  };
+
+  let mut state = op_state.borrow_mut();
+  let cpu_timer = if state.has::<CurrentCPUTimer>() {
+    let current_cpu_timer = state.borrow::<CurrentCPUTimer>();
+    if current_cpu_timer.thread_id != current_thread_id {
+      state.take::<CurrentCPUTimer>();
+      None
+    } else {
+      Some(current_cpu_timer.timer.clone())
+    }
+  } else {
+    None
+  };
+  let cpu_timer = if let Some(timer) = cpu_timer {
+    timer
+  } else {
+    let cpu_timer = CurrentCPUTimer {
+      thread_id: current_thread_id,
+      timer: CPUTimer::new().unwrap(),
+    };
+
+    state.put(cpu_timer.clone());
+    cpu_timer.timer
+  };
+
+  drop(state);
+  send_cpu_metrics_fn(CPUUsageMetrics::Enter(current_thread_id, cpu_timer));
+
+  let current_cpu_time_ns = get_current_cpu_time_ns().unwrap();
+
+  scopeguard::guard(
+    (),
+    Box::new(move |_| {
+      debug_assert_eq!(current_thread_id, std::thread::current().id());
+
+      let cpu_time_after_drop_ns =
+        get_current_cpu_time_ns().unwrap_or(current_cpu_time_ns);
+      let blocking_cpu_time_ns =
+        BlockingScopeCPUUsage::get_cpu_usage_ns_and_reset(
+          &mut op_state.borrow_mut(),
+        );
+
+      let diff_cpu_time_ns = cpu_time_after_drop_ns - current_cpu_time_ns;
+
+      *accumulated_cpu_time_ns += diff_cpu_time_ns;
+      *accumulated_cpu_time_ns += blocking_cpu_time_ns;
+
+      send_cpu_metrics_fn(CPUUsageMetrics::Leave(CPUUsage {
+        accumulated: *accumulated_cpu_time_ns,
+        diff: diff_cpu_time_ns,
+      }));
+
+      debug!(
+        accumulated_cpu_time_ms = *accumulated_cpu_time_ns / 1_000_000,
+        blocking_cpu_time_ms = blocking_cpu_time_ns / 1_000_000,
+      );
+    }),
+  )
+}
+
+fn terminate_execution_if_cancelled(
+  isolate: &mut v8::Isolate,
+  token: CancellationToken,
+) -> TerminateExecutionIfCancelledReturnType {
+  let handle = isolate.thread_safe_handle();
+  let cancel_task_token = CancellationToken::new();
+
+  drop(base_rt::SUPERVISOR_RT.spawn({
+    let cancel_task_token = cancel_task_token.clone();
+
+    async move {
+      if token.is_cancelled() {
+        handle.terminate_execution();
+      } else {
+        tokio::select! {
+          _ = token.cancelled_owned() => {
+            handle.terminate_execution();
+          }
+
+          _ = cancel_task_token.cancelled_owned() => {}
+        }
+      }
+    }
+  }));
+
+  scopeguard::guard(
+    cancel_task_token,
+    Box::new(|v| {
+      v.cancel();
+    }),
+  )
+}
+
+fn set_v8_flags() {
+  let v8_flags = std::env::var("V8_FLAGS").unwrap_or_default();
+  let debug_gc = std::env::var("TREX_DEBUG_GC").is_ok();
+  let mut vec = vec![""];
+
+  // Add GC debugging flags if TREX_DEBUG_GC is set
+  if debug_gc {
+    vec.extend([
+      "--trace-gc",
+      "--trace-gc-verbose",
+      "--trace-gc-object-stats",
+    ]);
+    tracing::info!("V8 GC debugging enabled via TREX_DEBUG_GC");
+  }
+
+  if !v8_flags.is_empty() {
+    vec.append(&mut v8_flags.split(' ').collect());
+  }
+
+  if vec.len() <= 1 {
+    return;
+  }
+
+  let ignored =
+    deno_core::v8_set_flags(vec.iter().map(|v| v.to_string()).collect());
+
+  if *ignored.as_slice() != [""] {
+    error!("v8 flags unrecognized {:?}", ignored);
+  }
+}
+
+unsafe extern "C" fn mem_check_gc_prologue_callback_fn(
+  isolate: v8::UnsafeRawIsolatePtr,
+  ty: GCType,
+  flags: GCCallbackFlags,
+  data: *mut c_void,
+) {
+  static DEBUG_GC: Lazy<bool> =
+    Lazy::new(|| std::env::var("TREX_DEBUG_GC").is_ok());
+
+  if *DEBUG_GC {
+    tracing::debug!(
+      isolate_ptr = ?isolate,
+      gc_type = ?ty,
+      gc_flags = ?flags,
+      "GC prologue callback invoked"
+    );
+  }
+
+  if isolate.is_null() {
+    if *DEBUG_GC {
+      tracing::warn!("GC prologue: null isolate pointer");
+    }
+    return;
+  }
+  if data.is_null() {
+    if *DEBUG_GC {
+      tracing::warn!("GC prologue: null data pointer");
+    }
+    return;
+  }
+
+  // SAFETY: data is non-null and points to valid MemCheck
+  let mem_check = &*(data as *const MemCheck);
+
+  // Atomically acquire access guard - prevents race with runtime drop
+  let Some(_guard) = mem_check.lifecycle.try_enter() else {
+    if *DEBUG_GC {
+      tracing::debug!("GC prologue: runtime dropping, skipping mem check");
+    }
+    return;
+  };
+
+  // SAFETY: We've verified isolate pointer is non-null and hold lifecycle guard
+  let mut isolate_ref = v8::Isolate::from_raw_isolate_ptr_unchecked(isolate);
+  mem_check.check(&mut isolate_ref);
+}
+
+#[cfg(test)]
+#[allow(
+  clippy::large_futures,
+  reason = "test-only: the test runtime boxes the root future, so stack size is not a concern"
+)]
+mod test {
+  use std::collections::HashMap;
+  use std::io::Write;
+  use std::marker::PhantomData;
+  use std::path::Path;
+  use std::path::PathBuf;
+  use std::sync::Arc;
+  use std::time::Duration;
+
+  // Tests reference fixtures via relative `./test_cases/...` paths. Anchor cwd
+  // to this package's manifest dir so they resolve regardless of whether
+  // `cargo test` runs from the workspace root or the package root.
+  #[::ctor::ctor]
+  fn anchor_cwd_to_manifest() {
+    let _ = std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
+  }
+
+  use anyhow::Context;
+  use deno_core::FastString;
+  use deno_core::error::AnyError;
+  use deno_core::serde_json;
+  use deno_core::v8;
+  use deno_facade::DenoOptionsBuilder;
+  use deno_facade::EmitterFactory;
+  use deno_facade::EszipPayloadKind;
+  use deno_facade::Metadata;
+  use deno_facade::generate_binary_eszip;
+  use ext_workers::context::MainWorkerRuntimeOpts;
+  use ext_workers::context::UserWorkerMsgs;
+  use ext_workers::context::UserWorkerRuntimeOpts;
+  use ext_workers::context::WorkerContextInitOpts;
+  use ext_workers::context::WorkerRuntimeOpts;
+  use fs::s3_fs::S3FsConfig;
+  use fs::tmp_fs::TmpFsConfig;
+  use serde::Serialize;
+  use serde::de::DeserializeOwned;
+  use serial_test::serial;
+  use tempfile::Builder;
+  use tokio::sync::mpsc;
+  use tokio::time::timeout;
+  use url::Url;
+
+  use super::GetRuntimeContext;
+  use super::RunOptionsBuilder;
+  use crate::runtime::DenoRuntime;
+  use crate::server::ServerFlags;
+  use crate::worker::DuplexStreamEntry;
+  use crate::worker::WorkerBuilder;
+
+  impl<RuntimeContext> DenoRuntime<RuntimeContext> {
+    #[allow(dead_code, reason = "test helper; used by a subset of tests")]
+    fn to_value_mut<T>(
+      &mut self,
+      _global_value: &v8::Global<v8::Value>,
+    ) -> Result<T, AnyError>
+    where
+      T: DeserializeOwned + 'static,
+    {
+      // NOTE: handle_scope() is no longer available in deno_core 2.x
+      // This method needs to be updated when V8 handle access is required
+      unimplemented!("handle_scope() API changed in deno_core 2.x")
+    }
+  }
+
+  #[derive(Debug, Default)]
+  struct RuntimeBuilder<C = ()> {
+    path: Option<String>,
+    eszip: Option<EszipPayloadKind>,
+    env_vars: Option<HashMap<String, String>>,
+    worker_runtime_conf: Option<WorkerRuntimeOpts>,
+    static_patterns: Vec<String>,
+    s3_fs_config: Option<S3FsConfig>,
+    tmp_fs_config: Option<TmpFsConfig>,
+    _phantom_context: PhantomData<C>,
+  }
+
+  impl RuntimeBuilder {
+    fn new() -> Self {
+      Self::default()
+    }
+  }
+
+  impl<C> RuntimeBuilder<C> {
+    fn set_context<C2>(self) -> RuntimeBuilder<C2>
+    where
+      C2: GetRuntimeContext,
+    {
+      RuntimeBuilder {
+        path: self.path,
+        eszip: self.eszip,
+        env_vars: self.env_vars,
+        worker_runtime_conf: self.worker_runtime_conf,
+        static_patterns: self.static_patterns,
+        s3_fs_config: self.s3_fs_config,
+        tmp_fs_config: self.tmp_fs_config,
+        _phantom_context: PhantomData,
+      }
+    }
+  }
+
+  impl<C> RuntimeBuilder<C>
+  where
+    C: GetRuntimeContext,
+  {
+    async fn build(self) -> DenoRuntime<C> {
+      let RuntimeBuilder {
+        path,
+        eszip,
+        env_vars,
+        worker_runtime_conf,
+        static_patterns,
+        s3_fs_config,
+        tmp_fs_config,
+        _phantom_context,
+      } = self;
+
+      let (worker_pool_tx, _) = mpsc::unbounded_channel::<UserWorkerMsgs>();
+
+      DenoRuntime::new(
+        WorkerBuilder::new(
+          WorkerContextInitOpts {
+            maybe_eszip: eszip,
+            service_path: path
+              .map(PathBuf::from)
+              .unwrap_or(PathBuf::from("./test_cases/main")),
+
+            conf: {
+              if let Some(conf) = worker_runtime_conf {
+                conf
+              } else {
+                WorkerRuntimeOpts::MainWorker(MainWorkerRuntimeOpts {
+                  worker_pool_tx,
+                  shared_metric_src: None,
+                  event_worker_metric_src: None,
+                  context: None,
+                })
+              }
+            },
+
+            maybe_entrypoint: None,
+            maybe_module_code: None,
+
+            no_module_cache: false,
+            no_npm: None,
+            env_vars: env_vars.unwrap_or_default(),
+
+            static_patterns,
+
+            timing: None,
+
+            maybe_s3_fs_config: s3_fs_config,
+            maybe_tmp_fs_config: tmp_fs_config,
+            maybe_otel_config: None,
+          },
+          Arc::default(),
+        )
+        .build()
+        .unwrap(),
+      )
+      .await
+      .unwrap()
+    }
+  }
+
+  impl<C> RuntimeBuilder<C> {
+    fn set_path(mut self, path: &str) -> Self {
+      // Tests are run from the workspace root (cargo test --workspace),
+      // but fixtures live under this package's directory. Anchor relative
+      // paths to CARGO_MANIFEST_DIR so they resolve regardless of cwd.
+      let resolved = {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+          path.to_string()
+        } else {
+          std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(p)
+            .to_string_lossy()
+            .into_owned()
+        }
+      };
+      let _ = self.path.insert(resolved);
+      self
+    }
+
+    async fn set_eszip<P>(mut self, path: P) -> Result<Self, anyhow::Error>
+    where
+      P: AsRef<Path>,
+    {
+      let _ = self.eszip.insert(EszipPayloadKind::VecKind(
+        tokio::fs::read(path)
+          .await
+          .context("cannot read eszip binary")?,
+      ));
+
+      Ok(self)
+    }
+
+    fn set_env_vars(mut self, vars: HashMap<String, String>) -> Self {
+      let _ = self.env_vars.insert(vars);
+      self
+    }
+
+    fn set_std_env(self) -> Self {
+      self.set_env_vars(std::env::vars().collect())
+    }
+
+    fn set_worker_runtime_conf(mut self, conf: WorkerRuntimeOpts) -> Self {
+      let _ = self.worker_runtime_conf.insert(conf);
+      self
+    }
+
+    #[allow(unused, reason = "test builder helper for s3-gated tests")]
+    fn set_s3_fs_config(mut self, config: S3FsConfig) -> Self {
+      let _ = self.s3_fs_config.insert(config);
+      self
+    }
+
+    fn add_static_pattern(mut self, pat: &str) -> Self {
+      self.static_patterns.push(pat.to_string());
+      self
+    }
+
+    fn extend_static_patterns<I>(mut self, iter: I) -> Self
+    where
+      I: IntoIterator<Item = String>,
+    {
+      self.static_patterns.extend(iter);
+      self
+    }
+  }
+
+  struct WithSyncFileAPI;
+
+  impl GetRuntimeContext for WithSyncFileAPI {
+    fn get_extra_context() -> impl Serialize {
+      serde_json::json!({
+        "useReadSyncFileAPI": true,
+      })
+    }
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_module_code_no_eszip() {
+    let (worker_pool_tx, _) = mpsc::unbounded_channel::<UserWorkerMsgs>();
+
+    DenoRuntime::<()>::new(
+      WorkerBuilder::new(
+        WorkerContextInitOpts {
+          service_path: PathBuf::from("./test_cases/"),
+          no_module_cache: false,
+          no_npm: None,
+          env_vars: Default::default(),
+          timing: None,
+          maybe_eszip: None,
+          maybe_entrypoint: None,
+          maybe_module_code: Some(FastString::from(String::from(
+            "Deno.serve((req) => new Response('Hello World'));",
+          ))),
+          conf: {
+            WorkerRuntimeOpts::MainWorker(MainWorkerRuntimeOpts {
+              worker_pool_tx,
+              shared_metric_src: None,
+              event_worker_metric_src: None,
+              context: None,
+            })
+          },
+          static_patterns: vec![],
+
+          maybe_s3_fs_config: None,
+          maybe_tmp_fs_config: None,
+          maybe_otel_config: None,
+        },
+        Arc::default(),
+      )
+      .build()
+      .unwrap(),
+    )
+    .await
+    .expect("It should not panic");
+  }
+
+  #[tokio::test]
+  #[serial]
+  #[allow(
+    clippy::arc_with_non_send_sync,
+    reason = "single-threaded test; the Arc-wrapped value never crosses threads"
+  )]
+  async fn test_eszip_with_source_file() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (worker_pool_tx, _) = mpsc::unbounded_channel::<UserWorkerMsgs>();
+    let mut temp_file = Builder::new()
+      .prefix("eszip-source-test")
+      .suffix(".ts")
+      .tempfile_in("./test_cases")
+      .unwrap();
+    temp_file
+      .write_all(
+        b"import isEven from \"npm:is-even\";\n\
+          const result = isEven(9);\n\
+          if (result !== false) {\n\
+            throw new Error(`Expected isEven(9) to be false, got: ${result}`);\n\
+          }\n\
+          console.log(\"eszip source file test passed\");",
+      )
+      .unwrap();
+
+    let path_buf = temp_file.path().to_path_buf();
+    let mut emitter_factory = EmitterFactory::new();
+
+    emitter_factory.set_deno_options(
+      DenoOptionsBuilder::new()
+        .entrypoint(path_buf)
+        .build()
+        .await
+        .unwrap(),
+    );
+
+    let mut metadata = Metadata::default();
+    let bin_eszip = generate_binary_eszip(
+      &mut metadata,
+      Arc::new(emitter_factory),
+      None,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+
+    let temp_path = temp_file.into_temp_path();
+    temp_path.close().unwrap();
+
+    let eszip_code = bin_eszip.into_bytes();
+    let mut runtime = DenoRuntime::<()>::new(
+      WorkerBuilder::new(
+        WorkerContextInitOpts {
+          service_path: PathBuf::from("./test_cases/"),
+          no_module_cache: false,
+          no_npm: None,
+          env_vars: Default::default(),
+          timing: None,
+          maybe_eszip: Some(EszipPayloadKind::VecKind(eszip_code)),
+          maybe_entrypoint: None,
+          maybe_module_code: None,
+          conf: {
+            WorkerRuntimeOpts::MainWorker(MainWorkerRuntimeOpts {
+              worker_pool_tx,
+              shared_metric_src: None,
+              event_worker_metric_src: None,
+              context: None,
+            })
+          },
+          static_patterns: vec![],
+          maybe_s3_fs_config: None,
+          maybe_tmp_fs_config: None,
+          maybe_otel_config: None,
+        },
+        Arc::default(),
+      )
+      .build()
+      .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = runtime
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(
+      result.is_ok(),
+      "eszip source file test failed: {:?}",
+      result
+    );
+  }
+
+  #[tokio::test]
+  #[serial]
+  #[allow(
+    clippy::arc_with_non_send_sync,
+    reason = "single-threaded test; the Arc-wrapped value never crosses threads"
+  )]
+  async fn test_create_eszip_from_graph() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (worker_pool_tx, _) = mpsc::unbounded_channel::<UserWorkerMsgs>();
+    let file = PathBuf::from("./test_cases/eszip-silly-test/index.ts");
+    let service_path = PathBuf::from("./test_cases/eszip-silly-test");
+    let mut emitter_factory = EmitterFactory::new();
+
+    emitter_factory.set_deno_options(
+      DenoOptionsBuilder::new()
+        .entrypoint(file)
+        .build()
+        .await
+        .unwrap(),
+    );
+
+    let mut metadata = Metadata::default();
+    let binary_eszip = generate_binary_eszip(
+      &mut metadata,
+      Arc::new(emitter_factory),
+      None,
+      None,
+      None,
+    )
+    .await
+    .unwrap();
+
+    let eszip_code = binary_eszip.into_bytes();
+    let mut runtime = DenoRuntime::<()>::new(
+      WorkerBuilder::new(
+        WorkerContextInitOpts {
+          service_path,
+          no_module_cache: false,
+          no_npm: None,
+          env_vars: Default::default(),
+          timing: None,
+          maybe_eszip: Some(EszipPayloadKind::VecKind(eszip_code)),
+          maybe_entrypoint: None,
+          maybe_module_code: None,
+          conf: {
+            WorkerRuntimeOpts::MainWorker(MainWorkerRuntimeOpts {
+              worker_pool_tx,
+              shared_metric_src: None,
+              event_worker_metric_src: None,
+              context: None,
+            })
+          },
+          static_patterns: vec![],
+          maybe_s3_fs_config: None,
+          maybe_tmp_fs_config: None,
+          maybe_otel_config: None,
+        },
+        Arc::default(),
+      )
+      .build()
+      .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = runtime
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(result.is_ok(), "eszip from graph test failed: {:?}", result);
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_main_runtime_creation() {
+    let mut runtime = RuntimeBuilder::new()
+      .set_path("./test_cases/mainRuntimeCreation")
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = runtime
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(
+      result.is_ok(),
+      "mainRuntimeCreation test failed: {:?}",
+      result
+    );
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_user_runtime_creation() {
+    let mut runtime = RuntimeBuilder::new()
+      .set_path("./test_cases/userRuntimeCreation")
+      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = runtime
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(
+      result.is_ok(),
+      "userRuntimeCreation test failed: {:?}",
+      result
+    );
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_main_rt_fs() {
+    let mut main_rt = RuntimeBuilder::new()
+      .set_std_env()
+      .set_path("./test_cases/readFile")
+      .set_context::<WithSyncFileAPI>()
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = main_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(result.is_ok(), "readTextFileSync test failed: {:?}", result);
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_jsx_import_source() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut main_rt = RuntimeBuilder::new()
+      .set_std_env()
+      .set_path("./test_cases/jsx-preact")
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = main_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(result.is_ok(), "jsx-preact test failed: {:?}", result);
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_node_builtin_imports() {
+    let mut main_rt = RuntimeBuilder::new()
+      .set_std_env()
+      .set_path("./test_cases/node-built-in")
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = main_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(result.is_ok(), "node-built-in test failed: {:?}", result);
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_static_fs() {
+    let mut user_rt = RuntimeBuilder::new()
+      .set_path("./test_cases/staticFs")
+      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .add_static_pattern("./test_cases/**/*.md")
+      .set_context::<WithSyncFileAPI>()
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = user_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(result.is_ok(), "staticFs test failed: {:?}", result);
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_os_ops() {
+    let mut user_rt = RuntimeBuilder::new()
+      .set_path("./test_cases/osOps")
+      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = user_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(result.is_ok(), "osOps test failed: {:?}", result);
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_os_env_vars_main() {
+    std::env::set_var("TREX_TEST_ENV_VAR", "test_value_123");
+
+    let mut main_rt = RuntimeBuilder::new()
+      .set_std_env()
+      .set_path("./test_cases/envVarsMain")
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = main_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    std::env::remove_var("TREX_TEST_ENV_VAR");
+
+    assert!(result.is_ok(), "envVarsMain test failed: {:?}", result);
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_os_env_vars_user() {
+    std::env::set_var("TREX_TEST_ENV_VAR", "test_value_123");
+
+    let mut user_rt = RuntimeBuilder::new()
+      .set_path("./test_cases/envVarsUser")
+      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = user_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    std::env::remove_var("TREX_TEST_ENV_VAR");
+
+    assert!(result.is_ok(), "envVarsUser test failed: {:?}", result);
+  }
+
+  fn create_basic_user_runtime_builder<T, U>(
+    path: &str,
+    memory_limit_mb: T,
+    worker_timeout_ms: U,
+    static_patterns: &[&str],
+  ) -> RuntimeBuilder
+  where
+    T: Into<Option<u64>>,
+    U: Into<Option<u64>>,
+  {
+    let default_opt = UserWorkerRuntimeOpts::default();
+    let memory_limit_mb = memory_limit_mb
+      .into()
+      .unwrap_or(default_opt.memory_limit_mb);
+    let worker_timeout_ms = worker_timeout_ms
+      .into()
+      .unwrap_or(default_opt.worker_timeout_ms);
+
+    RuntimeBuilder::new()
+      .set_path(path)
+      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::new(
+        UserWorkerRuntimeOpts {
+          memory_limit_mb,
+          worker_timeout_ms,
+          cpu_time_soft_limit_ms: 100,
+          cpu_time_hard_limit_ms: 200,
+          force_create: true,
+          ..default_opt
+        },
+      )))
+      .extend_static_patterns(
+        static_patterns.iter().map(|it| String::from(*it)),
+      )
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_array_buffer_allocation_below_limit() {
+    let mut user_rt = create_basic_user_runtime_builder(
+      "./test_cases/array_buffers",
+      20,
+      1000,
+      &[],
+    )
+    .build()
+    .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+    let (result, _) = user_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(result.is_ok(), "expected no errors");
+
+    // however, mem checker must be raised because it aggregates heap usage
+    assert!(user_rt.mem_check.state.read().unwrap().exceeded);
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_array_buffer_allocation_above_limit() {
+    let mut user_rt = create_basic_user_runtime_builder(
+      "./test_cases/array_buffers",
+      15,
+      1000,
+      &[],
+    )
+    .build()
+    .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+    let (result, _) = user_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    match result {
+      Err(err) => {
+        assert!(
+          err
+            .to_string()
+            .contains("RangeError: Array buffer allocation failed")
+        );
+      }
+      _ => panic!("Invalid Result"),
+    };
+  }
+
+  async fn test_mem_check_above_limit(
+    path: &str,
+    static_patterns: &[&str],
+    memory_limit_mb: u64,
+    worker_timeout_ms: u64,
+  ) {
+    let (_duplex_stream_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+    let (callback_tx, mut callback_rx) = mpsc::unbounded_channel::<()>();
+    let mut user_rt = create_basic_user_runtime_builder(
+      path,
+      memory_limit_mb,
+      worker_timeout_ms,
+      static_patterns,
+    )
+    .set_context::<WithSyncFileAPI>()
+    .build()
+    .await;
+
+    let waker = user_rt.waker.clone();
+    let handle = user_rt.js_runtime.v8_isolate().thread_safe_handle();
+
+    user_rt.add_memory_limit_callback(move |_| {
+      assert!(handle.terminate_execution());
+      waker.wake();
+      callback_tx.send(()).unwrap();
+    });
+
+    let wait_fut = async move {
+      let (result, _) = user_rt
+        .run(
+          RunOptionsBuilder::new()
+            .wait_termination_request_token(false)
+            .stream_rx(duplex_stream_rx)
+            .build()
+            .unwrap(),
+        )
+        .await;
+
+      let err = result.unwrap_err();
+      let err_str = err.to_string();
+      assert!(
+        err_str.ends_with("Error: execution terminated"),
+        "Expected error ending with 'Error: execution terminated', got: {}",
+        err_str
+      );
+
+      callback_rx.recv().await.unwrap();
+
+      assert!(user_rt.mem_check.state.read().unwrap().exceeded);
+    };
+
+    if timeout(Duration::from_secs(10), wait_fut).await.is_err() {
+      panic!(
+        "failed to detect a memory limit callback invocation within the given time"
+      );
+    }
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_mem_checker_above_limit_read_file_sync_api() {
+    test_mem_check_above_limit(
+      "./test_cases/read_file_sync_20mib",
+      &["./test_cases/**/*.bin"],
+      15, // 15728640 bytes
+      1000,
+    )
+    .await;
+  }
+
+  // Wasm linear memory is tracked via ext/runtime/js/wasm_memory_tracker.js;
+  // v8 147's HeapStatistics no longer surfaces WasmMemoryObject directly.
+  #[tokio::test]
+  #[serial]
+  async fn test_mem_checker_above_limit_wasm() {
+    test_mem_check_above_limit(
+      "./test_cases/wasm/grow_20mib",
+      &["./test_cases/**/*.wasm"],
+      60, // 62914560 bytes
+      1000,
+    )
+    .await;
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_mem_checker_above_limit_wasm_heap() {
+    test_mem_check_above_limit(
+      "./test_cases/wasm/heap",
+      &["./test_cases/**/*.wasm"],
+      60, // 62914560 bytes
+      1000,
+    )
+    .await;
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_mem_checker_above_limit_wasm_grow_jsapi() {
+    test_mem_check_above_limit(
+      "./test_cases/wasm/grow_jsapi",
+      &[],
+      62, // 65011712 bytes < 65536000 bytes (1000 pages)
+      1000,
+    )
+    .await;
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_mem_checker_above_limit_wasm_grow_standalone() {
+    test_mem_check_above_limit(
+      "./test_cases/wasm/grow_standalone",
+      &["./test_cases/**/*.wasm"],
+      22, // 23068672 bytes
+      1000,
+    )
+    .await;
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_user_worker_permission() {
+    struct Ctx;
+
+    impl GetRuntimeContext for Ctx {
+      fn get_extra_context() -> impl Serialize {
+        serde_json::json!({
+          "shouldBootstrapMockFnThrowError": true,
+        })
+      }
+    }
+
+    let mut user_rt = create_basic_user_runtime_builder(
+      "./test_cases/user-worker-san-check",
+      None,
+      None,
+      &[
+        "./test_cases/user-worker-san-check/.blocklisted",
+        "./test_cases/user-worker-san-check/.whitelisted",
+      ],
+    )
+    .set_context::<Ctx>()
+    .build()
+    .await;
+
+    let (_tx, duplex_stream_rx) = mpsc::unbounded_channel();
+
+    user_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await
+      .0
+      .unwrap();
+  }
+
+  #[tokio::test]
+  #[serial]
+  #[should_panic]
+  async fn test_load_corrupted_eszip_v1() {
+    let mut user_rt = RuntimeBuilder::new()
+      .set_path("./test_cases/eszip-migration/npm-flow-js")
+      .set_eszip("./test_cases/eszip-migration/npm-flow-js/v1_corrupted.eszip")
+      .await
+      .unwrap()
+      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) = mpsc::unbounded_channel();
+
+    user_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await
+      .0
+      .unwrap();
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_entrypoint_resolution() {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let base_path = temp_dir.path();
+
+    // Create a nested directory structure
+    let worker_dir = base_path.join("worker");
+    fs::create_dir_all(&worker_dir).unwrap();
+
+    // Create test files
+    let index_file = worker_dir.join("index.ts");
+    let utils_file = worker_dir.join("utils.ts");
+    fs::write(
+      &index_file,
+      "import { helper } from './utils.ts';\nconsole.log(helper());",
+    )
+    .unwrap();
+    fs::write(&utils_file, "export function helper() { return 'test'; }")
+      .unwrap();
+
+    let (worker_pool_tx, _) = mpsc::unbounded_channel::<UserWorkerMsgs>();
+
+    // Test 1: Relative path entrypoint
+    {
+      let runtime = DenoRuntime::<()>::new(
+        WorkerBuilder::new(
+          WorkerContextInitOpts {
+            service_path: base_path.to_path_buf(),
+            maybe_entrypoint: Some("worker/index.ts".to_string()),
+            no_module_cache: false,
+            no_npm: None,
+            env_vars: Default::default(),
+            timing: None,
+            maybe_eszip: None,
+            maybe_module_code: None,
+            static_patterns: vec![],
+            maybe_s3_fs_config: None,
+            maybe_tmp_fs_config: None,
+            maybe_otel_config: None,
+            conf: WorkerRuntimeOpts::UserWorker(Box::new(
+              UserWorkerRuntimeOpts {
+                pool_msg_tx: Some(worker_pool_tx.clone()),
+                ..Default::default()
+              },
+            )),
+          },
+          Arc::new(ServerFlags::default()),
+        )
+        .build()
+        .unwrap(),
+      )
+      .await
+      .unwrap();
+
+      let url = &runtime.main_module_url;
+      assert!(url.scheme() == "file");
+      assert!(url.path().ends_with("worker/index.ts"));
+    }
+
+    // Test 2: Path with .. traversal
+    {
+      let nested_dir = worker_dir.join("nested");
+      fs::create_dir_all(&nested_dir).unwrap();
+      let nested_file = nested_dir.join("test.ts");
+      fs::write(&nested_file, "console.log('nested');").unwrap();
+
+      let runtime = DenoRuntime::<()>::new(
+        WorkerBuilder::new(
+          WorkerContextInitOpts {
+            service_path: base_path.to_path_buf(),
+            maybe_entrypoint: Some("worker/nested/../index.ts".to_string()),
+            no_module_cache: false,
+            no_npm: None,
+            env_vars: Default::default(),
+            timing: None,
+            maybe_eszip: None,
+            maybe_module_code: None,
+            static_patterns: vec![],
+            maybe_s3_fs_config: None,
+            maybe_tmp_fs_config: None,
+            maybe_otel_config: None,
+            conf: WorkerRuntimeOpts::UserWorker(Box::new(
+              UserWorkerRuntimeOpts {
+                pool_msg_tx: Some(worker_pool_tx.clone()),
+                ..Default::default()
+              },
+            )),
+          },
+          Arc::new(ServerFlags::default()),
+        )
+        .build()
+        .unwrap(),
+      )
+      .await
+      .unwrap();
+
+      let url = &runtime.main_module_url;
+      assert!(url.scheme() == "file");
+      assert!(url.path().ends_with("worker/index.ts"));
+    }
+
+    // Test 3: file:// URL entrypoint
+    {
+      let file_url = Url::from_file_path(&index_file).unwrap();
+      let runtime = DenoRuntime::<()>::new(
+        WorkerBuilder::new(
+          WorkerContextInitOpts {
+            service_path: base_path.to_path_buf(),
+            maybe_entrypoint: Some(file_url.to_string()),
+            no_module_cache: false,
+            no_npm: None,
+            env_vars: Default::default(),
+            timing: None,
+            maybe_eszip: None,
+            maybe_module_code: None,
+            static_patterns: vec![],
+            maybe_s3_fs_config: None,
+            maybe_tmp_fs_config: None,
+            maybe_otel_config: None,
+            conf: WorkerRuntimeOpts::UserWorker(Box::new(
+              UserWorkerRuntimeOpts {
+                pool_msg_tx: Some(worker_pool_tx.clone()),
+                ..Default::default()
+              },
+            )),
+          },
+          Arc::new(ServerFlags::default()),
+        )
+        .build()
+        .unwrap(),
+      )
+      .await
+      .unwrap();
+
+      let url = &runtime.main_module_url;
+      assert!(url.scheme() == "file");
+      assert!(
+        url.path().ends_with("worker/index.ts"),
+        "file:// URL entrypoint should resolve to worker/index.ts, got: {}",
+        url
+      );
+    }
+  }
+}

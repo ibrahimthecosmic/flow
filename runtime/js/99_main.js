@@ -714,6 +714,15 @@ const NOT_IMPORTED_OPS = [
   "op_deploy_token_get",
   "op_deploy_token_set",
   "op_deploy_token_delete",
+
+  // flow: ops registered on top of the CLI snapshot by the flow embedding
+  // (cli/embed.rs seams); flow's post-bootstrap installer reaches them via
+  // `core.ops` (the snapshot-baked `ext:core/ops` export list is frozen).
+  // Inert for plain Deno (never registered). Keep in sync with the
+  // `user_workers_ops` extension in edge/ext/workers.
+  "op_user_worker_create",
+  "op_user_worker_cleanup_idle_workers",
+  "op_user_worker_inspect",
 ];
 
 function removeImportedOps() {

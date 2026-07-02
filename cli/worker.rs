@@ -511,6 +511,7 @@ impl CliMainWorkerFactory {
         preload_modules,
         require_modules,
         self.root_permissions.clone(),
+        // edge extensions are injected centrally in `create_custom_worker`
         vec![],
         Default::default(),
         None,
@@ -533,6 +534,7 @@ impl CliMainWorkerFactory {
         preload_modules,
         require_modules,
         self.root_permissions.clone(),
+        // edge extensions are injected centrally in `create_custom_worker`
         vec![],
         Default::default(),
         unconfigured_runtime,
@@ -552,6 +554,16 @@ impl CliMainWorkerFactory {
     stdio: deno_runtime::deno_io::Stdio,
     unconfigured_runtime: Option<deno_runtime::UnconfiguredRuntime>,
   ) -> Result<CliMainWorker, CreateCustomWorkerError> {
+    // flow: this is the single funnel for every main worker (run/eval/repl/
+    // test/bench/jupyter/...). Prepend the edge layer's extensions here so the
+    // post-bootstrap installer (flow_main.js, run below) always finds its ops —
+    // otherwise callers that pass their own extensions (repl/test/...) would
+    // crash when flow_main.js imports an unregistered op. No-op for plain Deno.
+    let custom_extensions = {
+      let mut exts = crate::embed::build_main_worker_extensions();
+      exts.extend(custom_extensions);
+      exts
+    };
     let main_module_npm_ref =
       NpmPackageReqReference::from_specifier(&main_module).ok();
     let mut npm_reqs = Vec::new();
@@ -649,6 +661,10 @@ impl CliMainWorkerFactory {
     op_state.borrow_mut().put(deno_core::error::InitialCwd(
       self.shared.initial_cwd.clone(),
     ));
+
+    // flow: install additive globals (EdgeRuntime/Flow) on the now-bootstrapped
+    // main worker. No-op for plain Deno.
+    crate::embed::run_main_worker_post_bootstrap(worker.js_runtime())?;
 
     Ok(CliMainWorker {
       worker,

@@ -477,6 +477,9 @@ pub fn op_node_private_decrypt(
         .map(|v| v.into())
         .map_err(|_| PrivateEncryptDecryptError::OaepDecodingError)
     }
+    // trex: padding 8 == OAEP-SHA256 (kept alongside upstream's dynamic
+    // create_oaep path for padding 4).
+    8 => Ok(key.decrypt(Oaep::new::<sha2::Sha256>(), &msg)?.into()),
     _ => Err(PrivateEncryptDecryptError::UnknownPadding),
   }
 }

@@ -51,3 +51,4 @@ Untitled*.ipynb
 
 # pyenv
 /.python-version
+tests/sqlite_extension/target/

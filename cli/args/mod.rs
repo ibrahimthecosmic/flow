@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use deno_ast::MediaType;
 use deno_ast::ModuleSpecifier;
-use deno_cache_dir::file_fetcher::CacheSetting;
+pub use deno_cache_dir::file_fetcher::CacheSetting;
 pub use deno_config::deno_json::BenchConfig;
 pub use deno_config::deno_json::CompilerOptions;
 pub use deno_config::deno_json::ConfigFile;
@@ -46,7 +46,7 @@ use deno_lib::version::DENO_VERSION_INFO;
 use deno_lib::worker::StorageKeyResolver;
 use deno_npm::NpmSystemInfo;
 use deno_npm_installer::LifecycleScriptsConfig;
-use deno_npm_installer::graph::NpmCachingStrategy;
+pub use deno_npm_installer::graph::NpmCachingStrategy;
 use deno_resolver::factory::resolve_jsr_url;
 use deno_runtime::deno_node::ops::ipc::ChildIpcSerialization;
 use deno_runtime::deno_permissions::AllowRunDescriptor;

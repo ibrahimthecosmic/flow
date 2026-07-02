@@ -23,7 +23,7 @@ pub use incremental::IncrementalCache;
 pub use module_info::ModuleInfoCache;
 pub use node::SqliteNodeAnalysisCache;
 
-use crate::sys::CliSys;
+pub use crate::sys::CliSys;
 
 pub type GlobalHttpCache = deno_cache_dir::GlobalHttpCache<CliSys>;
 pub type LocalLspHttpCache = deno_cache_dir::LocalLspHttpCache<CliSys>;

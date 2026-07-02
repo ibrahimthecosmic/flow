@@ -76,6 +76,9 @@ async function dlint() {
     ":!:ext/node/polyfills/deps/**",
     ":!:runtime/examples/",
     ":!:libs/eszip/testdata/**",
+    ":!:edge/crates/base/test_cases/**",
+    ":!:edge/crates/base/tests/fixture/**",
+    ":!:edge/crates/fs/tests/fixture/**",
     ":!:target/",
     ":!:tests/bench/testdata/npm/*",
     ":!:tests/bench/testdata/express-router.js",
@@ -707,6 +710,8 @@ async function ensureNoNewTopLevelEntries() {
     ".github",
     "x",
     "cli",
+    // flow's edge-runtime layer
+    "edge",
     "ext",
     "libs",
     "runtime",

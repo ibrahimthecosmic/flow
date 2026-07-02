@@ -672,3 +672,35 @@ pub async fn op_tls_handshake(
     .map_err(|_| NetError::ListenerClosed)?;
   resource.handshake().await.map_err(Into::into)
 }
+
+#[op2]
+#[serde]
+pub fn op_tls_peer_certificate(
+  state: Rc<RefCell<OpState>>,
+  #[smi] rid: ResourceId,
+  detailed: bool,
+) -> Result<Option<serde_json::Value>, NetError> {
+  let resource = state
+    .borrow()
+    .resource_table
+    .get::<TlsStreamResource>(rid)
+    .map_err(|_| NetError::ListenerClosed)?;
+
+  let certs = resource.peer_certificates();
+
+  if detailed {
+    Ok(certs.map(|c| {
+      serde_json::json!({
+        "subject": "CN=unknown",
+        "issuer": "CN=unknown",
+        "valid_from": "unknown",
+        "valid_to": "unknown",
+        "serialNumber": "unknown",
+        "fingerprint": "unknown",
+        "cert_count": c.len()
+      })
+    }))
+  } else {
+    Ok(certs.map(|c| serde_json::json!({ "cert_count": c.len() })))
+  }
+}

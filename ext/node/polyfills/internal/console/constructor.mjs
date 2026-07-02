@@ -39,6 +39,7 @@ const {
   SafeMap,
   SafeMapIterator,
   SafeRegExp,
+  SafeSet,
   SafeSetIterator,
   SafeWeakMap,
   StringPrototypeIncludes,
@@ -232,10 +233,30 @@ ObjectDefineProperties(Console.prototype, {
     ...consolePropAttributes,
     // Eager version for the Console constructor
     value: function (stdout, stderr) {
-      ObjectDefineProperties(this, {
-        "_stdout": { __proto__: null, ...consolePropAttributes, value: stdout },
-        "_stderr": { __proto__: null, ...consolePropAttributes, value: stderr },
-      });
+      const descriptors = {};
+
+      if (!ObjectHasOwn(this, "_stdout")) {
+        descriptors._stdout = {
+          __proto__: null,
+          ...consolePropAttributes,
+          value: stdout,
+        };
+      }
+
+      if (!ObjectHasOwn(this, "_stderr")) {
+        descriptors._stderr = {
+          __proto__: null,
+          ...consolePropAttributes,
+          value: stderr,
+        };
+      }
+
+      if (ObjectKeys(descriptors).length > 0) {
+        try {
+          ObjectDefineProperties(this, descriptors);
+        } catch (e) {
+        }
+      }
     },
   },
   [kBindStreamsLazy]: {
@@ -246,39 +267,58 @@ ObjectDefineProperties(Console.prototype, {
     value: function (object) {
       let stdout;
       let stderr;
-      ObjectDefineProperties(this, {
-        "_stdout": {
-          __proto__: null,
-          enumerable: false,
-          configurable: true,
-          get() {
-            if (!stdout) stdout = object.stdout;
-            return stdout;
-          },
-          set(value) {
-            stdout = value;
-          },
-        },
-        "_stderr": {
-          __proto__: null,
-          enumerable: false,
-          configurable: true,
-          get() {
-            if (!stderr) stderr = object.stderr;
-            return stderr;
-          },
-          set(value) {
-            stderr = value;
-          },
-        },
-      });
+      const descriptors = {};
+
+      try {
+        if (!ObjectHasOwn(this, "_stdout")) {
+          descriptors._stdout = {
+            __proto__: null,
+            enumerable: false,
+            configurable: true,
+            get() {
+              if (!stdout) stdout = object.stdout;
+              return stdout;
+            },
+            set(value) {
+              stdout = value;
+            },
+          };
+        }
+      } catch (e) {
+      }
+
+      try {
+        if (!ObjectHasOwn(this, "_stderr")) {
+          descriptors._stderr = {
+            __proto__: null,
+            enumerable: false,
+            configurable: true,
+            get() {
+              if (!stderr) stderr = object.stderr;
+              return stderr;
+            },
+            set(value) {
+              stderr = value;
+            },
+          };
+        }
+      } catch (e) {
+      }
+
+      if (ObjectKeys(descriptors).length > 0) {
+        try {
+          ObjectDefineProperties(this, descriptors);
+        } catch (e) {
+        }
+      }
     },
   },
   [kBindProperties]: {
     __proto__: null,
     ...consolePropAttributes,
     value: function (ignoreErrors, colorMode, groupIndentation = 2) {
-      ObjectDefineProperties(this, {
+      const descriptors = {};
+      const propertiesToDefine = {
         "_stdoutErrorHandler": {
           __proto__: null,
           ...consolePropAttributes,
@@ -332,7 +372,24 @@ ObjectDefineProperties(Console.prototype, {
           configurable: true,
           value: "console",
         },
-      });
+      };
+
+      const existingKeys = new SafeSet(ReflectOwnKeys(this));
+
+      const keysToDefine = ReflectOwnKeys(propertiesToDefine);
+      for (let i = 0; i < keysToDefine.length; i++) {
+        const key = keysToDefine[i];
+        if (!existingKeys.has(key)) {
+          descriptors[key] = propertiesToDefine[key];
+        }
+      }
+
+      if (ReflectOwnKeys(descriptors).length > 0) {
+        try {
+          ObjectDefineProperties(this, descriptors);
+        } catch (e) {
+        }
+      }
     },
   },
   [kWriteToConsole]: {

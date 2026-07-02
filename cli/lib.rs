@@ -1,31 +1,80 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-mod args;
-mod cache;
+// NOTE(flow): several modules below are `pub` (upstream: private) so the edge
+// layer can reuse them. Widening visibility arms visibility-dependent lints
+// on otherwise-unchanged upstream code; those are allowed here at the
+// widening site instead of patching upstream module bodies.
+#[allow(
+  hidden_glob_reexports,
+  reason = "upstream flags.rs shadows its own public glob re-export; only visible because flow pubs this module"
+)]
+pub mod args;
+pub mod cache;
 mod cdp;
-mod factory;
-mod file_fetcher;
+pub mod embed;
+pub mod factory;
+pub mod file_fetcher;
+#[allow(
+  async_fn_in_trait,
+  reason = "upstream trait; publicly reachable only because flow pubs the modules that re-export it"
+)]
 mod graph_container;
-mod graph_util;
-mod http_util;
+pub mod graph_util;
+pub mod http_util;
 mod jsr;
 mod lsp;
-mod module_loader;
-mod node;
+pub mod module_loader;
+pub mod node;
 mod node_compat_shim;
-mod npm;
+pub mod npm;
 mod ops;
 mod registry;
-mod resolver;
-mod standalone;
+pub mod resolver;
+pub mod standalone;
 mod task_runner;
-mod tools;
+#[allow(
+  clippy::new_without_default,
+  reason = "upstream `new()` constructors; only publicly visible because flow pubs this module"
+)]
+pub mod tools;
 mod tsc;
 mod type_checker;
-mod util;
+pub mod util;
 mod worker;
 
-pub(crate) mod sys {
+// Re-exports for the edge layer's `deno::deno_*` facade (mirrors trex-runtime ../deno).
+pub use deno_ast;
+pub use deno_cache_dir;
+pub use deno_config;
+pub use deno_core;
+pub use deno_crypto;
+pub use deno_fetch;
+pub use deno_fs;
+pub use deno_graph;
+pub use deno_http;
+pub use deno_io;
+pub use deno_lib;
+pub use deno_lockfile;
+pub use deno_net;
+pub use deno_npm;
+pub use deno_npmrc;
+pub use deno_package_json;
+pub use deno_path_util;
+pub use deno_permissions;
+pub use deno_permissions::PermissionsContainer;
+pub use deno_resolver;
+pub use deno_runtime;
+pub use deno_semver;
+pub use deno_telemetry;
+pub use deno_tls;
+pub use deno_url;
+pub use deno_web;
+pub use deno_webidl;
+pub use deno_websocket;
+pub use deno_webstorage;
+pub use node_resolver;
+
+pub mod sys {
   #[allow(clippy::disallowed_types, reason = "definition")]
   pub type CliSys = sys_traits::impls::RealSys;
 }
@@ -767,12 +816,20 @@ pub fn main() {
   boot_phase("after aws_lc install");
 
   let args: Vec<_> = env::args_os().collect();
+  // flow: strip flow-specific top-level flags (e.g. `--policy`) before Deno's
+  // flag parser runs. No-op for plain Deno.
+  let args = crate::embed::apply_arg_filter(args);
   // If we were invoked through a `node` shim (a symlink/hardlink named `node`
   // pointing at this binary), translate the Node.js CLI args to Deno args.
   // Done here, before any threads are spawned, because it may set env vars.
   let args = node_compat_shim::maybe_rewrite_node_arg0(args);
   let future = async move {
-    let roots = LibWorkerFactoryRoots::default();
+    // flow: the shared-array-buffer store may be shared with flow's user
+    // workers (fresh private store for plain Deno).
+    let roots = LibWorkerFactoryRoots {
+      shared_array_buffer_store: crate::embed::shared_array_buffer_store(),
+      ..Default::default()
+    };
 
     #[cfg(unix)]
     let (waited_unconfigured_runtime, waited_args, waited_cwd) =

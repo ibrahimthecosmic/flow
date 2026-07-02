@@ -50,6 +50,12 @@ const Runners = {
     arch: "x86_64",
     runner: ubuntuX86Runner,
   },
+  linuxX86Musl: {
+    os: "linux",
+    arch: "x86_64",
+    libc: "musl",
+    runner: ubuntuX86Runner,
+  },
   linuxArm: {
     os: "linux",
     arch: "aarch64",
@@ -227,6 +233,10 @@ function handleBuildItems(items: {
   skip?: Condition | boolean;
   os: "linux" | "macos" | "windows";
   arch: "x86_64" | "aarch64";
+  // C runtime for linux builds. Defaults to "gnu" (glibc). "musl" cross-compiles
+  // a static Alpine-compatible binary against the rusty_v8 fork's prebuilt musl
+  // static lib (served via RUSTY_V8_MIRROR).
+  libc?: "gnu" | "musl";
   runner: string | ExpressionValue;
   profile: string;
   use_sysroot?: boolean;
@@ -280,6 +290,17 @@ const cloneRepoStep = step({
     "fetch-depth": 5,
     submodules: false,
   },
+}, {
+  // The root Cargo.toml patches v8 to the flow rusty_v8 fork via a sibling
+  // path dependency (`[patch.crates-io] v8 = { path = "../rusty_v8" }`), so
+  // cargo cannot resolve the dependency graph unless ../rusty_v8 exists. Every
+  // job that runs cargo needs it, so clone it as part of the shared checkout.
+  // Single line so it works under both bash and pwsh (lint runs on Windows).
+  // The prebuilt V8 static libs (glibc + musl) are still fetched from
+  // RUSTY_V8_MIRROR at build time.
+  name: "Clone rusty_v8 fork (v8 patch dependency)",
+  run:
+    "git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8",
 });
 const cloneSubmodule = (path: string) =>
   step({
@@ -434,10 +455,6 @@ const installRustStep = step(
     uses: "dsherret/rust-toolchain-file@v1",
   }),
 );
-const installWasmStep = step({
-  name: "Install wasm target",
-  run: "rustup target add wasm32-unknown-unknown",
-});
 
 function getOsSpecificSteps({
   isWindows,
@@ -534,52 +551,22 @@ const preBuildJob = job("pre_build", {
 
 // === build job ===
 
+// flow ships only two Linux binaries: x86_64 glibc (linux-x64) and x86_64 musl
+// (Alpine). macOS/Windows/ARM builds are dropped. The glibc release build runs
+// WPT, the glibc debug build runs the test/lint/wpt suites, and the musl build
+// is a release-only cross-compile that produces the Alpine binary.
 const buildItems = handleBuildItems([{
-  ...Runners.macosX86,
-  profile: "debug",
-}, {
-  ...Runners.macosX86,
-  profile: "release",
-  skip_pr: true,
-}, {
-  ...Runners.macosArm,
-  profile: "debug",
-}, {
-  ...Runners.macosArmSelfHosted,
-  profile: "release",
-  skip_pr: true,
-}, {
-  ...Runners.windowsX86,
-  profile: "debug",
-}, {
-  ...Runners.windowsX86Xl,
-  profile: "release",
-  skip_pr: true,
-}, {
-  ...Runners.windowsArm,
-  profile: "debug",
-}, {
-  ...Runners.windowsArm,
-  profile: "release",
-  skip_pr: true,
-}, {
   ...Runners.linuxX86Xl,
   profile: "release",
   use_sysroot: true,
-  // Because CI is so slow on for OSX and Windows, we
-  // currently run the Web Platform tests only on Linux.
   wpt: isNotTag,
 }, {
   ...Runners.linuxX86,
   profile: "debug",
   use_sysroot: true,
 }, {
-  ...Runners.linuxArm,
-  profile: "debug",
-}, {
-  ...Runners.linuxArmXl,
+  ...Runners.linuxX86Musl,
   profile: "release",
-  use_sysroot: true,
   skip_pr: true,
 }]);
 
@@ -588,10 +575,25 @@ const buildJobs = buildItems.map((rawBuildItem) => {
   const isLinux = buildItem.os.equals("linux");
   const isWindows = buildItem.os.equals("windows");
   const isMacos = buildItem.os.equals("macos");
-  const profileName = `${buildItem.profile}-${buildItem.os}-${buildItem.arch}`;
+  // libc is known at generation time (plain value on the raw item), so musl
+  // handling is resolved statically rather than as a runtime `if` expression.
+  const libc = (rawBuildItem as { libc?: string }).libc ?? "gnu";
+  const isMusl = libc === "musl";
+  const linuxTriple = `${rawBuildItem.arch}-unknown-linux-${libc}`;
+  // musl builds must cross-compile with an explicit --target so the v8 build
+  // script fetches the musl prebuilt from RUSTY_V8_MIRROR; glibc builds compile
+  // natively for the host (no --target) exactly as before.
+  const cargoTargetFlag = isMusl ? ` --target ${linuxTriple}` : "";
+  // Disambiguate the musl job id/artifacts from the glibc x86_64 build (both are
+  // linux-x86_64 otherwise).
+  const profileName = `${buildItem.profile}-${buildItem.os}${
+    isMusl ? "-musl" : ""
+  }-${buildItem.arch}`;
   const jobIdForJob = (name: string) => `${name}-${profileName}`;
   const jobNameForJob = (name: string) =>
-    `${name} ${buildItem.profile} ${buildItem.os}-${buildItem.arch}`;
+    `${name} ${buildItem.profile} ${buildItem.os}${
+      isMusl ? "-musl" : ""
+    }-${buildItem.arch}`;
   const createBinaryArtifact = (name: string) => {
     const directory = `target/${buildItem.profile}`;
     const exeExt = rawBuildItem.os === "windows" ? ".exe" : "";
@@ -696,11 +698,11 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             if: isLinux.and(isDenoland),
             run: [
               "cd target/release",
-              `./deno -A ../../tools/release/create_symcache.ts deno-${buildItem.arch}-unknown-linux-gnu.symcache`,
+              `./deno -A ../../tools/release/create_symcache.ts deno-${linuxTriple}.symcache`,
               "strip ./deno",
-              `shasum -a 256 deno > deno-${buildItem.arch}-unknown-linux-gnu.sha256sum`,
-              `zip -r deno-${buildItem.arch}-unknown-linux-gnu.zip deno`,
-              `shasum -a 256 deno-${buildItem.arch}-unknown-linux-gnu.zip > deno-${buildItem.arch}-unknown-linux-gnu.zip.sha256sum`,
+              `shasum -a 256 deno > deno-${linuxTriple}.sha256sum`,
+              `zip -r deno-${linuxTriple}.zip deno`,
+              `shasum -a 256 deno-${linuxTriple}.zip > deno-${linuxTriple}.zip.sha256sum`,
               // denort is the `deno compile` base binary: libsui rewrites its
               // ELF to embed user code, and that rewrite drops `.relr.dyn`
               // relative relocations when the symbol table is gone, producing a
@@ -708,11 +710,11 @@ const buildJobs = buildItems.map((rawBuildItem) => {
               // (`__cxa_guard_acquire failed to acquire mutex`). Keep .symtab
               // (strip only debug info) so the relocations survive.
               "strip --strip-debug ./denort",
-              `zip -r denort-${buildItem.arch}-unknown-linux-gnu.zip denort`,
-              `shasum -a 256 denort-${buildItem.arch}-unknown-linux-gnu.zip > denort-${buildItem.arch}-unknown-linux-gnu.zip.sha256sum`,
+              `zip -r denort-${linuxTriple}.zip denort`,
+              `shasum -a 256 denort-${linuxTriple}.zip > denort-${linuxTriple}.zip.sha256sum`,
               "strip ./libdenort.so",
-              `zip -r libdenort-${buildItem.arch}-unknown-linux-gnu.zip libdenort.so`,
-              `shasum -a 256 libdenort-${buildItem.arch}-unknown-linux-gnu.zip > libdenort-${buildItem.arch}-unknown-linux-gnu.zip.sha256sum`,
+              `zip -r libdenort-${linuxTriple}.zip libdenort.so`,
+              `shasum -a 256 libdenort-${linuxTriple}.zip > libdenort-${linuxTriple}.zip.sha256sum`,
               "./deno types > lib.deno.d.ts",
             ],
           },
@@ -824,7 +826,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             name: "Generate delta patch (linux)",
             if: isLinux.and(isDenoland).and(isTag),
             run: [
-              `TARGET="${buildItem.arch}-unknown-linux-gnu"`,
+              `TARGET="${linuxTriple}"`,
               'PREV_VERSION=$(curl -sf https://dl.deno.land/release-latest.txt | tr -d "v\\n") || true',
               'if [ -z "$PREV_VERSION" ]; then echo "No previous version found, skipping delta"; exit 0; fi',
               'echo "Generating delta from $PREV_VERSION for $TARGET"',
@@ -883,9 +885,11 @@ const buildJobs = buildItems.map((rawBuildItem) => {
         const binsToBuild = ["deno", "denort", "test_server"]
           .map((name) => `--bin ${name}`).join(" ");
         const cargoBuildReleaseStep = step
-          .if(
-            isRelease.and(isDenoland.or(buildItem.use_sysroot)),
-          )
+          // flow always builds its release binaries (glibc + musl). Upstream
+          // gated this on isDenoland-or-sysroot to avoid expensive release
+          // builds on contributor PRs; for the fork we want every release
+          // build item to actually build.
+          .if(isRelease)
           .dependsOn(
             installLldStep,
             installDenoStep,
@@ -919,11 +923,19 @@ const buildJobs = buildItems.map((rawBuildItem) => {
                 "fi",
                 // output fs space before and after building
                 "df -h",
-                `cargo build --release --locked ${packagesToBuild} ${binsToBuild} --features=deno/panic-trace`,
+                `cargo build --release --locked${cargoTargetFlag} ${packagesToBuild} ${binsToBuild} --features=deno/panic-trace`,
                 // Build the desktop runtime shared library (libdenort cdylib) for
                 // laufey-based desktop apps. Separate invocation because the
                 // panic-trace feature only applies to the deno/denort binaries.
-                "cargo build --release --locked -p denort_desktop",
+                `cargo build --release --locked${cargoTargetFlag} -p denort_desktop`,
+                // Cross-compiled musl artifacts land under target/<triple>/release;
+                // copy them into target/release so all downstream packaging/upload
+                // steps (which assume the native path) work unchanged.
+                ...(isMusl
+                  ? [
+                    `cp target/${linuxTriple}/release/{deno,denort,test_server,libdenort.so} target/release/`,
+                  ]
+                  : []),
                 "df -h",
               ],
             },
@@ -984,7 +996,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
               name: "Build debug",
               if: isDebug,
               run:
-                `cargo build --locked ${packagesToBuild} ${binsToBuild} --features=deno/panic-trace`,
+                `cargo build --locked${cargoTargetFlag} ${packagesToBuild} ${binsToBuild} --features=deno/panic-trace`,
               env: { CARGO_PROFILE_DEV_DEBUG: 0 },
             },
             cargoBuildReleaseStep,
@@ -1049,21 +1061,10 @@ const buildJobs = buildItems.map((rawBuildItem) => {
               GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
             },
             with: {
+              // flow ships x86_64 glibc + x86_64 musl (Alpine) Linux binaries
+              // only. Each release build item runs this step with the same list;
+              // softprops uploads whichever artifacts the current job produced.
               files: [
-                "target/release/deno-x86_64-pc-windows-msvc.zip",
-                "target/release/deno-x86_64-pc-windows-msvc.zip.sha256sum",
-                "target/release/deno-x86_64-pc-windows-msvc.sha256sum",
-                "target/release/denort-x86_64-pc-windows-msvc.zip",
-                "target/release/denort-x86_64-pc-windows-msvc.zip.sha256sum",
-                "target/release/libdenort-x86_64-pc-windows-msvc.zip",
-                "target/release/libdenort-x86_64-pc-windows-msvc.zip.sha256sum",
-                "target/release/deno-aarch64-pc-windows-msvc.zip",
-                "target/release/deno-aarch64-pc-windows-msvc.zip.sha256sum",
-                "target/release/deno-aarch64-pc-windows-msvc.sha256sum",
-                "target/release/denort-aarch64-pc-windows-msvc.zip",
-                "target/release/denort-aarch64-pc-windows-msvc.zip.sha256sum",
-                "target/release/libdenort-aarch64-pc-windows-msvc.zip",
-                "target/release/libdenort-aarch64-pc-windows-msvc.zip.sha256sum",
                 "target/release/deno-x86_64-unknown-linux-gnu.zip",
                 "target/release/deno-x86_64-unknown-linux-gnu.zip.sha256sum",
                 "target/release/deno-x86_64-unknown-linux-gnu.sha256sum",
@@ -1071,27 +1072,13 @@ const buildJobs = buildItems.map((rawBuildItem) => {
                 "target/release/denort-x86_64-unknown-linux-gnu.zip.sha256sum",
                 "target/release/libdenort-x86_64-unknown-linux-gnu.zip",
                 "target/release/libdenort-x86_64-unknown-linux-gnu.zip.sha256sum",
-                "target/release/deno-x86_64-apple-darwin.zip",
-                "target/release/deno-x86_64-apple-darwin.zip.sha256sum",
-                "target/release/deno-x86_64-apple-darwin.sha256sum",
-                "target/release/denort-x86_64-apple-darwin.zip",
-                "target/release/denort-x86_64-apple-darwin.zip.sha256sum",
-                "target/release/libdenort-x86_64-apple-darwin.zip",
-                "target/release/libdenort-x86_64-apple-darwin.zip.sha256sum",
-                "target/release/deno-aarch64-unknown-linux-gnu.zip",
-                "target/release/deno-aarch64-unknown-linux-gnu.zip.sha256sum",
-                "target/release/deno-aarch64-unknown-linux-gnu.sha256sum",
-                "target/release/denort-aarch64-unknown-linux-gnu.zip",
-                "target/release/denort-aarch64-unknown-linux-gnu.zip.sha256sum",
-                "target/release/libdenort-aarch64-unknown-linux-gnu.zip",
-                "target/release/libdenort-aarch64-unknown-linux-gnu.zip.sha256sum",
-                "target/release/deno-aarch64-apple-darwin.zip",
-                "target/release/deno-aarch64-apple-darwin.zip.sha256sum",
-                "target/release/deno-aarch64-apple-darwin.sha256sum",
-                "target/release/denort-aarch64-apple-darwin.zip",
-                "target/release/denort-aarch64-apple-darwin.zip.sha256sum",
-                "target/release/libdenort-aarch64-apple-darwin.zip",
-                "target/release/libdenort-aarch64-apple-darwin.zip.sha256sum",
+                "target/release/deno-x86_64-unknown-linux-musl.zip",
+                "target/release/deno-x86_64-unknown-linux-musl.zip.sha256sum",
+                "target/release/deno-x86_64-unknown-linux-musl.sha256sum",
+                "target/release/denort-x86_64-unknown-linux-musl.zip",
+                "target/release/denort-x86_64-unknown-linux-musl.zip.sha256sum",
+                "target/release/libdenort-x86_64-unknown-linux-musl.zip",
+                "target/release/libdenort-x86_64-unknown-linux-musl.zip.sha256sum",
                 "target/release/deno_src.tar.gz",
                 "target/release/lib.deno.d.ts",
                 "target/release/deno-*.bsdiff",
@@ -1141,6 +1128,21 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             installPythonStep,
             installRustStep,
           ),
+          // Cross-compilation toolchain for the musl (Alpine) target. musl-tools
+          // provides musl-gcc; the rustup target lets cargo build the static
+          // x86_64-unknown-linux-musl binary.
+          ...(isMusl
+            ? [
+              step({
+                name: "Install musl toolchain",
+                run: [
+                  "sudo apt-get update",
+                  "sudo apt-get install -y --no-install-recommends musl-tools",
+                  `rustup target add ${linuxTriple}`,
+                ].join("\n"),
+              }).comesAfter(installRustStep),
+            ]
+            : []),
           cargoBuildStep,
           publishStep,
           saveCacheStep.if(buildItem.save_cache),
@@ -1348,53 +1350,10 @@ const buildJobs = buildItems.map((rawBuildItem) => {
       ),
     }));
   }
-  if (
-    isDebug.and(isLinux).and(buildItem.arch.equals("x86_64")).isPossiblyTrue()
-  ) {
-    const {
-      restoreCacheStep,
-      saveCacheStep,
-    } = createCacheSteps({
-      ...buildItem,
-      cachePrefix: "build-libs",
-    });
-    additionalJobs.push(job(jobIdForJob("build-libs"), {
-      name: jobNameForJob("build libs"),
-      needs: [preBuildJob],
-      if: preBuildJob.outputs.skip_build.notEquals("true"),
-      runsOn: buildItem.runner,
-      timeoutMinutes: 30,
-      steps: step.if(isNotTag.and(buildItem.skip.not()))(
-        cloneRepoStep,
-        installRustStep,
-        restoreCacheStep,
-        installWasmStep,
-        // we want these crates to be Wasm compatible
-        {
-          name: "Cargo check (deno_resolver)",
-          run:
-            "cargo check --target wasm32-unknown-unknown -p deno_resolver && cargo check --target wasm32-unknown-unknown -p deno_resolver --features graph && cargo check --target wasm32-unknown-unknown -p deno_resolver --features graph --features deno_ast",
-        },
-        {
-          name: "Cargo check (deno_npm_installer)",
-          run:
-            "cargo check --target wasm32-unknown-unknown -p deno_npm_installer",
-        },
-        {
-          name: "Cargo check (deno_config)",
-          run: [
-            "cargo check --no-default-features -p deno_config",
-            "cargo check --no-default-features --features workspace -p deno_config",
-            "cargo check --no-default-features --features package_json -p deno_config",
-            "cargo check --no-default-features --features workspace --features sync -p deno_config",
-            "cargo check --target wasm32-unknown-unknown --all-features -p deno_config",
-            "cargo check -p deno --features=lsp-tracing",
-          ],
-        },
-        saveCacheStep,
-      ),
-    }));
-  }
+  // The upstream `build-libs` job only enforces wasm32 compatibility for crates
+  // (deno_resolver, deno_npm_installer, deno_config) that denoland publishes for
+  // wasm consumers. flow ships only the host binary and doesn't publish them, so
+  // the job is dropped.
 
   if (buildItem.wpt.isPossiblyTrue()) {
     const buildCacheSteps = createRestoreAndSaveCacheSteps({
@@ -1497,7 +1456,9 @@ const buildJobs = buildItems.map((rawBuildItem) => {
 
   return {
     buildJob,
-    additionalJobs,
+    // The musl build only produces the Alpine release binary; the test/wpt/libs
+    // suites run on the glibc x86_64 builds, so skip them for musl.
+    additionalJobs: isMusl ? [] : additionalJobs,
   };
 });
 
@@ -1585,17 +1546,13 @@ const benchJob = job(
 
 // === lint job ===
 
+// flow lints on Linux only. Upstream also lints on macOS/Windows to catch
+// platform-specific #[cfg] clippy issues, but the fork ships only Linux and the
+// rusty_v8 fork publishes prebuilt V8 for gnu/musl only, so clippy on those
+// runners would try to build V8 from source.
 const lintMatrix = defineMatrix({
   include: [{
     ...Runners.linuxX86,
-    profile: "debug",
-    job: "lint",
-  }, {
-    ...Runners.macosX86,
-    profile: "debug",
-    job: "lint",
-  }, {
-    ...Runners.windowsX86,
     profile: "debug",
     job: "lint",
   }],
@@ -1837,19 +1794,11 @@ const workflow = createWorkflow({
     "id-token": "write", // Required for GitHub OIDC with Azure for code signing
   },
   on: {
+    // flow's development line is `main`; version upgrades are validated on
+    // `upgrade/*` branches before merging. The `deno` branch is a pristine
+    // upstream mirror and must never trigger CI.
     push: {
-      branches: ["main"],
-      tags: ["*"],
-    },
-    pull_request: {
-      types: [
-        "opened",
-        "reopened",
-        "synchronize",
-        // need to re-run the action when converting from draft because
-        // draft PRs will not necessarily run all the steps
-        "ready_for_review",
-      ],
+      branches: ["main", "upgrade/*"],
     },
   },
   concurrency: {

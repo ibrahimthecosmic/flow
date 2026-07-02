@@ -1496,7 +1496,7 @@ pub fn clap_root() -> Command {
     DENO_VERSION_INFO.typescript
   );
 
-  run_args(Command::new("deno"), true)
+  let root = run_args(Command::new("deno"), true)
     .with_unstable_args(UnstableArgsConfig::ResolutionAndRuntime)
     .next_line_help(false)
     .bin_name("deno")
@@ -1605,8 +1605,17 @@ pub fn clap_root() -> Command {
       cmd.subcommand(help)
     })
     .help_template(DENO_HELP)
-    .after_help(&*ENV_VARIABLES_HELP)
-    .next_line_help(false)
+    .next_line_help(false);
+
+  // flow: render the flow command group (e.g. `eszip`) just before the
+  // "Environment variables" block. `DENO_HELP` has no `{subcommands}` slot, so
+  // this seam is how flow subcommands surface in `--help`. No-op for plain Deno.
+  match crate::embed::help_section() {
+    Some(section) => {
+      root.after_help(format!("{section}\n\n{}", *ENV_VARIABLES_HELP))
+    }
+    None => root.after_help(&*ENV_VARIABLES_HELP),
+  }
 }
 
 #[inline(always)]

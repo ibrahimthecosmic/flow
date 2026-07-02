@@ -46,6 +46,9 @@ export async function checkCopyright() {
     ":!:libs/config/testdata/**",
     ":!:libs/eszip/testdata/**",
     ":!:ext/node/polyfills/deps/**",
+    // flow's edge layer (supabase/edge-runtime lineage, MIT) keeps its own
+    // authorship; it is not "the Deno authors" code.
+    ":!:edge/**",
 
     // rust
     "*.rs",

@@ -1,0 +1,10 @@
+{
+  "workspace": [],
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact-shim"
+  },
+  "imports": {
+    "preact-shim/jsx-runtime": "./preact-shim/jsx-runtime.ts"
+  }
+}

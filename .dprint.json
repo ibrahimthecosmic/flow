@@ -37,6 +37,8 @@
     "cli/tsc/dts/typescript.d.ts",
     "cli/tools/doc/prism.css",
     "cli/tools/doc/prism.js",
+    "edge/crates/base/test_cases",
+    "edge/crates/base/tests/fixture/testdata",
     "ext/node/polyfills/deps",
     "ext/websocket/autobahn/reports",
     "libs/eszip/testdata",

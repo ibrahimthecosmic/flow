@@ -61,7 +61,7 @@ pub struct SerializedResolverWorkspaceJsrPackage {
   pub exports: IndexMap<String, String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub struct SerializedWorkspaceResolver {
   pub import_map: Option<SerializedWorkspaceResolverImportMap>,
   pub jsr_pkgs: Vec<SerializedResolverWorkspaceJsrPackage>,

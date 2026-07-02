@@ -6,7 +6,7 @@ use deno_ast::MediaType;
 use deno_cache_dir::GlobalOrLocalHttpCache;
 use deno_cache_dir::file_fetcher::BlobData;
 use deno_cache_dir::file_fetcher::CacheSetting;
-use deno_cache_dir::file_fetcher::File;
+pub use deno_cache_dir::file_fetcher::File;
 use deno_cache_dir::file_fetcher::SendError;
 use deno_cache_dir::file_fetcher::SendResponse;
 use deno_core::ModuleSpecifier;

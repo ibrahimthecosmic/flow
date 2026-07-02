@@ -18,6 +18,7 @@ use deno_config::workspace::TsTypeLib;
 use deno_config::workspace::WorkspaceDirectory;
 use deno_config::workspace::WorkspaceRc;
 use deno_error::JsError;
+use deno_maybe_sync::new_arc;
 use deno_maybe_sync::new_rc;
 use deno_path_util::normalize_path;
 use deno_path_util::url_from_directory_path;
@@ -544,6 +545,7 @@ pub struct CompilerOptionsData {
   pub sources: Vec<CompilerOptionsSource>,
   pub source_kind: CompilerOptionsSourceKind,
   workspace_dir_url: Option<UrlRc>,
+  last_source_specifier: Option<UrlRc>,
   memoized: MemoizedValues,
   logged_warnings: LoggedWarningsRc,
   #[cfg_attr(
@@ -565,10 +567,14 @@ impl CompilerOptionsData {
     logged_warnings: LoggedWarningsRc,
     overrides: CompilerOptionsOverrides,
   ) -> Self {
+    let last_source_specifier = sources
+      .last()
+      .map(|s| deno_maybe_sync::new_rc((*s.specifier).clone()));
     Self {
       sources,
       source_kind,
       workspace_dir_url,
+      last_source_specifier,
       memoized: Default::default(),
       logged_warnings,
       overrides,
@@ -933,7 +939,7 @@ impl CompilerOptionsData {
     self
       .workspace_dir_url
       .as_ref()
-      .or_else(|| self.sources.last().map(|s| &s.specifier))
+      .or(self.last_source_specifier.as_ref())
   }
 }
 
@@ -1038,12 +1044,11 @@ impl TsConfigData {
   }
 
   fn specifier(&self) -> &UrlRc {
-    &self
+    self
       .compiler_options
-      .sources
-      .last()
+      .last_source_specifier
+      .as_ref()
       .expect("Tsconfigs should always have at least one source.")
-      .specifier
   }
 }
 
@@ -1259,7 +1264,7 @@ impl<
       .flat_map(|t| &t.compiler_options.sources)
       .cloned()
       .chain([CompilerOptionsSource {
-        specifier: specifier.clone(),
+        specifier: new_arc((*specifier).clone()),
         compiler_options: object
           .and_then(|o| o.get("compilerOptions"))
           .filter(|v| !v.is_null())
@@ -1481,7 +1486,7 @@ impl CompilerOptionsResolver {
       FolderScopedWithUnscopedMap::new(CompilerOptionsData::new(
         root_dir.to_configured_compiler_options_sources(),
         CompilerOptionsSourceKind::DenoJson,
-        Some(root_dir.dir_url().clone()),
+        Some(new_rc(root_dir.dir_url().as_ref().clone())),
         logged_warnings.clone(),
         overrides.clone(),
       ));
@@ -1491,11 +1496,11 @@ impl CompilerOptionsResolver {
       }
       if dir.dir_url() != root_dir.dir_url() {
         workspace_configs.insert(
-          dir.dir_url().clone(),
+          new_rc(dir.dir_url().as_ref().clone()),
           CompilerOptionsData::new(
             dir.to_configured_compiler_options_sources(),
             CompilerOptionsSourceKind::DenoJson,
-            Some(dir.dir_url().clone()),
+            Some(new_rc(dir.dir_url().as_ref().clone())),
             logged_warnings.clone(),
             overrides.clone(),
           ),

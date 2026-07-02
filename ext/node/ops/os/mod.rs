@@ -222,35 +222,14 @@ pub fn op_node_os_user_info(
 }
 
 #[op2(fast, stack_trace)]
-pub fn op_geteuid(state: &mut OpState) -> Result<u32, PermissionCheckError> {
-  {
-    let permissions = state.borrow_mut::<PermissionsContainer>();
-    permissions.check_sys("uid", "node:os.geteuid()")?;
-  }
-
-  #[cfg(windows)]
-  let euid = 0;
-  #[cfg(unix)]
-  // SAFETY: Call to libc geteuid.
-  let euid = unsafe { libc::geteuid() };
-
-  Ok(euid)
+pub fn op_geteuid(_state: &mut OpState) -> Result<u32, PermissionCheckError> {
+  // Sandboxed: always report root-equivalent uid; do not leak host identity.
+  Ok(0)
 }
 
 #[op2(fast, stack_trace)]
-pub fn op_getegid(state: &mut OpState) -> Result<u32, PermissionCheckError> {
-  {
-    let permissions = state.borrow_mut::<PermissionsContainer>();
-    permissions.check_sys("getegid", "node:os.getegid()")?;
-  }
-
-  #[cfg(windows)]
-  let egid = 0;
-  #[cfg(unix)]
-  // SAFETY: Call to libc getegid.
-  let egid = unsafe { libc::getegid() };
-
-  Ok(egid)
+pub fn op_getegid(_state: &mut OpState) -> Result<u32, PermissionCheckError> {
+  Ok(0)
 }
 
 #[op2(stack_trace)]

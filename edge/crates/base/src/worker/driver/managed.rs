@@ -1,0 +1,225 @@
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Error;
+use base_mem_check::MemCheckState;
+use ext_event_worker::events::ShutdownEvent;
+use ext_event_worker::events::ShutdownReason;
+use ext_event_worker::events::UncaughtExceptionEvent;
+use ext_event_worker::events::WorkerEvents;
+use ext_event_worker::events::WorkerMemoryUsed;
+use futures_util::FutureExt;
+use log::error;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::task::JoinError;
+use tokio::time::timeout;
+use tracing::warn;
+
+use super::BaseCx;
+use super::WorkerDriver;
+use crate::runtime::DenoRuntime;
+use crate::runtime::RunOptionsBuilder;
+use crate::runtime::WillTerminateReason;
+use crate::worker::DuplexStreamEntry;
+use crate::worker::WorkerCx;
+use crate::worker::supervisor::as_interrupt_callback;
+use crate::worker::supervisor::v8_handle_beforeunload_raw;
+use crate::worker::supervisor::{self};
+use crate::worker::utils::apply_source_maps;
+use crate::worker::utils::translate_vfs_paths;
+
+const SUPERVISE_DEADLINE_SEC: Duration = Duration::from_secs(15);
+
+#[derive(Clone)]
+pub(crate) struct Managed {
+  inner: Arc<WorkerCx>,
+  cx: Arc<Mutex<BaseCx>>,
+}
+
+impl Managed {
+  pub fn new(inner: Arc<WorkerCx>) -> Self {
+    Managed {
+      inner,
+      cx: Arc::default(),
+    }
+  }
+}
+
+impl WorkerDriver for Managed {
+  fn on_created<'l>(
+    &self,
+    runtime: &'l mut DenoRuntime,
+  ) -> impl Future<Output = Result<WorkerEvents, Error>> + 'l {
+    let Managed { inner, cx } = self.clone();
+
+    async move {
+      let mut cx = cx.lock().await;
+      let network_receiver = cx.take_network_receiver()?;
+      let termination_event_receiver = cx.take_termination_event_receiver()?;
+      let termination_token = inner.termination_token.clone();
+
+      drop(cx);
+
+      let result = runtime
+        .run(
+          RunOptionsBuilder::new()
+            .stream_rx(network_receiver)
+            .wait_termination_request_token(true)
+            .build()
+            .unwrap(),
+        )
+        .await;
+
+      if let Some(token) = termination_token {
+        token.cancel();
+      }
+
+      match result {
+        // if the error is execution terminated, check termination event reason
+        (Err(err), cpu_usage_ms) => {
+          let err_string = err.to_string();
+
+          if err_string.ends_with("execution terminated") {
+            Ok(
+              termination_event_receiver
+                .await
+                .unwrap()
+                .with_cpu_time_used(cpu_usage_ms as usize),
+            )
+          } else {
+            error!(
+              "runtime has escaped from the event loop unexpectedly: {:#}",
+              err
+            );
+
+            // Apply source maps to translate bundled line numbers to original
+            let exception = apply_source_maps(&err_string);
+            let exception = translate_vfs_paths(
+              &exception,
+              inner.event_metadata.service_path.as_deref(),
+            );
+            Ok(WorkerEvents::UncaughtException(UncaughtExceptionEvent {
+              exception,
+              cpu_time_used: cpu_usage_ms as usize,
+            }))
+          }
+        }
+
+        (Ok(()), cpu_usage_ms) => Ok(
+          termination_event_receiver
+            .await
+            .unwrap()
+            .with_cpu_time_used(cpu_usage_ms as usize),
+        ),
+      }
+    }
+  }
+
+  fn supervise(
+    &self,
+    runtime: &mut DenoRuntime,
+  ) -> Option<impl Future<Output = Result<(), JoinError>> + 'static> {
+    let Managed { inner, cx } = self.clone();
+    let mut cx = cx.try_lock().ok()?;
+    let runtime_drop_token = runtime.drop_token.clone();
+    let runtime_disposed_token = runtime.disposed_token.clone();
+    let isolate_lifecycle = runtime.mem_check_lifecycle();
+    let termination_request_token = runtime.termination_request_token.clone();
+    let termination_token = inner.termination_token.clone()?;
+    let termination_event_sender = match cx.take_termination_event_sender() {
+      Ok(v) => v,
+      Err(err) => {
+        tracing::error!(?err);
+        return None;
+      }
+    };
+
+    let (waker, thread_safe_handle, runtime_state) = (
+      runtime.waker.clone(),
+      runtime.js_runtime.v8_isolate().thread_safe_handle(),
+      runtime.runtime_state.clone(),
+    );
+
+    let wait_fut = async move {
+      termination_token.inbound.cancelled().await;
+
+      // Cancel termination_request_token to allow the event loop to exit.
+      // This is necessary for the main worker to stop its run() method.
+      if !termination_request_token.is_cancelled() {
+        termination_request_token.cancel();
+        waker.wake();
+      }
+
+      let _ =
+        termination_event_sender.send(WorkerEvents::Shutdown(ShutdownEvent {
+          reason: ShutdownReason::TerminationRequested,
+          cpu_time_used: 0,
+          memory_used: WorkerMemoryUsed {
+            total: 0,
+            heap: 0,
+            external: 0,
+            mem_check_captured: MemCheckState::default(),
+          },
+        }));
+
+      let data_ptr_mut =
+        Box::into_raw(Box::new(supervisor::V8HandleBeforeunloadData {
+          reason: WillTerminateReason::Termination,
+          runtime_drop_token: runtime_drop_token.clone(),
+          runtime_state: runtime_state.clone(),
+        }));
+
+      // Guard against calling V8 handle methods during/after runtime disposal
+      if let Some(_guard) = isolate_lifecycle.try_enter() {
+        if thread_safe_handle.request_interrupt(
+          as_interrupt_callback(v8_handle_beforeunload_raw),
+          data_ptr_mut as *mut _,
+        ) {
+          waker.wake();
+        } else {
+          // SAFETY: request_interrupt rejected the callback, so it will never
+          // run and we are the sole owner of the leaked box.
+          drop(unsafe { Box::from_raw(data_ptr_mut) });
+        }
+      } else {
+        // SAFETY: the interrupt was never requested, so we are the sole owner
+        // of the leaked box.
+        drop(unsafe { Box::from_raw(data_ptr_mut) });
+      }
+
+      if (timeout(SUPERVISE_DEADLINE_SEC, runtime_disposed_token.cancelled())
+        .await)
+        .is_err()
+      {
+        warn!(
+          concat!(
+            "termination job is running for over {} seconds ",
+            "(Press Control-C to terminate the job immediately)"
+          ),
+          SUPERVISE_DEADLINE_SEC.as_secs()
+        );
+
+        tokio::select! {
+          _ = runtime_disposed_token.cancelled() => {},
+          Ok(_) = tokio::signal::ctrl_c() => {
+            warn!("interrupt signal received");
+          }
+        }
+      }
+
+      termination_token.outbound.cancel();
+    };
+
+    base_rt::SUPERVISOR_RT.spawn(wait_fut).boxed().into()
+  }
+
+  fn runtime_handle(&self) -> &'static tokio_util::task::LocalPoolHandle {
+    &base_rt::PRIMARY_WORKER_RT
+  }
+
+  async fn network_sender(&self) -> mpsc::UnboundedSender<DuplexStreamEntry> {
+    self.cx.lock().await.get_network_sender()
+  }
+}

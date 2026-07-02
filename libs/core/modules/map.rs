@@ -233,6 +233,7 @@ pub(crate) struct ModuleMap {
   pub(crate) loader: RefCell<Rc<dyn ModuleLoader>>,
 
   pub(crate) source_mapper: Rc<RefCell<SourceMapper>>,
+  mod_evaluate_ptr: Cell<Option<*mut ModEvaluate>>,
   exception_state: Rc<ExceptionState>,
   dynamic_import_map: RefCell<HashMap<ModuleLoadId, DynImportState>>,
   preparing_dynamic_imports: TrackedFutures<Pin<Box<PrepareLoadFuture>>>,
@@ -282,6 +283,9 @@ impl ModuleMap {
     self.pending_dyn_mod_evaluations.clear();
     self.pending_tla_waiters.borrow_mut().clear();
     self.code_cache_ready_futs.clear();
+    if let Some(ptr) = self.mod_evaluate_ptr.take() {
+      unsafe { drop(Box::from_raw(ptr)) }
+    }
     std::mem::take(&mut *self.data.borrow_mut());
   }
 
@@ -337,6 +341,7 @@ impl ModuleMap {
       will_snapshot,
       loader: loader.into(),
       source_mapper,
+      mod_evaluate_ptr: Default::default(),
       exception_state,
       dyn_module_evaluate_idle_counter: Default::default(),
       dynamic_import_map: Default::default(),
@@ -1879,15 +1884,15 @@ impl ModuleMap {
       };
 
       // Create a ModEvaluate instance and stash it in an external
-      let evaluation = v8::External::new(
-        tc_scope,
-        Box::into_raw(Box::new(ModEvaluate {
-          module_map: self.clone(),
-          sender: Some(sender),
-          notify,
-          module,
-        })) as _,
-      );
+      let mod_evaluate_ptr = Box::into_raw(Box::new(ModEvaluate {
+        module_map: self.clone(),
+        sender: Some(sender),
+        notify,
+        module,
+      }));
+      let evaluation = v8::External::new(tc_scope, mod_evaluate_ptr as _);
+
+      self.mod_evaluate_ptr.set(Some(mod_evaluate_ptr));
 
       fn get_sender(arg: v8::Local<v8::Value>) -> ModEvaluate {
         let sender = v8::Local::<v8::External>::try_from(arg).unwrap();
@@ -1900,6 +1905,7 @@ impl ModuleMap {
          _rv: v8::ReturnValue| {
           let mut sender = get_sender(args.data());
           sender.module_map.pending_mod_evaluation.set(false);
+          sender.module_map.mod_evaluate_ptr.take();
           sender.module_map.module_waker.wake();
           sender.notify(scope);
         },
@@ -1913,6 +1919,7 @@ impl ModuleMap {
          _rv: v8::ReturnValue| {
           let mut sender = get_sender(args.data());
           sender.module_map.pending_mod_evaluation.set(false);
+          sender.module_map.mod_evaluate_ptr.take();
           sender.module_map.module_waker.wake();
           _ = sender.sender.take().unwrap().send(Ok(()));
           scope.throw_exception(args.get(0));
@@ -1938,6 +1945,7 @@ impl ModuleMap {
 
         // Unset pending mod evaluation as the handlers will never run. See debug_assert below.
         self.pending_mod_evaluation.set(false);
+        self.mod_evaluate_ptr.take();
 
         let mut sender = get_sender(evaluation.into());
         match promise.state() {
@@ -2712,7 +2720,13 @@ impl ModuleMap {
     let status = module_local.get_status();
     assert_eq!(status, v8::ModuleStatus::Instantiated);
 
-    let value = module_local.evaluate(scope).unwrap();
+    let Some(value) = module_local.evaluate(scope) else {
+      // `evaluate` returns `None` when execution is terminating - e.g. an
+      // embedder's watchdog (CPU/memory limiter) terminated the isolate while
+      // it was lazy-loading this module. Surface an error instead of
+      // panicking, so terminating one isolate cannot abort the host process.
+      return Err(CoreErrorKind::ExecutionTerminated.into_box());
+    };
     // Under Explicit microtask policy, drain microtasks so the module
     // evaluation promise resolves for synchronous modules.
     //
@@ -2735,7 +2749,12 @@ impl ModuleMap {
     }
 
     let status = module_local.get_status();
-    assert_eq!(status, v8::ModuleStatus::Evaluated);
+    if status != v8::ModuleStatus::Evaluated {
+      // Only reachable when execution was terminated mid-evaluation (see the
+      // `evaluate` check above); a JS error in the module would have surfaced
+      // through the promise-result check.
+      return Err(CoreErrorKind::ExecutionTerminated.into_box());
+    }
 
     let mod_ns = module_local.get_module_namespace();
 

@@ -1,0 +1,81 @@
+use std::collections::HashMap;
+
+use deno::PermissionsContainer;
+use deno_core::OpState;
+use deno_core::op2;
+use deno_error::JsErrorBox;
+
+const NODE_ENV_VAR_ALLOWLIST: &[&str] =
+  &["FORCE_COLOR", "NODE_DEBUG", "NODE_OPTIONS", "NO_COLOR"];
+
+#[derive(Default)]
+pub struct EnvVars(pub HashMap<String, String>);
+
+impl std::ops::Deref for EnvVars {
+  type Target = HashMap<String, String>;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+deno_core::extension!(
+  env,
+  ops = [op_set_env, op_env, op_get_env, op_delete_env],
+  esm_entry_point = "ext:env/env.js",
+  esm = ["env.js"]
+);
+
+#[op2(fast)]
+fn op_set_env(
+  _state: &mut OpState,
+  #[string] _key: String,
+  #[string] _value: String,
+) -> Result<(), JsErrorBox> {
+  Err(JsErrorBox::not_supported())
+}
+
+#[op2]
+#[serde]
+fn op_env(state: &mut OpState) -> Result<HashMap<String, String>, JsErrorBox> {
+  state
+    .borrow_mut::<PermissionsContainer>()
+    .check_env_all()
+    .map_err(JsErrorBox::from_err)?;
+  let env_vars = state.borrow::<EnvVars>();
+  Ok(env_vars.0.clone())
+}
+
+#[op2]
+#[string]
+fn op_get_env(
+  state: &mut OpState,
+  #[string] key: String,
+) -> Result<Option<String>, JsErrorBox> {
+  let skip_permission_check = NODE_ENV_VAR_ALLOWLIST.contains(&key.as_str());
+
+  if !skip_permission_check {
+    state
+      .borrow_mut::<PermissionsContainer>()
+      .check_env(&key)
+      .map_err(JsErrorBox::from_err)?;
+  }
+
+  if key.is_empty() {
+    return Err(JsErrorBox::type_error("Key is an empty string."));
+  }
+
+  if key.contains(&['=', '\0'] as &[char]) {
+    return Err(JsErrorBox::type_error(format!(
+      "Key contains invalid characters: {:?}",
+      key
+    )));
+  }
+
+  let env_vars = state.borrow::<EnvVars>();
+  let r = env_vars.get(&key).cloned();
+  Ok(r)
+}
+
+#[op2(fast)]
+fn op_delete_env(_state: &mut OpState, #[string] _key: String) {}

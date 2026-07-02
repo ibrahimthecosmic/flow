@@ -814,6 +814,10 @@ pub unsafe fn uv_tcp_nodelay(tcp: *mut uv_tcp_t, enable: c_int) -> c_int {
 pub unsafe fn uv_tcp_reset(tcp: *mut uv_tcp_t) -> c_int {
   // SAFETY: Caller guarantees tcp is valid and initialized.
   unsafe {
+    #[allow(
+      deprecated,
+      reason = "tokio deprecated set_linger because SO_LINGER can block on drop, but SO_LINGER=0 never blocks and is required here for the RST behaviour"
+    )]
     if let Some(ref stream) = (*tcp).internal_stream
       && stream.set_linger(Some(std::time::Duration::ZERO)).is_err()
     {

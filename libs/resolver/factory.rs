@@ -10,6 +10,7 @@ use deno_cache_dir::DenoDirResolutionError;
 use deno_cache_dir::GlobalHttpCacheRc;
 use deno_cache_dir::GlobalOrLocalHttpCache;
 use deno_cache_dir::LocalHttpCache;
+use deno_cache_dir::LocalHttpCacheRc;
 use deno_cache_dir::npm::NpmCacheDir;
 use deno_config::deno_json::MinimumDependencyAgeConfig;
 use deno_config::deno_json::NewestDependencyDate;
@@ -25,6 +26,7 @@ use deno_config::workspace::WorkspaceDiscoverOptions;
 use deno_config::workspace::WorkspaceDiscoverStart;
 use deno_maybe_sync::MaybeSend;
 use deno_maybe_sync::MaybeSync;
+use deno_maybe_sync::new_arc;
 use deno_maybe_sync::new_rc;
 pub use deno_npm::NpmSystemInfo;
 use deno_npm::resolution::NpmOverrides;
@@ -496,10 +498,11 @@ impl<TSys: WorkspaceFactorySys> WorkspaceFactory<TSys> {
   ) -> Result<&GlobalHttpCacheRc<TSys>, DenoDirResolutionError> {
     self.global_http_cache.get_or_try_init(|| {
       let global_cache_dir = self.deno_dir()?.remote_folder_path();
-      let global_http_cache = new_rc(deno_cache_dir::GlobalHttpCache::new(
-        self.sys.clone(),
-        global_cache_dir,
-      ));
+      let global_http_cache =
+        GlobalHttpCacheRc::new(deno_cache_dir::GlobalHttpCache::new(
+          self.sys.clone(),
+          global_cache_dir,
+        ));
       Ok(global_http_cache)
     })
   }
@@ -518,7 +521,7 @@ impl<TSys: WorkspaceFactorySys> WorkspaceFactory<TSys> {
             deno_cache_dir::GlobalToLocalCopy::Allow,
             self.jsr_url().clone(),
           );
-          Ok(new_rc(local_cache).into())
+          Ok(LocalHttpCacheRc::new(local_cache).into())
         }
         None => Ok(global_cache.into()),
       }
@@ -628,7 +631,7 @@ impl<TSys: WorkspaceFactorySys> WorkspaceFactory<TSys> {
         }
       };
       let resolve_empty_options = || WorkspaceDirectoryEmptyOptions {
-        root_dir: new_rc(
+        root_dir: new_arc(
           deno_path_util::url_from_directory_path(&self.initial_cwd).unwrap(),
         ),
         use_vendor_dir: maybe_vendor_override
