@@ -2087,6 +2087,7 @@ export const builtinModules = [
   "v8",
   "vm",
   "wasi",
+  "worker_threads",
   "zlib",
 ];
 

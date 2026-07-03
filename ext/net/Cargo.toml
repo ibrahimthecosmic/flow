@@ -29,7 +29,6 @@ pin-project.workspace = true
 quinn = { workspace = true, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rustls-tokio-stream.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 socket2.workspace = true
 thiserror.workspace = true

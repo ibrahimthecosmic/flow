@@ -14,7 +14,7 @@ const {
   op_tls_handshake,
   op_tls_key_null,
   op_tls_key_static,
-  // op_tls_peer_certificate,
+  op_tls_peer_certificate,
   op_tls_start,
 } = core.ops;
 const {
@@ -47,8 +47,8 @@ class TlsConn extends Conn {
     return op_tls_handshake(this.#rid);
   }
 
-  [_getPeerCertificate](_detailed = false) {
-    return null;
+  [_getPeerCertificate](detailed = false) {
+    return op_tls_peer_certificate(this.#rid, detailed);
   }
 }
 

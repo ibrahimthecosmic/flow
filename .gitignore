@@ -52,3 +52,4 @@ Untitled*.ipynb
 # pyenv
 /.python-version
 tests/sqlite_extension/target/
+tests/specs/node/child_process_extra_pipes/test-pipe/target/
