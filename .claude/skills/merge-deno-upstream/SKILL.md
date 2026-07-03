@@ -17,19 +17,21 @@ internal APIs change. Read the memory files first:
 `memory/`). They record every non-obvious decision and the API-drift map.
 
 **Repo topology** (see `flow-runtime-progress.md`): flow lives in the detached
-public repo `ibrahimthecosmic/flow` (`origin`), with `upstream` =
-denoland/deno. Two long-lived branches: **`deno`** = a pristine upstream mirror
-(only ever fast-forwards to a release commit; never holds flow commits) and
-**`main`** = the flow dev line. A Deno upgrade happens on an
-**`upgrade/<denover>`** branch merged back into `main` when done.
+public repo `ibrahimthecosmic/flow` (`origin`), with `upstream` = denoland/deno.
+Two long-lived branches: **`deno`** = a pristine upstream mirror (only ever
+fast-forwards to a release commit; never holds flow commits) and **`main`** =
+the flow dev line. A Deno upgrade happens on an **`upgrade/<denover>`** branch
+merged back into `main` when done.
 
 **Versioning & builds:** flow ships from its OWN tags (`vX.Y.Z`) — major aligned
 with Deno, minor/patch diverge (flow can ship fixes/features off Deno's release
 schedule). CI **builds only on Flow tag pushes**; branch pushes (`main`,
-`upgrade/*`, `deno`) do NOT build, so validate locally (`cargo build -p flow
---bin flow` + smoke tests) before tagging. A Flow fix/feature is developed on
-`main`, then tagged to release. A Deno upgrade ends by merging the upgrade
-branch to `main`, tagging, and deleting the branch (step 8).
+`upgrade/*`, `deno`) do NOT build, so validate locally
+(`cargo build -p flow
+--bin flow` + smoke tests) before tagging. A Flow
+fix/feature is developed on `main`, then tagged to release. A Deno upgrade ends
+by merging the upgrade branch to `main`, tagging, and deleting the branch (step
+8).
 
 ## Procedure
 
