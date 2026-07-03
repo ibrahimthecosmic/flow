@@ -27,6 +27,7 @@ use tokio::time::timeout;
 
 mod flags;
 mod flow_config;
+mod flow_events;
 
 /// `flow` is a drop-in Deno binary plus the edge layer. Everything except the
 /// flow-specific `eszip` subcommand group is delegated verbatim to the full
@@ -112,7 +113,10 @@ fn install_flow_embedding() {
   );
 
   deno::embed::register_main_worker_extensions(Box::new(|| {
-    vec![ext_workers::user_workers_ops::init()]
+    vec![
+      ext_workers::user_workers_ops::init(),
+      flow_events::flow_events_ops::init(),
+    ]
   }));
 
   deno::embed::register_main_worker_post_bootstrap(Box::new(|js_runtime| {
@@ -132,10 +136,18 @@ fn install_flow_embedding() {
       Inspector::with_option(InspectorOption::Inspect(addr), server)
     });
 
+    // Always-on user-worker event channel: the pool sends lifecycle events
+    // (Boot/Shutdown/BootFailure/UncaughtException) and each worker's console
+    // interceptor sends Log events here. Until user code claims
+    // `FlowRuntime.events`, the relay task drains it with stdio-inherit
+    // semantics; claiming hands the receiver over to the flow_events ops.
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let relay_cmd_tx = flow_events::spawn_events_relay(events_rx);
+
     let (_metric_src, worker_pool_tx) = create_user_worker_pool(
       Arc::new(server_flags),
       policy,
-      None,
+      Some(events_tx),
       None,
       vec![],
       inspector,
@@ -148,6 +160,8 @@ fn install_flow_embedding() {
     // be present before any user JS calls `FlowRuntime.userWorkers.create()`,
     // which can only happen after this step completes.
     js_runtime.op_state().borrow_mut().put(worker_pool_tx);
+    // Same deal for the flow_events ops (`FlowRuntime.events` claim/release).
+    js_runtime.op_state().borrow_mut().put(relay_cmd_tx);
 
     // Evaluated as ESM (not a classic script) so it can `import` the
     // snapshotted `ext:core/mod.js` to reach the ops — `Deno.core` is not on

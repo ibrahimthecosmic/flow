@@ -723,6 +723,12 @@ const NOT_IMPORTED_OPS = [
   "op_user_worker_create",
   "op_user_worker_cleanup_idle_workers",
   "op_user_worker_inspect",
+  // flow: FlowRuntime.events (keep in sync with the `flow_events_ops`
+  // extension in edge/cli/src/flow_events.rs).
+  "op_flow_events_claim",
+  "op_flow_events_accept",
+  "op_flow_events_cancel",
+  "op_flow_events_release",
 ];
 
 function removeImportedOps() {

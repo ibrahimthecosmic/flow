@@ -178,6 +178,51 @@ Details:
 const cleaned = await FlowRuntime.userWorkers.tryCleanupIdleWorkers(30_000);
 ```
 
+## Observing workers: `FlowRuntime.events`
+
+`FlowRuntime.events` is an async iterable over every worker's lifecycle and
+console output — the same event stream edge/trex feed to their dedicated "events
+worker" (`new EventManager()`), collapsed into a host API on the main isolate:
+
+```ts
+for await (const ev of FlowRuntime.events) {
+  // ev = { timestamp, event_type, event, metadata }
+  switch (ev.event_type) {
+    case "Log": // every console.* call in a worker: { msg, level }
+    case "Boot": // { boot_time }
+    case "BootFailure": // { msg }
+    case "UncaughtException": // { exception, cpu_time_used }
+    case "Shutdown": // { reason, cpu_time_used, memory_used }
+  }
+  // ev.metadata = { service_path, execution_id, ... } — route per tenant
+}
+```
+
+Semantics:
+
+- **stdio-inherit until claimed.** While nobody iterates, worker output behaves
+  like a Node child with `stdio: "inherit"`: `console.log`/`info`/`debug` land
+  on flow's stdout, `console.warn`/`error` and uncaught exceptions on stderr.
+  `Boot`/`Shutdown` telemetry prints nothing (visible via `DENO_LOG=debug`).
+- **Claiming.** The first `next()` (i.e. entering the `for await`) claims the
+  stream; from then on events go to the iterator instead of stdio.
+- **Single consumer.** A second concurrent iteration rejects with a claim error.
+  Fan out in JS if you need multiple readers.
+- **Releasing.** Breaking out of the loop (or calling `return()` on the
+  iterator) hands the stream back — stdio-inherit resumes. The iterator ends
+  (`done`) when the worker pool shuts down.
+
+The stream is claimed on the main isolate. To do heavy per-tenant processing
+(batching, shipping logs to third parties) without loading the main event loop,
+relay events into a plain Web Worker — they are structured-clone-safe:
+
+```ts
+const shipper = new Worker(import.meta.resolve("./shipper.ts"), {
+  type: "module",
+});
+for await (const ev of FlowRuntime.events) shipper.postMessage(ev);
+```
+
 ## Debugging workers
 
 Start flow with the user-worker inspector enabled:

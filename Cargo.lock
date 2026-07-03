@@ -5950,9 +5950,13 @@ dependencies = [
  "clap",
  "color-print",
  "deno",
+ "deno_core",
+ "deno_error",
  "deno_facade",
  "env_logger 0.10.0",
+ "ext_event_worker",
  "ext_workers",
+ "log",
  "rustls 0.23.40",
  "tokio",
 ]
