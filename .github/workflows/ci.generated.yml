@@ -3,9 +3,8 @@
 name: ci
 on:
   push:
-    branches:
-      - main
-      - upgrade/*
+    tags:
+      - v*
 permissions:
   contents: write
   id-token: write

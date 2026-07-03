@@ -10,6 +10,12 @@
 #   - upgrade/<version> : where a new upstream release is reconciled with flow
 #                         before merging into `main`.
 #
+# flow ships from its OWN release tags (`vX.Y.Z`): major aligned with Deno,
+# minor/patch diverge (flow can ship fixes/features off Deno's schedule). A
+# build is produced by pushing a Flow tag on a `main` commit. So the upgrade
+# ends: merge upgrade/<version> into main, tag main with the Flow version, push
+# the tag (this triggers the build), then delete the upgrade branch.
+#
 # We deliberately do NOT import upstream tags (denoland ships hundreds, and a
 # tag named `v2.9.1` would collide with an `upgrade/2.9.1` branch). Instead we
 # fetch only the tag's commit into the `deno` branch.
@@ -86,14 +92,18 @@ if [ "$DO_UPGRADE" = "--upgrade" ]; then
   fi
   echo "Creating ${BRANCH} off main and merging deno (${TAG}) into it ..."
   git switch -c "${BRANCH}" main
-  if git merge --no-edit deno; then
-    echo "Merge clean. Build + test, then: git switch main && git merge ${BRANCH}"
+  merge_ok=1
+  git merge --no-edit deno || merge_ok=0
+  echo ""
+  if [ "$merge_ok" = 1 ]; then
+    echo "Merge clean. Build + test flow, then finish with:"
   else
-    echo ""
-    echo "Merge has conflicts (expected). Resolve them, then:"
-    echo "  git commit           # finish the merge"
-    echo "  # build + test flow, then:"
-    echo "  git switch main && git merge ${BRANCH}"
-    echo "See the merge-deno-upstream skill for guidance."
+    echo "Merge has conflicts (expected). Resolve them, 'git commit' to finish"
+    echo "the merge, build + test flow, then:"
   fi
+  echo "  git switch main && git merge --no-ff ${BRANCH}"
+  echo "  git tag v<flow-version>      # flow's own version, NOT necessarily ${VERSION}"
+  echo "  git push origin main --tags  # pushing the tag triggers the build"
+  echo "  git branch -d ${BRANCH} && git push origin --delete ${BRANCH}"
+  echo "See the merge-deno-upstream skill for conflict-resolution guidance."
 fi

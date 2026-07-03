@@ -1794,11 +1794,13 @@ const workflow = createWorkflow({
     "id-token": "write", // Required for GitHub OIDC with Azure for code signing
   },
   on: {
-    // flow's development line is `main`; version upgrades are validated on
-    // `upgrade/*` branches before merging. The `deno` branch is a pristine
-    // upstream mirror and must never trigger CI.
+    // flow builds from its OWN release tags (`vX.Y.Z`), never Deno's — upstream
+    // tags are not imported. A build is produced when a commit on `main` is
+    // tagged: either a Flow fix/feature developed on `main`, or a completed Deno
+    // upgrade merged back into `main`. Branch pushes (`main`, `upgrade/*`, and
+    // the `deno` mirror) do not trigger CI.
     push: {
-      branches: ["main", "upgrade/*"],
+      tags: ["v*"],
     },
   },
   concurrency: {

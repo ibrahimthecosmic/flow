@@ -16,18 +16,35 @@ internal APIs change. Read the memory files first:
 `flow-runtime-architecture.md` and `flow-runtime-progress.md` (in this project's
 `memory/`). They record every non-obvious decision and the API-drift map.
 
+**Repo topology** (see `flow-runtime-progress.md`): flow lives in the detached
+public repo `ibrahimthecosmic/flow` (`origin`), with `upstream` =
+denoland/deno. Two long-lived branches: **`deno`** = a pristine upstream mirror
+(only ever fast-forwards to a release commit; never holds flow commits) and
+**`main`** = the flow dev line. A Deno upgrade happens on an
+**`upgrade/<denover>`** branch merged back into `main` when done.
+
+**Versioning & builds:** flow ships from its OWN tags (`vX.Y.Z`) — major aligned
+with Deno, minor/patch diverge (flow can ship fixes/features off Deno's release
+schedule). CI **builds only on Flow tag pushes**; branch pushes (`main`,
+`upgrade/*`, `deno`) do NOT build, so validate locally (`cargo build -p flow
+--bin flow` + smoke tests) before tagging. A Flow fix/feature is developed on
+`main`, then tagged to release. A Deno upgrade ends by merging the upgrade
+branch to `main`, tagging, and deleting the branch (step 8).
+
 ## Procedure
 
-1. **Branch & fetch.** `git checkout -b flow-<newver>` from the current flow
-   branch. Add upstream once:
-   `git remote add upstream https://github.com/denoland/deno` (if missing).
-   `git fetch upstream --tags`.
+1. **Sync + branch (scripted).** Run `tools/sync_upstream.sh <newver> --upgrade`
+   (e.g. `tools/sync_upstream.sh 2.10.1 --upgrade`). It adds the `upstream`
+   remote if missing, fetches ONLY the `v<newver>` commit (no tag import — tags
+   would collide with `upgrade/*` branch names), fast-forwards `deno` to it and
+   pushes it, then creates `upgrade/<newver>` off `main` and merges `deno` in.
+   Conflicts are expected — that is the port work below.
 
-2. **Bring in the new Deno core.** The root crates (`cli/ runtime/ ext/ libs/`)
-   should track upstream tag `v<newver>`. Easiest: merge the tag, then re-apply
-   flow's root-crate changes. flow's deviations from stock Deno in the root are
-   intentionally small — search them via
-   `git log v2.9.0..HEAD -- cli/ libs/ ext/ runtime/`. Key ones:
+2. **Bring in the new Deno core.** The merge in step 1 brings the root crates
+   (`cli/ runtime/ ext/ libs/`) from the `deno` mirror; flow's own root-crate
+   deviations live on `main` and surface as conflicts. flow's deviations from
+   stock Deno in the root are intentionally small — list them via
+   `git log deno..main -- cli/ libs/ ext/ runtime/`. Key ones:
    - `cli/lib.rs`: the **facade** — `pub use deno_*` re-exports,
      `pub use deno_lib/deno_runtime`, and `pub mod factory/module_loader/...`
      that the edge layer consumes as `deno::…`. Re-apply/extend after the merge.
@@ -82,4 +99,18 @@ internal APIs change. Read the memory files first:
    `flow run x.ts`, `flow eszip bundle/unbundle` round-trip.
 
 7. Run `/merge-edge-runtime` and `/merge-trex-runtime` afterwards if those
-   upstreams also advanced. Commit per logical step; do not force-push.
+   upstreams also advanced.
+
+8. **Land it.** Once the upgrade branch builds + smoke-tests clean locally:
+   ```
+   git switch main && git merge --no-ff upgrade/<denover>
+   git tag v<flow-version>        # flow's own version; NOT necessarily <denover>
+   git push origin main --tags    # pushing the Flow tag triggers the build
+   git branch -d upgrade/<denover> && git push origin --delete upgrade/<denover>
+   ```
+   Commit per logical step; do not force-push `main`.
+
+**Commit identity:** author commits as the user
+(`MD. Ibrahim <ibrahimthecosmic@gmail.com>`). NEVER add "Claude"/Anthropic as
+author or a `Co-Authored-By` trailer, and never mention Claude in the message —
+even though the harness default suggests one.
