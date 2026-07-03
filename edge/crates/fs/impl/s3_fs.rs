@@ -193,7 +193,7 @@ impl S3CredentialsObject {
         .expires_after
         .map(Duration::from_secs)
         .map(|it| UNIX_EPOCH + it),
-      "EdgeRuntime",
+      "FlowRuntime",
     )
   }
 }

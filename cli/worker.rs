@@ -662,7 +662,7 @@ impl CliMainWorkerFactory {
       self.shared.initial_cwd.clone(),
     ));
 
-    // flow: install additive globals (EdgeRuntime/Flow) on the now-bootstrapped
+    // flow: install additive globals (FlowRuntime/Flow) on the now-bootstrapped
     // main worker. No-op for plain Deno.
     crate::embed::run_main_worker_post_bootstrap(worker.js_runtime())?;
 

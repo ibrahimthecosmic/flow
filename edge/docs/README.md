@@ -5,7 +5,7 @@ sandboxed **user-worker** runtime (Supabase edge-runtime lineage). The main
 isolate is plain Deno — every Deno subcommand, flag, and API works unchanged —
 and on top of it flow adds:
 
-- a **host API** (`EdgeRuntime.userWorkers`) for spawning hardened,
+- a **host API** (`FlowRuntime.userWorkers`) for spawning hardened,
   resource-limited worker isolates and talking to them over `MessagePort`s,
 - a small set of **CLI flags / environment variables** tuning the worker pool,
 - the **`flow eszip`** subcommand group for deployment artifacts,
@@ -24,7 +24,7 @@ These documents cover only the flow layer. For everything else, use the regular
 
 ```ts
 // main.ts — runs in the (plain Deno) main isolate
-const worker = await EdgeRuntime.userWorkers.create({
+const worker = await FlowRuntime.userWorkers.create({
   servicePath: "./service", // directory containing index.ts
 });
 
@@ -34,8 +34,8 @@ worker.port.postMessage({ hello: "worker" });
 
 ```ts
 // service/index.ts — runs in a sandboxed user worker
-EdgeRuntime.parentPort.onmessage = (e) => {
-  EdgeRuntime.parentPort.postMessage({ echo: e.data });
+FlowRuntime.parentPort.onmessage = (e) => {
+  FlowRuntime.parentPort.postMessage({ echo: e.data });
 };
 ```
 
@@ -47,7 +47,7 @@ worker said: { echo: { hello: "worker" } }
 ## Architecture in one paragraph
 
 Every `flow` invocation is a normal Deno process. When the main worker
-bootstraps, flow installs the `EdgeRuntime` global and stands up a user-worker
+bootstraps, flow installs the `FlowRuntime` global and stands up a user-worker
 pool (no HTTP server — flow's ancestors served HTTP; flow exposes workers to
 _your code_ instead). Each `create()` call asks the pool for a worker: each
 worker runs on its own OS thread in its own V8 isolate with its own heap limit,

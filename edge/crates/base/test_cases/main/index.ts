@@ -22,7 +22,7 @@ Deno.serve(async (req: Request) => {
   // handle health checks
   if (pathname === "/_internal/cleanup-idle-workers") {
     return Response.json({
-      count: await EdgeRuntime.userWorkers.tryCleanupIdleWorkers(1000),
+      count: await FlowRuntime.userWorkers.tryCleanupIdleWorkers(1000),
     });
   }
 
@@ -87,7 +87,7 @@ Deno.serve(async (req: Request) => {
       },
     };
 
-    return await EdgeRuntime.userWorkers.create({
+    return await FlowRuntime.userWorkers.create({
       servicePath,
       memoryLimitMb,
       workerTimeoutMs,

@@ -124,7 +124,7 @@ pub fn shared_array_buffer_store() -> SharedArrayBufferStore {
 
 /// Runs once on a freshly bootstrapped main worker, *after* Deno's
 /// `bootstrapMainRuntime` has set up the global scope. flow uses this to
-/// install its additive globals (`EdgeRuntime`/`Flow`) on top of a fully
+/// install its additive globals (`FlowRuntime`/`Flow`) on top of a fully
 /// initialized Deno scope — running at extension-eval time would be too early
 /// (`globalThis.Deno` is not built yet).
 type PostBootstrapHook =

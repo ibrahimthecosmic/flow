@@ -7,7 +7,7 @@ Deno.serve(async (req: Request) => {
 
   const userWorkerPath = path.join(basePath, "user_worker");
   if (pathname === "/import_map") {
-    const worker = await EdgeRuntime.userWorkers.create({
+    const worker = await FlowRuntime.userWorkers.create({
       servicePath: userWorkerPath,
       forceCreate: true,
       context: {
@@ -26,7 +26,7 @@ Deno.serve(async (req: Request) => {
       encodeURIComponent(JSON.stringify(inlineImportMap))
     }`;
 
-    const worker = await EdgeRuntime.userWorkers.create({
+    const worker = await FlowRuntime.userWorkers.create({
       servicePath: userWorkerPath,
       forceCreate: true,
       context: {

@@ -92,7 +92,7 @@ pub struct Inspector {
 
 impl Inspector {
   pub fn from_option(option: InspectorOption) -> Self {
-    const INSPECTOR_NAME: &str = "sb-edge-runtime-inspector";
+    const INSPECTOR_NAME: &str = "flow-runtime-inspector";
 
     Self {
       option,
@@ -747,7 +747,7 @@ impl InspectorInfo {
     let host_listen = format!("{}", self.host);
     let host = host.as_ref().unwrap_or(&host_listen);
     json!({
-      "description": "EdgeRuntime",
+      "description": "FlowRuntime",
       "devtoolsFrontendUrl": self.get_frontend_url(host),
       "faviconUrl": "https://deno.land/favicon.ico",
       "id": self.uuid.to_string(),
@@ -771,7 +771,7 @@ impl InspectorInfo {
 
   fn get_title(&self) -> String {
     format!(
-      "EdgeRuntime{} [pid: {}]",
+      "FlowRuntime{} [pid: {}]",
       self
         .thread_name
         .as_ref()

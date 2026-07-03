@@ -6,21 +6,21 @@ globals. This page documents what differs from plain Deno.
 
 ## Flow globals
 
-### `EdgeRuntime`
+### `FlowRuntime`
 
 | Member                           | Meaning                                                                                                                                                                    |
 | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `EdgeRuntime.parentPort`         | `MessagePort` to the host handle that created this worker                                                                                                                  |
-| `EdgeRuntime.parentPorts`        | Array of every parent port delivered so far (first one included)                                                                                                           |
-| `EdgeRuntime.onparentport`       | Assignable callback `(port: MessagePort) => void`, invoked when a reused `create()` delivers an additional channel (see [user-workers.md](./user-workers.md#worker-reuse)) |
-| `EdgeRuntime.waitUntil(promise)` | Keep the worker alive until the promise settles (useful for background work after replying)                                                                                |
+| `FlowRuntime.parentPort`         | `MessagePort` to the host handle that created this worker                                                                                                                  |
+| `FlowRuntime.parentPorts`        | Array of every parent port delivered so far (first one included)                                                                                                           |
+| `FlowRuntime.onparentport`       | Assignable callback `(port: MessagePort) => void`, invoked when a reused `create()` delivers an additional channel (see [user-workers.md](./user-workers.md#worker-reuse)) |
+| `FlowRuntime.waitUntil(promise)` | Keep the worker alive until the promise settles (useful for background work after replying)                                                                                |
 
 ```ts
-EdgeRuntime.parentPort.onmessage = (e) => {
+FlowRuntime.parentPort.onmessage = (e) => {
   const result = handle(e.data);
-  EdgeRuntime.parentPort.postMessage(result);
+  FlowRuntime.parentPort.postMessage(result);
   // fire-and-forget work that must still complete:
-  EdgeRuntime.waitUntil(flushMetrics());
+  FlowRuntime.waitUntil(flushMetrics());
 };
 ```
 
@@ -64,13 +64,13 @@ With `stream: true`, `run()` resolves to an async iterable of chunks.
 | `DENO_VERSION` | the Deno version flow is built on |
 
 `Deno.version.deno` inside a worker reports
-`flow-edge-runtime-<flow> (compatible with Deno v<deno>)`, and the user agent is
-`Deno/<deno> (variant; FlowEdgeRuntime/<flow>)`.
+`flow-runtime-<flow> (compatible with Deno v<deno>)`, and the user agent is
+`Deno/<deno> (variant; FlowRuntime/<flow>)`.
 
 ### `Trex`
 
 A legacy compatibility alias (trex-runtime lineage) exposing `waitUntil`. Prefer
-`EdgeRuntime.waitUntil`.
+`FlowRuntime.waitUntil`.
 
 ## Sandbox behavior
 
@@ -108,8 +108,8 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import isEven from "npm:is-even";
 
-EdgeRuntime.parentPort.onmessage = (e) => {
-  EdgeRuntime.parentPort.postMessage({
+FlowRuntime.parentPort.onmessage = (e) => {
+  FlowRuntime.parentPort.postMessage({
     hash: createHash("sha256").update(String(e.data)).digest("hex"),
     b64: Buffer.from("flow").toString("base64"),
     even: isEven(42),

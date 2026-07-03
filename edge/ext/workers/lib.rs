@@ -207,7 +207,7 @@ pub fn add_message_port(state: &mut OpState, port: MessagePort) -> ResourceId {
 }
 
 /// Worker-side: return the rid of this worker's parent `MessagePort`, if one was
-/// installed (i.e. the worker was created via `EdgeRuntime.userWorkers.create`).
+/// installed (i.e. the worker was created via `FlowRuntime.userWorkers.create`).
 #[op2(fast)]
 pub fn op_flow_parent_port_rid(state: &mut OpState) -> i32 {
   state
@@ -256,7 +256,7 @@ deno_core::extension!(
   // main isolate on top of Deno's CLI snapshot. It carries no ESM, because a
   // freshly-added ESM-bearing extension can't link against the snapshotted
   // `ext:` modules (deno_webidl/deno_web/...) and panics at init. The
-  // `EdgeRuntime.userWorkers` host surface is installed post-bootstrap by
+  // `FlowRuntime.userWorkers` host surface is installed post-bootstrap by
   // calling these ops directly (see edge/cli/src/flow_main.js).
   //
   // The HTTP request-passing fetch ops are intentionally omitted: that was the
@@ -558,7 +558,7 @@ pub async fn op_user_worker_create(
 /// user-worker inspector is disabled or `key` is malformed. The URL is derived
 /// purely from `key` + the configured inspector host, matching what the worker
 /// registered under, so no cross-thread lookup is needed. flow exposes this as
-/// `EdgeRuntime.userWorkers`' `worker.inspect()`.
+/// `FlowRuntime.userWorkers`' `worker.inspect()`.
 /// Returns the URL, or an empty string when the inspector is disabled or `key`
 /// is malformed (deno_core ops can't return `Option<String>` directly).
 #[op2]

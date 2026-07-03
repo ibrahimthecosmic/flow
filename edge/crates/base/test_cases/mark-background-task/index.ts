@@ -37,7 +37,7 @@ export default {
     // make a promise that waits for 5s, and at the same time, notify the runtime that it should
     // wait for this promise.
     dispatchEvent(
-      new MyBackgroundTaskEvent(EdgeRuntime.waitUntil(sleep(5000))),
+      new MyBackgroundTaskEvent(FlowRuntime.waitUntil(sleep(5000))),
     );
     return new Response();
   },

@@ -631,7 +631,7 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
     version: getterOnly(() => ({
       deno:
         // TODO(flow): change to a well-known name for the ecosystem.
-        `flow-edge-runtime-${globalThis.FLOW_VERSION} (compatible with Deno v${globalThis.DENO_VERSION})`,
+        `flow-runtime-${globalThis.FLOW_VERSION} (compatible with Deno v${globalThis.DENO_VERSION})`,
       v8: "11.6.189.12",
       typescript: "5.1.6",
     })),
@@ -663,20 +663,20 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
     // flow: expose the duplex MessagePort back to the host (main isolate). The
     // pair is created in Rust by op_user_worker_create; this worker's half was
     // installed into op_state and its rid is handed over here. Surfaced as
-    // `EdgeRuntime.parentPort` (postMessage/onmessage, structured clone).
+    // `FlowRuntime.parentPort` (postMessage/onmessage, structured clone).
     const parentPortRid = ops.op_flow_parent_port_rid();
     if (parentPortRid >= 0) {
       const { createMessagePort } = core.loadExtScript(
         "ext:deno_web/13_message_port.js",
       );
-      globalThis.EdgeRuntime.parentPort = createMessagePort(parentPortRid);
-      globalThis.EdgeRuntime.parentPorts = [globalThis.EdgeRuntime.parentPort];
+      globalThis.FlowRuntime.parentPort = createMessagePort(parentPortRid);
+      globalThis.FlowRuntime.parentPorts = [globalThis.FlowRuntime.parentPort];
 
       // Accept ADDITIONAL parent ports, delivered when a later host-side
-      // `EdgeRuntime.userWorkers.create()` resolves to this already-running
+      // `FlowRuntime.userWorkers.create()` resolves to this already-running
       // worker (pool reuse) - each such create() gets its own duplex channel,
       // SharedWorker-style. New ports are appended to
-      // `EdgeRuntime.parentPorts` and handed to `EdgeRuntime.onparentport`
+      // `FlowRuntime.parentPorts` and handed to `FlowRuntime.onparentport`
       // when set (messages queue inside the port until a handler attaches).
       // The pending accept op is unref'd so it never holds the event loop.
       (async () => {
@@ -688,14 +688,14 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
             break;
           }
           const port = createMessagePort(rid);
-          ArrayPrototypePush(globalThis.EdgeRuntime.parentPorts, port);
-          const handler = globalThis.EdgeRuntime.onparentport;
+          ArrayPrototypePush(globalThis.FlowRuntime.parentPorts, port);
+          const handler = globalThis.FlowRuntime.onparentport;
           if (typeof handler === "function") {
             try {
               handler(port);
             } catch (error) {
               globalThis.console.error(
-                "EdgeRuntime.onparentport threw:",
+                "FlowRuntime.onparentport threw:",
                 error,
               );
             }
@@ -716,7 +716,7 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
   setNumCpus(1); // explicitly setting no of CPUs to 1 (since we don't allow workers)
   setUserAgent(
     // TODO(flow): change to a well-known name for the ecosystem.
-    `Deno/${globalThis.DENO_VERSION} (variant; FlowEdgeRuntime/${globalThis.FLOW_VERSION})`,
+    `Deno/${globalThis.DENO_VERSION} (variant; FlowRuntime/${globalThis.FLOW_VERSION})`,
   );
   setLanguage("en");
 

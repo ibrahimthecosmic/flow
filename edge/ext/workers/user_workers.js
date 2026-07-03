@@ -22,7 +22,7 @@ const {
 
 const NO_FLOW_TAG_WARN_MSG =
   `Unable to find the flow tag from the request instance.\n\
-Invoke \`EdgeRuntime.applyFlowTag(origReq, newReq)\` if you have cloned the original request.`;
+Invoke \`FlowRuntime.applyFlowTag(origReq, newReq)\` if you have cloned the original request.`;
 
 function nullBodyStatus(status) {
   return status === 101 || status === 204 || status === 205 || status === 304;

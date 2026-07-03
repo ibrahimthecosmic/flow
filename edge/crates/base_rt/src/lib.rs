@@ -53,17 +53,16 @@ pub static SUPERVISOR_RT: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
 // are saturated.
 pub static PRIMARY_WORKER_RT: Lazy<tokio_util::task::LocalPoolHandle> =
   Lazy::new(|| {
-    let maybe_pool_size =
-      std::env::var("EDGE_RUNTIME_PRIMARY_WORKER_POOL_SIZE")
-        .ok()
-        .and_then(|it| it.parse::<usize>().ok())
-        .map(|it| {
-          if it < DEFAULT_PRIMARY_WORKER_POOL_SIZE {
-            DEFAULT_PRIMARY_WORKER_POOL_SIZE
-          } else {
-            it
-          }
-        });
+    let maybe_pool_size = std::env::var("FLOW_PRIMARY_WORKER_POOL_SIZE")
+      .ok()
+      .and_then(|it| it.parse::<usize>().ok())
+      .map(|it| {
+        if it < DEFAULT_PRIMARY_WORKER_POOL_SIZE {
+          DEFAULT_PRIMARY_WORKER_POOL_SIZE
+        } else {
+          it
+        }
+      });
 
     // See USER_WORKER_RT below: without v8::Locker, threads that host many
     // successive isolates eventually fault in JsRealm::destroy.
@@ -80,7 +79,7 @@ pub static PRIMARY_WORKER_RT: Lazy<tokio_util::task::LocalPoolHandle> =
 
 pub static USER_WORKER_RT: Lazy<tokio_util::task::LocalPoolHandle> =
   Lazy::new(|| {
-    let maybe_pool_size = std::env::var("EDGE_RUNTIME_WORKER_POOL_SIZE")
+    let maybe_pool_size = std::env::var("FLOW_WORKER_POOL_SIZE")
       .ok()
       .and_then(|it| it.parse::<usize>().ok())
       .map(|it| {

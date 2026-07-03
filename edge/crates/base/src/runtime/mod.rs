@@ -162,7 +162,7 @@ pub mod thread_utils;
 const DEFAULT_ALLOC_CHECK_INT_MSEC: u64 = 1000;
 
 static ALLOC_CHECK_DUR: Lazy<Duration> = Lazy::new(|| {
-  std::env::var("EDGE_RUNTIME_ALLOC_CHECK_INT")
+  std::env::var("FLOW_ALLOC_CHECK_INT")
     .ok()
     .and_then(|it| it.parse::<u64>().ok().map(Duration::from_millis))
     .unwrap_or_else(|| Duration::from_millis(DEFAULT_ALLOC_CHECK_INT_MSEC))
@@ -1080,7 +1080,7 @@ where
           ),
           deno_fetch::deno_fetch::args(
             deno_fetch::Options {
-              user_agent: "flow-edge-runtime".to_string(),
+              user_agent: "flow-runtime".to_string(),
               root_cert_store_provider: None,
               unsafely_ignore_certificate_errors: None,
               file_fetch_handler: std::rc::Rc::new(deno_fetch::FsFetchHandler),
@@ -1270,7 +1270,7 @@ where
           // flow: install the worker's MessagePort half (created by
           // op_user_worker_create, handed over via the global registry) BEFORE
           // `bootstrapSBEdge` runs below, so `op_flow_parent_port_rid` can give
-          // the bootstrap the rid to expose as `EdgeRuntime.parentPort`.
+          // the bootstrap the rid to expose as `FlowRuntime.parentPort`.
           if let Some(token) = conf
             .as_user_worker()
             .and_then(|c| c.maybe_parent_port_token)

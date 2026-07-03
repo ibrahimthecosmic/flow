@@ -153,7 +153,7 @@ function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
     return;
   }
 
-  ObjectDefineProperty(globalThis, "EdgeRuntime", {
+  ObjectDefineProperty(globalThis, "FlowRuntime", {
     get() {
       return props;
     },

@@ -1,11 +1,11 @@
 # User workers — the host API
 
 In any flow main isolate (`flow run`, `eval`, `repl`, `test`, …) the global
-`EdgeRuntime` object exposes the user-worker pool:
+`FlowRuntime` object exposes the user-worker pool:
 
 ```ts
-EdgeRuntime.userWorkers.create(options): Promise<UserWorker>
-EdgeRuntime.userWorkers.tryCleanupIdleWorkers(timeoutMs): Promise<boolean>
+FlowRuntime.userWorkers.create(options): Promise<UserWorker>
+FlowRuntime.userWorkers.tryCleanupIdleWorkers(timeoutMs): Promise<boolean>
 ```
 
 A `UserWorker` handle:
@@ -19,7 +19,7 @@ worker.inspect(); // string — DevTools WebSocket URL (throws if inspector off)
 ## Creating a worker
 
 ```ts
-const worker = await EdgeRuntime.userWorkers.create({
+const worker = await FlowRuntime.userWorkers.create({
   servicePath: "./service",
   envVars: [["API_TOKEN", "s3cr3t"]],
   memoryLimitMb: 256,
@@ -87,17 +87,17 @@ Sandbox & platform:
 
 ```ts
 // host
-const worker = await EdgeRuntime.userWorkers.create({ servicePath: "./svc" });
+const worker = await FlowRuntime.userWorkers.create({ servicePath: "./svc" });
 worker.port.onmessage = (e) => console.log("reply:", e.data);
 worker.port.postMessage({ op: "sum", nums: [1, 2, 3] });
 ```
 
 ```ts
 // svc/index.ts (worker)
-EdgeRuntime.parentPort.onmessage = (e) => {
+FlowRuntime.parentPort.onmessage = (e) => {
   if (e.data.op === "sum") {
     const sum = e.data.nums.reduce((a: number, b: number) => a + b, 0);
-    EdgeRuntime.parentPort.postMessage({ sum });
+    FlowRuntime.parentPort.postMessage({ sum });
   }
 };
 ```
@@ -121,10 +121,10 @@ console.log(bytes.buffer.byteLength); // 0 — detached, ownership moved
 
 ```ts
 // worker — receive, process, transfer a result back
-EdgeRuntime.parentPort.onmessage = (e) => {
+FlowRuntime.parentPort.onmessage = (e) => {
   const view = new Uint8Array(e.data.buf);
   const out = process(view); // Uint8Array
-  EdgeRuntime.parentPort.postMessage({ buf: out.buffer }, [out.buffer]);
+  FlowRuntime.parentPort.postMessage({ buf: out.buffer }, [out.buffer]);
 };
 ```
 
@@ -146,17 +146,17 @@ the new channel SharedWorker-style:
 
 ```ts
 // host
-const a = await EdgeRuntime.userWorkers.create({ servicePath: "./svc" });
-const b = await EdgeRuntime.userWorkers.create({ servicePath: "./svc" });
+const a = await FlowRuntime.userWorkers.create({ servicePath: "./svc" });
+const b = await FlowRuntime.userWorkers.create({ servicePath: "./svc" });
 console.log(a.key === b.key); // true  — same worker
 console.log(b.port !== null); // true  — but its own channel
 ```
 
 ```ts
 // svc/index.ts — accept extra connections
-EdgeRuntime.parentPort.onmessage = handle; // first connection
+FlowRuntime.parentPort.onmessage = handle; // first connection
 
-EdgeRuntime.onparentport = (port: MessagePort) => {
+FlowRuntime.onparentport = (port: MessagePort) => {
   port.onmessage = handle; // each reused create() delivers a new port
 };
 ```
@@ -164,7 +164,7 @@ EdgeRuntime.onparentport = (port: MessagePort) => {
 Details:
 
 - All ports delivered to a worker (including the first) are collected in
-  `EdgeRuntime.parentPorts`.
+  `FlowRuntime.parentPorts`.
 - Ports queue messages until a handler is attached, so a service that sets
   `onparentport` late does not lose messages.
 - `worker.port` is `null` only in one rare race: the pool answered with a worker
@@ -175,7 +175,7 @@ Details:
 
 ```ts
 // Retire workers that have been idle for at least 30s
-const cleaned = await EdgeRuntime.userWorkers.tryCleanupIdleWorkers(30_000);
+const cleaned = await FlowRuntime.userWorkers.tryCleanupIdleWorkers(30_000);
 ```
 
 ## Debugging workers
@@ -190,7 +190,7 @@ Each worker registers as a distinct DevTools target. `worker.inspect()` returns
 the WebSocket URL for **that** worker:
 
 ```ts
-const worker = await EdgeRuntime.userWorkers.create({ servicePath: "./svc" });
+const worker = await FlowRuntime.userWorkers.create({ servicePath: "./svc" });
 console.log(worker.inspect());
 // ws://127.0.0.1:9230/ws/8b3f…  — open in chrome://inspect / DevTools
 ```

@@ -566,13 +566,13 @@ impl Server {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
     debug!(
-      "edge-runtime is listening on {:?}",
+      "flow-runtime is listening on {:?}",
       non_secure_listener.local_addr()?
     );
 
     if let Some((_, addr)) = secure_listener.as_ref() {
       info!("TLS server ready on {:?}", addr);
-      debug!("edge-runtime is listening on {:?} (secure)", addr);
+      debug!("flow-runtime is listening on {:?} (secure)", addr);
     }
 
     if let Some(callback) = self.callback_tx.clone() {

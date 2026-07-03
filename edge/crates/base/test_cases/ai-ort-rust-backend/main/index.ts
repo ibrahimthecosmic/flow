@@ -2,11 +2,11 @@ import * as path from "jsr:@std/path";
 
 const handle = setInterval(async () => {
   try {
-    const cleanupCount = await EdgeRuntime.ai.tryCleanupUnusedSession();
+    const cleanupCount = await FlowRuntime.ai.tryCleanupUnusedSession();
     if (cleanupCount == 0) {
       return;
     }
-    console.log("EdgeRuntime.ai.tryCleanupUnusedSession", cleanupCount);
+    console.log("FlowRuntime.ai.tryCleanupUnusedSession", cleanupCount);
   } catch (e) {
     console.error(e.toString());
   }
@@ -15,7 +15,7 @@ const handle = setInterval(async () => {
 addEventListener("beforeunload", async () => {
   clearInterval(handle);
   try {
-    await EdgeRuntime.ai.forceCleanupAllSessions();
+    await FlowRuntime.ai.forceCleanupAllSessions();
   } catch (_) {
     // ignore cleanup errors on shutdown
   }
@@ -46,7 +46,7 @@ Deno.serve(async (req: Request) => {
     const envVarsObj = Deno.env.toObject();
     const envVars = Object.keys(envVarsObj).map((k) => [k, envVarsObj[k]]);
 
-    return await EdgeRuntime.userWorkers.create({
+    return await FlowRuntime.userWorkers.create({
       servicePath,
       memoryLimitMb,
       workerTimeoutMs,

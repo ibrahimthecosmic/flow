@@ -74,7 +74,7 @@ fn main() -> ExitCode {
 
 /// Registers the flow embedding into Deno's main worker via the `deno::embed`
 /// seam, before `deno::main()` runs. This is what turns plain Deno into flow:
-/// every `flow run script.ts` gets the additive `EdgeRuntime` host surface and
+/// every `flow run script.ts` gets the additive `FlowRuntime` host surface and
 /// can spawn hardened user workers — while the main isolate stays a full,
 /// unmodified Deno.
 ///
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
 ///      Deno's CLI snapshot and panics at init.
 ///   2. a post-bootstrap step that (a) stands up the user-worker pool on the
 ///      main worker's tokio runtime and puts its sender into op_state, then
-///      (b) installs the `EdgeRuntime` global by evaluating `flow_main.js`,
+///      (b) installs the `FlowRuntime` global by evaluating `flow_main.js`,
 ///      which calls the ops directly. It runs after `bootstrapMainRuntime`, so
 ///      `globalThis.Deno` and the snapshot `ext:` modules are already live.
 fn install_flow_embedding() {
@@ -145,7 +145,7 @@ fn install_flow_embedding() {
     .expect("user worker pool standup failed");
 
     // The `op_user_worker_create` op borrows this sender from op_state. It must
-    // be present before any user JS calls `EdgeRuntime.userWorkers.create()`,
+    // be present before any user JS calls `FlowRuntime.userWorkers.create()`,
     // which can only happen after this step completes.
     js_runtime.op_state().borrow_mut().put(worker_pool_tx);
 

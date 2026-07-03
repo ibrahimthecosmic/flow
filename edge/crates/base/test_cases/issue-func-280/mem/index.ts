@@ -38,6 +38,6 @@ addEventListener("beforeunload", () => {
 });
 
 const never = new Promise(() => {});
-EdgeRuntime.waitUntil(never);
+FlowRuntime.waitUntil(never);
 
 Deno.serve((_req) => new Response("Hello, world"));

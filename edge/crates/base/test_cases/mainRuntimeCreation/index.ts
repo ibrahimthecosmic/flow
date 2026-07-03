@@ -1,16 +1,16 @@
-// Verifies EdgeRuntime global with userWorkers API is available
+// Verifies FlowRuntime global with userWorkers API is available
 
-if (typeof EdgeRuntime === 'undefined') {
-  throw new Error('EdgeRuntime is not defined in main runtime');
+if (typeof FlowRuntime === 'undefined') {
+  throw new Error('FlowRuntime is not defined in main runtime');
 }
 
-if (typeof EdgeRuntime !== 'object' || EdgeRuntime === null) {
-  throw new Error(`Expected EdgeRuntime to be an object, got: ${typeof EdgeRuntime}`);
+if (typeof FlowRuntime !== 'object' || FlowRuntime === null) {
+  throw new Error(`Expected FlowRuntime to be an object, got: ${typeof FlowRuntime}`);
 }
 
-if (!EdgeRuntime.userWorkers) {
-  throw new Error('EdgeRuntime.userWorkers is not defined in main runtime');
+if (!FlowRuntime.userWorkers) {
+  throw new Error('FlowRuntime.userWorkers is not defined in main runtime');
 }
 
 console.log('mainRuntimeCreation test passed');
-console.log('EdgeRuntime keys:', Object.keys(EdgeRuntime));
+console.log('FlowRuntime keys:', Object.keys(FlowRuntime));

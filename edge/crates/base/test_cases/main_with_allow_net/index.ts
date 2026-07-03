@@ -39,7 +39,7 @@ Deno.serve({
       const envVarsObj = Deno.env.toObject();
       const envVars = Object.keys(envVarsObj).map((k) => [k, envVarsObj[k]]);
 
-      return await EdgeRuntime.userWorkers.create({
+      return await FlowRuntime.userWorkers.create({
         servicePath,
         memoryLimitMb,
         workerTimeoutMs,

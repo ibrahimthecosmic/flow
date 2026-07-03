@@ -1,4 +1,4 @@
-// flow: post-bootstrap installer for the additive `EdgeRuntime` HOST global.
+// flow: post-bootstrap installer for the additive `FlowRuntime` HOST global.
 //
 // Loaded by the `deno::embed` post-bootstrap hook (cli/embed.rs) once
 // `edge/cli/src/main.rs` registers it, i.e. on every `flow run`. See memory
@@ -16,7 +16,7 @@
 //      like `ext:core/mod.js` — but it must not import un-registered edge ESM.
 //      (`globalThis.Deno.core` is NOT available post-bootstrap; Deno hides it.)
 //   3. Namespace split (confirmed via trex examples + Supabase docs):
-//        - main isolate / host  -> `EdgeRuntime` (userWorkers, ...)  [here]
+//        - main isolate / host  -> `FlowRuntime` (userWorkers, ...)  [here]
 //        - user workers         -> `Supabase`/`Flow` (ai.Session) — installed by
 //          the edge runtime when it spawns user workers, NOT here.
 
@@ -55,7 +55,7 @@ function define(name, value) {
 // A handle to a spawned user worker. `port` is a duplex MessagePort to the
 // worker (structured-clone messaging). Each create() gets its OWN channel,
 // including when the pool reuses an already-running worker - the worker sees
-// the extra port via `EdgeRuntime.onparentport` / `EdgeRuntime.parentPorts`
+// the extra port via `FlowRuntime.onparentport` / `FlowRuntime.parentPorts`
 // (SharedWorker-style). `port` is `null` only in the rare race where the
 // reused worker was torn down before the new channel could be delivered.
 class UserWorker {
@@ -108,7 +108,7 @@ async function tryCleanupIdleWorkers(timeoutMs) {
 
 // Host surface. The user-worker pool sender is injected into op_state by the
 // post-bootstrap hook before this runs, so `create` is functional immediately.
-define("EdgeRuntime", {
+define("FlowRuntime", {
   userWorkers: {
     create: createUserWorker,
     tryCleanupIdleWorkers,
