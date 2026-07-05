@@ -13,7 +13,29 @@ const {
 import { exit as osExit } from "ext:os/exit.js";
 
 const ops = core.ops;
-const { ObjectDefineProperty } = primordials;
+const {
+  ArrayIsArray,
+  JSONParse,
+  JSONStringify,
+  ObjectDefineProperty,
+  ObjectFreeze,
+  ObjectValues,
+} = primordials;
+
+// Bootstrap-context keys owned by the runtime, not the embedder; they never
+// show up in `Flow.context`.
+const RUNTIME_CONTEXT_KEYS = ["terminationRequestToken"];
+
+function deepFreeze(value) {
+  if (value !== null && (typeof value === "object")) {
+    const values = ArrayIsArray(value) ? value : ObjectValues(value);
+    for (const inner of values) {
+      deepFreeze(inner);
+    }
+    ObjectFreeze(value);
+  }
+  return value;
+}
 
 let trexMod;
 function loadTrex() {
@@ -163,10 +185,26 @@ function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
 
 /**
  * @param {"user" | "main" | "event"} _kind
+ * @param {object | undefined} bootstrapContext the merged bootstrap context
+ *   (embedder extra context + the `context` object passed to
+ *   `userWorkers.create`, plus runtime-owned keys, which are stripped)
  */
-function installFlowNamespace(_kind) {
+function installFlowNamespace(_kind, bootstrapContext) {
+  let frozenContext;
   const props = {
     ai: USER_WORKER_API,
+    get context() {
+      if (frozenContext === undefined) {
+        // JSON round-trip: the context is JSON-derived by construction, and
+        // this detaches Flow.context from the internal bootstrap object.
+        const clone = JSONParse(JSONStringify(bootstrapContext ?? {}));
+        for (const key of RUNTIME_CONTEXT_KEYS) {
+          delete clone[key];
+        }
+        frozenContext = deepFreeze(clone);
+      }
+      return frozenContext;
+    },
   };
 
   ObjectDefineProperty(globalThis, "Flow", {

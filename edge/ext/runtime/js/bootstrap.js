@@ -612,7 +612,7 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
   installPromiseHook(kind);
   installEdgeRuntimeNamespace(kind, ctx.terminationRequestToken);
   installTrexNamespace(kind, ctx.terminationRequestToken);
-  installFlowNamespace(kind);
+  installFlowNamespace(kind, ctx);
 
   ObjectDefineProperty(
     globalThis,
