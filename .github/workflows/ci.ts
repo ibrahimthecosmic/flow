@@ -666,11 +666,6 @@ const buildJobs = buildItems.map((rawBuildItem) => {
       needs: [preBuildJob],
       if: preBuildJob.outputs.skip_build.notEquals("true"),
       runsOn: buildItem.runner,
-      // This is required to successfully authenticate with Azure using OIDC for
-      // code signing.
-      environment: {
-        name: isMainOrTag.then("build").else(""),
-      },
       timeoutMinutes: 240,
       defaults,
       env,
@@ -1352,7 +1347,6 @@ const workflow = createWorkflow({
   name: "ci",
   permissions: {
     contents: "write",
-    "id-token": "write", // Required for GitHub OIDC with Azure for code signing
   },
   on: {
     // flow builds from its OWN release tags (`vX.Y.Z`), never Deno's — upstream
