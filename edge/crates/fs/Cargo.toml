@@ -69,11 +69,14 @@ ext_event_worker.workspace = true
 bytes.workspace = true
 ctor.workspace = true
 dotenvy.workspace = true
+http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 rand.workspace = true
 serial_test.workspace = true
+
+aws-smithy-types = "1"
 
 aws-smithy-runtime = { version = "1.7", features = ["test-util"] }
 aws-smithy-runtime-api = { version = "1.7", features = ["test-util"] }

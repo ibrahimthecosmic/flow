@@ -2672,6 +2672,7 @@ mod test {
   use aws_sdk_s3::{self as s3};
   use aws_smithy_runtime::client::http::test_util::ReplayEvent;
   use aws_smithy_runtime::client::http::test_util::StaticReplayClient;
+  use aws_smithy_types::body::SdkBody;
   use deno_fs::FileSystem;
   use deno_fs::OpenOptions;
   use deno_permissions::CheckedPathBuf;
@@ -2763,5 +2764,191 @@ mod test {
     assert_eq!(many.len(), 2);
     assert_eq!(many[0].take_mount_point(), "/objects");
     assert_eq!(many[1].take_mount_point(), super::DEFAULT_S3_MOUNT_POINT);
+  }
+
+  fn checked(path: &str) -> CheckedPathBuf {
+    CheckedPathBuf::unsafe_new(PathBuf::from(path))
+  }
+
+  /// Placeholder for the "expected request" slot of a [`ReplayEvent`]; these
+  /// tests assert on [`StaticReplayClient::actual_requests`] directly instead
+  /// of using `assert_requests_match`.
+  fn any_request() -> http::Request<SdkBody> {
+    http::Request::builder()
+      .uri("https://unchecked.invalid")
+      .body(SdkBody::empty())
+      .unwrap()
+  }
+
+  fn head_ok(content_length: usize) -> http::Response<SdkBody> {
+    http::Response::builder()
+      .status(200)
+      .header("content-length", content_length.to_string())
+      .header("last-modified", "Fri, 24 May 2024 00:00:00 GMT")
+      .header("etag", "\"meow\"")
+      .body(SdkBody::empty())
+      .unwrap()
+  }
+
+  fn status_only(status: u16) -> http::Response<SdkBody> {
+    http::Response::builder()
+      .status(status)
+      .body(SdkBody::empty())
+      .unwrap()
+  }
+
+  fn xml_ok(body: &'static str) -> http::Response<SdkBody> {
+    http::Response::builder()
+      .status(200)
+      .body(SdkBody::from(body))
+      .unwrap()
+  }
+
+  /// `ListObjectsV2` answer for the `stat` directory probe: nothing under the
+  /// `<key>/` prefix, i.e. "not a directory".
+  fn list_no_keys() -> http::Response<SdkBody> {
+    xml_ok(
+      r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>meow</Name><KeyCount>0</KeyCount><MaxKeys>1</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#,
+    )
+  }
+
+  fn copy_ok() -> http::Response<SdkBody> {
+    xml_ok(
+      r#"<?xml version="1.0" encoding="UTF-8"?>
+<CopyObjectResult><ETag>"meow"</ETag><LastModified>2024-05-24T00:00:00Z</LastModified></CopyObjectResult>"#,
+    )
+  }
+
+  #[tokio::test]
+  async fn copy_file_percent_encodes_copy_source() {
+    let (fs, client) = get_s3_fs([
+      ReplayEvent::new(any_request(), head_ok(4)), // HEAD src (existence)
+      ReplayEvent::new(any_request(), copy_ok()),  // CopyObject
+    ]);
+
+    fs.copy_file_async(checked("meow/a+b c.txt"), checked("meow/dst.txt"))
+      .await
+      .unwrap();
+
+    let requests = client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method(), "HEAD");
+    assert_eq!(requests[1].method(), "PUT");
+    assert!(
+      requests[1]
+        .uri()
+        .split('?')
+        .next()
+        .unwrap()
+        .ends_with("/dst.txt")
+    );
+    // `/` stays a separator; `+` and ` ` must be encoded or S3 misreads them
+    assert_eq!(
+      requests[1].headers().get("x-amz-copy-source"),
+      Some("meow/a%2Bb%20c.txt")
+    );
+  }
+
+  #[tokio::test]
+  async fn rename_is_copy_then_delete() {
+    let (fs, client) = get_s3_fs([
+      ReplayEvent::new(any_request(), list_no_keys()), // stat: dir probe
+      ReplayEvent::new(any_request(), head_ok(7)),     // stat: open
+      ReplayEvent::new(any_request(), head_ok(7)),     // stat: file stat
+      ReplayEvent::new(any_request(), head_ok(7)),     // copy: src existence
+      ReplayEvent::new(any_request(), copy_ok()),      // CopyObject
+      ReplayEvent::new(any_request(), status_only(204)), // DeleteObject
+    ]);
+
+    fs.rename_async(checked("meow/src.txt"), checked("meow/dst.txt"))
+      .await
+      .unwrap();
+
+    let requests = client.actual_requests().collect::<Vec<_>>();
+    let methods = requests.iter().map(|it| it.method()).collect::<Vec<_>>();
+    assert_eq!(methods, ["GET", "HEAD", "HEAD", "HEAD", "PUT", "DELETE"]);
+
+    assert!(
+      requests[4]
+        .uri()
+        .split('?')
+        .next()
+        .unwrap()
+        .ends_with("/dst.txt")
+    );
+    assert_eq!(
+      requests[4].headers().get("x-amz-copy-source"),
+      Some("meow/src.txt")
+    );
+    // the source object is deleted only after the copy
+    assert!(
+      requests[5]
+        .uri()
+        .split('?')
+        .next()
+        .unwrap()
+        .ends_with("/src.txt")
+    );
+  }
+
+  #[tokio::test]
+  async fn truncate_to_zero_puts_empty_body_without_get() {
+    let (fs, client) = get_s3_fs([
+      ReplayEvent::new(any_request(), head_ok(10)), // size probe
+      ReplayEvent::new(any_request(), xml_ok("")),  // PutObject
+    ]);
+
+    fs.truncate_async(checked("meow/a.txt"), 0).await.unwrap();
+
+    let requests = client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2, "len == 0 must not fetch the object");
+    assert_eq!(requests[1].method(), "PUT");
+    assert_eq!(requests[1].body().bytes(), Some(&[][..]));
+  }
+
+  #[tokio::test]
+  async fn truncate_missing_object_is_not_found() {
+    let (fs, client) =
+      get_s3_fs([ReplayEvent::new(any_request(), status_only(404))]);
+
+    let err = fs
+      .truncate_async(checked("meow/missing.txt"), 4)
+      .await
+      .err()
+      .unwrap();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert_eq!(client.actual_requests().count(), 1);
+  }
+
+  #[tokio::test]
+  async fn realpath_roots_the_normalized_path() {
+    let (fs, _) = get_s3_fs([
+      ReplayEvent::new(any_request(), list_no_keys()), // stat: dir probe
+      ReplayEvent::new(any_request(), head_ok(4)),     // stat: open
+      ReplayEvent::new(any_request(), head_ok(4)),     // stat: file stat
+    ]);
+
+    assert_eq!(
+      fs.realpath_async(checked("meow/sub/../a.txt"))
+        .await
+        .unwrap(),
+      PathBuf::from("/meow/a.txt")
+    );
+  }
+
+  #[tokio::test]
+  async fn realpath_missing_object_is_not_found() {
+    let (fs, _) = get_s3_fs([
+      ReplayEvent::new(any_request(), list_no_keys()), // stat: dir probe
+      ReplayEvent::new(any_request(), status_only(404)), // stat: open
+    ]);
+
+    let err = fs
+      .realpath_async(checked("meow/missing.txt"))
+      .await
+      .err()
+      .unwrap();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
   }
 }
