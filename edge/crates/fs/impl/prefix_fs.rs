@@ -92,6 +92,15 @@ where
     self.check_sync_api = v;
     self
   }
+
+  /// Joins a path resolved by the inner (mount-relative) fs back under this
+  /// layer's mount prefix.
+  fn rejoin_prefix(&self, resolved: PathBuf) -> PathBuf {
+    match resolved.strip_prefix("/") {
+      Ok(relative) => self.prefix.join(relative),
+      Err(_) => self.prefix.join(resolved),
+    }
+  }
 }
 
 impl<FileSystem> PrefixFs<FileSystem>
@@ -689,7 +698,11 @@ where
     if path.starts_with(&self.prefix) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
-      self.fs.realpath_sync(&checked)
+      // the inner fs resolves mount-relative paths; restore the mount prefix
+      self
+        .fs
+        .realpath_sync(&checked)
+        .map(|it| self.rejoin_prefix(it))
     } else {
       self
         .base_fs
@@ -703,7 +716,12 @@ where
     if path.starts_with(&self.prefix) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
-      self.fs.realpath_async(checked).await
+      // the inner fs resolves mount-relative paths; restore the mount prefix
+      self
+        .fs
+        .realpath_async(checked)
+        .await
+        .map(|it| self.rejoin_prefix(it))
     } else if let Some(fs) = self.base_fs.as_ref() {
       fs.realpath_async(path).await
     } else {

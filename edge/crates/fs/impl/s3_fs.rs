@@ -68,6 +68,9 @@ use futures::stream::FuturesUnordered;
 use memmap2::MmapOptions;
 use memmap2::MmapRaw;
 use once_cell::sync::OnceCell;
+use percent_encoding::AsciiSet;
+use percent_encoding::CONTROLS;
+use percent_encoding::utf8_percent_encode;
 use serde::Deserialize;
 use serde::Serialize;
 use tempfile::tempfile;
@@ -277,6 +280,9 @@ impl S3ClientRetryConfig {
   }
 }
 
+/// Mount path used when an [`S3FsConfig`] does not specify `mountPoint`.
+pub const DEFAULT_S3_MOUNT_POINT: &str = "/s3";
+
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct S3FsConfig {
@@ -286,6 +292,32 @@ pub struct S3FsConfig {
   credentials: S3CredentialsObject,
   force_path_style: Option<bool>,
   retry_config: Option<S3ClientRetryConfig>,
+  mount_point: Option<String>,
+}
+
+/// One or many S3 mounts. A bare config object (the historical shape) mounts
+/// at [`DEFAULT_S3_MOUNT_POINT`]; an array lets each entry pick its own
+/// `mountPoint`.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum S3FsConfigs {
+  One(S3FsConfig),
+  Many(Vec<S3FsConfig>),
+}
+
+impl S3FsConfigs {
+  pub fn into_vec(self) -> Vec<S3FsConfig> {
+    match self {
+      Self::One(config) => vec![config],
+      Self::Many(configs) => configs,
+    }
+  }
+}
+
+impl From<S3FsConfig> for S3FsConfigs {
+  fn from(config: S3FsConfig) -> Self {
+    Self::One(config)
+  }
 }
 
 impl TryInto<S3Fs> for S3FsConfig {
@@ -297,6 +329,15 @@ impl TryInto<S3Fs> for S3FsConfig {
 }
 
 impl S3FsConfig {
+  /// Takes the configured mount point, falling back to
+  /// [`DEFAULT_S3_MOUNT_POINT`].
+  pub fn take_mount_point(&mut self) -> String {
+    self
+      .mount_point
+      .take()
+      .unwrap_or_else(|| DEFAULT_S3_MOUNT_POINT.to_string())
+  }
+
   fn try_into_s3_config(self) -> Result<Config, anyhow::Error> {
     let mut builder = Config::builder();
 
@@ -425,6 +466,121 @@ impl S3Fs {
       background_tasks: Arc::default(),
       config: Arc::new(config),
     })
+  }
+
+  /// Server-side copy of one object. A single `CopyObject` call is capped at
+  /// 5 GiB by S3; larger sources surface the service error as-is.
+  async fn copy_object_inner(
+    &self,
+    src_bucket: &str,
+    src_key: &str,
+    dst_bucket: &str,
+    dst_key: &str,
+  ) -> FsResult<()> {
+    // `copy-source` is a URL path: encode the key's special characters but
+    // keep `/` as the segment separator. `+` must be encoded or S3 reads it
+    // as a space.
+    const COPY_SOURCE_SET: &AsciiSet = &CONTROLS
+      .add(b' ')
+      .add(b'"')
+      .add(b'#')
+      .add(b'%')
+      .add(b'<')
+      .add(b'>')
+      .add(b'?')
+      .add(b'[')
+      .add(b'\\')
+      .add(b']')
+      .add(b'^')
+      .add(b'`')
+      .add(b'{')
+      .add(b'|')
+      .add(b'}')
+      .add(b'+');
+
+    let resp = self
+      .client
+      .head_object()
+      .bucket(src_bucket)
+      .key(src_key)
+      .send()
+      .await;
+
+    if let Some(err) = resp.err() {
+      if err
+        .as_service_error()
+        .map(|it| it.is_not_found())
+        .unwrap_or_default()
+      {
+        return Err(FsError::Io(io::Error::from(io::ErrorKind::NotFound)));
+      }
+
+      return Err(FsError::Io(io::Error::other(err)));
+    }
+
+    self
+      .client
+      .copy_object()
+      .bucket(dst_bucket)
+      .key(dst_key)
+      .copy_source(format!(
+        "{}/{}",
+        src_bucket,
+        utf8_percent_encode(src_key, COPY_SOURCE_SET)
+      ))
+      .send()
+      .await
+      .map_err(io::Error::other)?;
+
+    Ok(())
+  }
+
+  /// Copies every object under the `src_key/` prefix to the `dst_key/`
+  /// prefix. Errors with `NotFound` when the source prefix holds nothing.
+  async fn copy_prefix_inner(
+    &self,
+    src_bucket: &str,
+    src_key: &str,
+    dst_bucket: &str,
+    dst_key: &str,
+  ) -> FsResult<()> {
+    let mut stream = self
+      .client
+      .list_objects_v2()
+      .bucket(src_bucket)
+      .prefix(format!("{}/", src_key))
+      .into_paginator()
+      .send();
+
+    let mut copied_any = false;
+    while let Some(resp) = stream.next().await {
+      let v = resp.map_err(io::Error::other)?;
+      for object in v.contents() {
+        let Some(key) = object.key() else {
+          continue;
+        };
+        let Some(rest) = key.strip_prefix(src_key) else {
+          continue;
+        };
+
+        self
+          .copy_object_inner(
+            src_bucket,
+            key,
+            dst_bucket,
+            &format!("{}{}", dst_key, rest),
+          )
+          .await?;
+
+        copied_any = true;
+      }
+    }
+
+    if !copied_any {
+      return Err(FsError::Io(io::Error::from(io::ErrorKind::NotFound)));
+    }
+
+    Ok(())
   }
 }
 
@@ -857,36 +1013,104 @@ impl deno_fs::FileSystem for S3Fs {
 
   fn copy_file_sync(
     &self,
-    _oldpath: &CheckedPath,
-    _newpath: &CheckedPath,
+    oldpath: &CheckedPath,
+    newpath: &CheckedPath,
   ) -> FsResult<()> {
-    Err(FsError::NotSupported)
+    std::thread::scope(|s| {
+      let oldpath = oldpath.to_path_buf();
+      let newpath = newpath.to_path_buf();
+      s.spawn(move || {
+        rt::IO_RT.block_on(async move {
+          self
+            .copy_file_async(
+              CheckedPathBuf::unsafe_new(oldpath),
+              CheckedPathBuf::unsafe_new(newpath),
+            )
+            .await
+        })
+      })
+      .join()
+      .unwrap()
+    })
   }
 
+  #[instrument(level = "trace", skip(self), ret, err(Debug))]
   async fn copy_file_async(
     &self,
-    _oldpath: CheckedPathBuf,
-    _newpath: CheckedPathBuf,
+    oldpath: CheckedPathBuf,
+    newpath: CheckedPathBuf,
   ) -> FsResult<()> {
-    // TODO
-    Err(FsError::NotSupported)
+    self.flush_background_tasks().await;
+
+    let (src_bucket, src_key) =
+      try_get_bucket_name_and_key(oldpath.try_normalize()?)?;
+    let (dst_bucket, dst_key) =
+      try_get_bucket_name_and_key(newpath.try_normalize()?)?;
+
+    if src_key.is_empty() || dst_key.is_empty() {
+      return Err(FsError::Io(io::Error::from(io::ErrorKind::InvalidInput)));
+    }
+
+    self
+      .copy_object_inner(&src_bucket, &src_key, &dst_bucket, &dst_key)
+      .await
   }
 
   fn cp_sync(
     &self,
-    _path: &CheckedPath,
-    _new_path: &CheckedPath,
+    path: &CheckedPath,
+    new_path: &CheckedPath,
   ) -> FsResult<()> {
-    Err(FsError::NotSupported)
+    std::thread::scope(|s| {
+      let path = path.to_path_buf();
+      let new_path = new_path.to_path_buf();
+      s.spawn(move || {
+        rt::IO_RT.block_on(async move {
+          self
+            .cp_async(
+              CheckedPathBuf::unsafe_new(path),
+              CheckedPathBuf::unsafe_new(new_path),
+            )
+            .await
+        })
+      })
+      .join()
+      .unwrap()
+    })
   }
 
+  #[instrument(level = "trace", skip(self), ret, err(Debug))]
   async fn cp_async(
     &self,
-    _path: CheckedPathBuf,
-    _new_path: CheckedPathBuf,
+    path: CheckedPathBuf,
+    new_path: CheckedPathBuf,
   ) -> FsResult<()> {
-    // TODO
-    Err(FsError::NotSupported)
+    self.flush_background_tasks().await;
+
+    let normalized = path.try_normalize()?;
+    let (src_bucket, src_key) =
+      try_get_bucket_name_and_key(normalized.clone())?;
+    let (dst_bucket, dst_key) =
+      try_get_bucket_name_and_key(new_path.try_normalize()?)?;
+
+    if src_key.is_empty() || dst_key.is_empty() {
+      return Err(FsError::Io(io::Error::from(io::ErrorKind::InvalidInput)));
+    }
+
+    // NotFound when the source is missing
+    let stat = self
+      .stat_async(CheckedPathBuf::unsafe_new(normalized))
+      .await?;
+
+    if stat.is_directory {
+      self
+        .copy_prefix_inner(&src_bucket, &src_key, &dst_bucket, &dst_key)
+        .await
+    } else {
+      self
+        .copy_object_inner(&src_bucket, &src_key, &dst_bucket, &dst_key)
+        .await
+    }
   }
 
   fn stat_sync(&self, path: &CheckedPath) -> FsResult<FsStat> {
@@ -994,12 +1218,31 @@ impl deno_fs::FileSystem for S3Fs {
     Ok(self.stat_async(path).await.is_ok())
   }
 
-  fn realpath_sync(&self, _path: &CheckedPath) -> FsResult<PathBuf> {
-    Err(FsError::NotSupported)
+  fn realpath_sync(&self, path: &CheckedPath) -> FsResult<PathBuf> {
+    std::thread::scope(|s| {
+      let path = path.to_path_buf();
+      s.spawn(move || {
+        rt::IO_RT.block_on(async move {
+          self.realpath_async(CheckedPathBuf::unsafe_new(path)).await
+        })
+      })
+      .join()
+      .unwrap()
+    })
   }
 
-  async fn realpath_async(&self, _path: CheckedPathBuf) -> FsResult<PathBuf> {
-    Err(FsError::NotSupported)
+  /// S3 has no symlinks, so realpath is the normalized identity — rooted so
+  /// the enclosing PrefixFs layer can re-join its mount prefix. Missing paths
+  /// error with NotFound, matching `fs.realpath` semantics.
+  #[instrument(level = "trace", skip(self), err(Debug))]
+  async fn realpath_async(&self, path: CheckedPathBuf) -> FsResult<PathBuf> {
+    let normalized = path.try_normalize()?;
+
+    self
+      .stat_async(CheckedPathBuf::unsafe_new(normalized.clone()))
+      .await?;
+
+    Ok(PathBuf::from("/").join(normalized))
   }
 
   fn read_dir_sync(&self, path: &CheckedPath) -> FsResult<Vec<FsDirEntry>> {
@@ -1125,19 +1368,75 @@ impl deno_fs::FileSystem for S3Fs {
 
   fn rename_sync(
     &self,
-    _oldpath: &CheckedPath,
-    _newpath: &CheckedPath,
+    oldpath: &CheckedPath,
+    newpath: &CheckedPath,
   ) -> FsResult<()> {
-    Err(FsError::NotSupported)
+    std::thread::scope(|s| {
+      let oldpath = oldpath.to_path_buf();
+      let newpath = newpath.to_path_buf();
+      s.spawn(move || {
+        rt::IO_RT.block_on(async move {
+          self
+            .rename_async(
+              CheckedPathBuf::unsafe_new(oldpath),
+              CheckedPathBuf::unsafe_new(newpath),
+            )
+            .await
+        })
+      })
+      .join()
+      .unwrap()
+    })
   }
 
+  /// Object storage has no atomic rename: copy (server-side) then delete the
+  /// source. A crash between the two can leave both paths populated.
   #[instrument(level = "trace", skip(self), ret, err(Debug))]
   async fn rename_async(
     &self,
-    _oldpath: CheckedPathBuf,
-    _newpath: CheckedPathBuf,
+    oldpath: CheckedPathBuf,
+    newpath: CheckedPathBuf,
   ) -> FsResult<()> {
-    Err(FsError::NotSupported)
+    self.flush_background_tasks().await;
+
+    let normalized = oldpath.try_normalize()?;
+    let (src_bucket, src_key) =
+      try_get_bucket_name_and_key(normalized.clone())?;
+    let (dst_bucket, dst_key) =
+      try_get_bucket_name_and_key(newpath.try_normalize()?)?;
+
+    if src_key.is_empty() || dst_key.is_empty() {
+      return Err(FsError::Io(io::Error::from(io::ErrorKind::InvalidInput)));
+    }
+
+    // NotFound when the source is missing
+    let stat = self
+      .stat_async(CheckedPathBuf::unsafe_new(normalized.clone()))
+      .await?;
+
+    if stat.is_directory {
+      self
+        .copy_prefix_inner(&src_bucket, &src_key, &dst_bucket, &dst_key)
+        .await?;
+      self
+        .remove_async(CheckedPathBuf::unsafe_new(normalized), true)
+        .await
+    } else {
+      self
+        .copy_object_inner(&src_bucket, &src_key, &dst_bucket, &dst_key)
+        .await?;
+
+      self
+        .client
+        .delete_object()
+        .bucket(src_bucket)
+        .key(src_key)
+        .send()
+        .await
+        .map_err(io::Error::other)?;
+
+      Ok(())
+    }
   }
 
   fn link_sync(
@@ -1182,16 +1481,97 @@ impl deno_fs::FileSystem for S3Fs {
     Err(FsError::NotSupported)
   }
 
-  fn truncate_sync(&self, _path: &CheckedPath, _len: u64) -> FsResult<()> {
-    Err(FsError::NotSupported)
+  fn truncate_sync(&self, path: &CheckedPath, len: u64) -> FsResult<()> {
+    std::thread::scope(|s| {
+      let path = path.to_path_buf();
+      s.spawn(move || {
+        rt::IO_RT.block_on(async move {
+          self
+            .truncate_async(CheckedPathBuf::unsafe_new(path), len)
+            .await
+        })
+      })
+      .join()
+      .unwrap()
+    })
   }
 
+  /// Object storage has no in-place resize: rewrite the object at the new
+  /// length (extension zero-pads, matching `ftruncate`). The object is
+  /// buffered in memory, so this is intended for small/medium objects.
+  #[instrument(level = "trace", skip(self), ret, err(Debug))]
   async fn truncate_async(
     &self,
-    _path: CheckedPathBuf,
-    _len: u64,
+    path: CheckedPathBuf,
+    len: u64,
   ) -> FsResult<()> {
-    Err(FsError::NotSupported)
+    self.flush_background_tasks().await;
+
+    let (bucket_name, key) =
+      try_get_bucket_name_and_key(path.try_normalize()?)?;
+
+    if key.is_empty() {
+      return Err(FsError::Io(io::Error::from(io::ErrorKind::InvalidInput)));
+    }
+
+    let head = self
+      .client
+      .head_object()
+      .bucket(&bucket_name)
+      .key(&key)
+      .send()
+      .await;
+
+    let size = match head {
+      Ok(v) => v.content_length().unwrap_or(0).max(0) as u64,
+      Err(err) => {
+        if err
+          .as_service_error()
+          .map(|it| it.is_not_found())
+          .unwrap_or_default()
+        {
+          return Err(FsError::Io(io::Error::from(io::ErrorKind::NotFound)));
+        }
+
+        return Err(FsError::Io(io::Error::other(err)));
+      }
+    };
+
+    let body = if len == 0 {
+      Vec::new()
+    } else {
+      let request = self.client.get_object().bucket(&bucket_name).key(&key);
+      let request = if len < size {
+        request.range(format!("bytes=0-{}", len - 1))
+      } else {
+        request
+      };
+
+      let mut bytes = request
+        .send()
+        .await
+        .map_err(io::Error::other)?
+        .body
+        .collect()
+        .await
+        .map_err(io::Error::other)?
+        .to_vec();
+
+      bytes.resize(len as usize, 0);
+      bytes
+    };
+
+    self
+      .client
+      .put_object()
+      .bucket(bucket_name)
+      .key(key)
+      .body(ByteStream::from(body))
+      .send()
+      .await
+      .map_err(io::Error::other)?;
+
+    Ok(())
   }
 
   fn utime_sync(
@@ -2356,5 +2736,32 @@ mod test {
       .kind(),
       io::ErrorKind::InvalidInput
     );
+  }
+
+  #[test]
+  fn s3_fs_configs_accepts_object_or_array() {
+    use deno_core::serde_json;
+
+    let credentials = serde_json::json!({
+      "accessKeyId": "AKIMEOWMEOW",
+      "secretAccessKey": "+meowmeowmeeeeeeow/",
+    });
+
+    let one: super::S3FsConfigs =
+      serde_json::from_value(serde_json::json!({ "credentials": credentials }))
+        .unwrap();
+    let mut one = one.into_vec();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].take_mount_point(), super::DEFAULT_S3_MOUNT_POINT);
+
+    let many: super::S3FsConfigs = serde_json::from_value(serde_json::json!([
+      { "credentials": credentials, "mountPoint": "/objects" },
+      { "credentials": credentials },
+    ]))
+    .unwrap();
+    let mut many = many.into_vec();
+    assert_eq!(many.len(), 2);
+    assert_eq!(many[0].take_mount_point(), "/objects");
+    assert_eq!(many[1].take_mount_point(), super::DEFAULT_S3_MOUNT_POINT);
   }
 }

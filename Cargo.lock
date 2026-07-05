@@ -6111,6 +6111,7 @@ dependencies = [
  "memmap2",
  "normalize-path",
  "once_cell",
+ "percent-encoding",
  "rand 0.8.5",
  "rkyv",
  "rustls 0.21.12",
