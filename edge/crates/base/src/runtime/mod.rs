@@ -84,6 +84,7 @@ use fs::VfsSys;
 use fs::deno_compile_fs::DenoCompileFileSystem;
 use fs::prefix_fs::PrefixFs;
 use fs::s3_fs::S3Fs;
+use fs::s3_fs::S3FsConfigs;
 use fs::static_fs::StaticFs;
 use fs::tmp_fs::TmpFs;
 use futures_util::FutureExt;
@@ -445,7 +446,7 @@ pub struct DenoRuntime<RuntimeContext = DefaultRuntimeContext> {
   pub(crate) termination_request_token: CancellationToken,
 
   pub conf: WorkerRuntimeOpts,
-  pub s3_fs: Option<S3Fs>,
+  pub s3_fses: Vec<S3Fs>,
 
   entrypoint: Option<Entrypoint>,
   main_module_url: Url,
@@ -607,7 +608,7 @@ where
       main_module_url: Url,
       entrypoint: Option<Entrypoint>,
       context: Option<serde_json::Map<String, serde_json::Value>>,
-      s3_fs: Option<S3Fs>,
+      s3_fses: Vec<S3Fs>,
       beforeunload_cpu_threshold: ArcSwapOption<u64>,
       beforeunload_mem_threshold: ArcSwapOption<u64>,
     }
@@ -817,7 +818,7 @@ where
         };
 
         let build_file_system_fn = |base_fs: Arc<dyn deno_fs::FileSystem>| -> Result<
-          (Arc<dyn deno_fs::FileSystem>, Option<S3Fs>),
+          (Arc<dyn deno_fs::FileSystem>, Vec<S3Fs>),
           AnyError,
         > {
           let tmp_fs =
@@ -829,19 +830,38 @@ where
 
           fs.set_runtime_state(&runtime_state);
 
-          Ok(
-            if let Some(s3_fs) =
-              maybe_s3_fs_config.map(S3Fs::new).transpose()?
-            {
-              let mut s3_prefix_fs = fs.add_fs("/s3", s3_fs.clone());
+          let mut mount_points = Vec::new();
+          let mut mounts = Vec::new();
+          for mut config in maybe_s3_fs_config
+            .map(S3FsConfigs::into_vec)
+            .unwrap_or_default()
+          {
+            let mount_point = config.take_mount_point();
+            validate_s3_mount_point(&mount_point, &mount_points)?;
+            mounts.push((mount_point.clone(), S3Fs::new(config)?));
+            mount_points.push(mount_point);
+          }
 
-              s3_prefix_fs.set_check_sync_api(is_user_worker);
+          let s3_fses =
+            mounts.iter().map(|(_, s3_fs)| s3_fs.clone()).collect();
+          let mut mounts = mounts.into_iter();
 
-              (Arc::new(s3_prefix_fs), Some(s3_fs))
-            } else {
-              (Arc::new(fs), None)
-            },
-          )
+          Ok(match mounts.next() {
+            Some((first_mount_point, first_s3_fs)) => {
+              let mut chain = fs.add_fs(first_mount_point, first_s3_fs);
+
+              // subsequent layers inherit this flag through add_fs
+              chain.set_check_sync_api(is_user_worker);
+
+              (
+                Arc::new(mounts.fold(chain, |chain, (mount_point, s3_fs)| {
+                  chain.add_fs(mount_point, s3_fs)
+                })),
+                s3_fses,
+              )
+            }
+            None => (Arc::new(fs), s3_fses),
+          })
         };
 
         let static_files = if is_some_entry_point {
@@ -862,7 +882,7 @@ where
           static_files
         };
 
-        let (fs, s3_fs) = build_file_system_fn(if is_user_worker && should_block_fs {
+        let (fs, s3_fses) = build_file_system_fn(if is_user_worker && should_block_fs {
           let compile_base_dir = if matches!(entrypoint, Some(Entrypoint::ModuleCode(_)) | None)
               && is_some_entry_point
             {
@@ -1093,7 +1113,7 @@ where
           deno_http::deno_http::args(deno_http::Options::default()),
           deno_io::deno_io::args(Some(stdio.clone())),
           deno_fs::deno_fs::args(
-            if should_block_fs || s3_fs.is_some() || flags.restrict_host_fs {
+            if should_block_fs || !s3_fses.is_empty() || flags.restrict_host_fs {
               fs.clone()
             } else {
               Arc::new(deno_fs::RealFs) as Arc<dyn deno_fs::FileSystem>
@@ -1103,7 +1123,7 @@ where
             deno_resolver::npm::DenoInNpmPackageChecker,
             npm::NpmResolver<VfsSys>,
             VfsSys,
-          >(Some(node_services), if should_block_fs || s3_fs.is_some() || flags.restrict_host_fs {
+          >(Some(node_services), if should_block_fs || !s3_fses.is_empty() || flags.restrict_host_fs {
             fs.clone()
           } else {
             Arc::new(deno_fs::RealFs) as Arc<dyn deno_fs::FileSystem>
@@ -1228,7 +1248,7 @@ where
           main_module_url,
           entrypoint,
           context: Some(context),
-          s3_fs,
+          s3_fses,
           beforeunload_cpu_threshold,
           beforeunload_mem_threshold,
         })
@@ -1390,7 +1410,7 @@ where
       mem_check,
       main_module_url,
       entrypoint,
-      s3_fs,
+      s3_fses,
       beforeunload_cpu_threshold,
       beforeunload_mem_threshold,
       ..
@@ -1494,7 +1514,7 @@ where
       termination_request_token,
 
       conf,
-      s3_fs,
+      s3_fses,
 
       entrypoint,
       main_module_url,
@@ -2695,6 +2715,38 @@ fn terminate_execution_if_cancelled(
   )
 }
 
+/// Rejects an S3 mount point that is not an absolute non-root path, or that
+/// equals or nests with `/tmp` or one of the mount points registered before
+/// it. `Path::starts_with` compares whole components, so `/s3-two` does not
+/// conflict with `/s3`.
+fn validate_s3_mount_point(
+  mount_point: &str,
+  existing: &[String],
+) -> Result<(), Error> {
+  let path = Path::new(mount_point);
+  if !path.is_absolute() || path == Path::new("/") {
+    bail!(
+      "invalid S3 mount point '{mount_point}': must be an absolute path other than '/'"
+    );
+  }
+
+  let tmp = Path::new("/tmp");
+  if path.starts_with(tmp) || tmp.starts_with(path) {
+    bail!("invalid S3 mount point '{mount_point}': conflicts with '/tmp'");
+  }
+
+  for other in existing {
+    let other_path = Path::new(other);
+    if path.starts_with(other_path) || other_path.starts_with(path) {
+      bail!(
+        "invalid S3 mount point '{mount_point}': conflicts with mount point '{other}'"
+      );
+    }
+  }
+
+  Ok(())
+}
+
 fn set_v8_flags() {
   let v8_flags = std::env::var("V8_FLAGS").unwrap_or_default();
   let debug_gc = std::env::var("TREX_DEBUG_GC").is_ok();
@@ -2822,10 +2874,34 @@ mod test {
 
   use super::GetRuntimeContext;
   use super::RunOptionsBuilder;
+  use super::validate_s3_mount_point;
   use crate::runtime::DenoRuntime;
   use crate::server::ServerFlags;
   use crate::worker::DuplexStreamEntry;
   use crate::worker::WorkerBuilder;
+
+  #[test]
+  fn test_validate_s3_mount_point() {
+    let ok = |mount: &str, existing: &[&str]| {
+      validate_s3_mount_point(
+        mount,
+        &existing.iter().map(ToString::to_string).collect::<Vec<_>>(),
+      )
+    };
+
+    assert!(ok("/s3", &[]).is_ok());
+    assert!(ok("/objects", &["/s3"]).is_ok());
+    // `starts_with` compares whole components; sharing a string prefix is fine
+    assert!(ok("/s3-two", &["/s3"]).is_ok());
+
+    assert!(ok("s3", &[]).is_err()); // relative
+    assert!(ok("/", &[]).is_err()); // root
+    assert!(ok("/tmp", &[]).is_err()); // reserved
+    assert!(ok("/tmp/s3", &[]).is_err()); // nests under /tmp
+    assert!(ok("/s3", &["/s3"]).is_err()); // duplicate
+    assert!(ok("/s3/inner", &["/s3"]).is_err()); // nests under existing
+    assert!(ok("/s3", &["/s3/inner"]).is_err()); // existing nests under it
+  }
 
   impl<RuntimeContext> DenoRuntime<RuntimeContext> {
     #[allow(dead_code, reason = "test helper; used by a subset of tests")]
@@ -2928,7 +3004,7 @@ mod test {
 
             timing: None,
 
-            maybe_s3_fs_config: s3_fs_config,
+            maybe_s3_fs_config: s3_fs_config.map(Into::into),
             maybe_tmp_fs_config: tmp_fs_config,
             maybe_otel_config: None,
           },
@@ -3751,6 +3827,45 @@ mod test {
       .await
       .0
       .unwrap();
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_flow_context_global() {
+    struct Ctx;
+
+    impl GetRuntimeContext for Ctx {
+      fn get_extra_context() -> impl Serialize {
+        serde_json::json!({
+          "flavor": "meow",
+          "nested": { "a": [1, 2, 3] },
+        })
+      }
+    }
+
+    // the fixture throws if Flow.context is missing values, leaks
+    // runtime-owned keys, or is not deep-frozen/memoized
+    let mut main_rt = RuntimeBuilder::new()
+      .set_std_env()
+      .set_path("./test_cases/flow_context")
+      .set_context::<Ctx>()
+      .build()
+      .await;
+
+    let (_tx, duplex_stream_rx) =
+      mpsc::unbounded_channel::<DuplexStreamEntry>();
+
+    let (result, _) = main_rt
+      .run(
+        RunOptionsBuilder::new()
+          .wait_termination_request_token(false)
+          .stream_rx(duplex_stream_rx)
+          .build()
+          .unwrap(),
+      )
+      .await;
+
+    assert!(result.is_ok(), "Flow.context test failed: {:?}", result);
   }
 
   #[tokio::test]

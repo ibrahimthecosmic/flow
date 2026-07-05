@@ -152,8 +152,8 @@ impl WorkerDriver for User {
       }
     };
 
-    let mut s3_fs = runtime.s3_fs.clone();
-    debug!(use_s3_fs = s3_fs.is_some());
+    let s3_fses = runtime.s3_fses.clone();
+    debug!(use_s3_fs = !s3_fses.is_empty());
 
     let (cpu_tx, cpu_rx) = mpsc::unbounded_channel();
     let Ok(cancel_token) = create_supervisor(
@@ -176,7 +176,7 @@ impl WorkerDriver for User {
     async move {
       let _guard = cancel_token.drop_guard();
 
-      if let Some(fs) = s3_fs.take() {
+      for fs in s3_fses {
         fs.flush_background_tasks().await;
       }
 

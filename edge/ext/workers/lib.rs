@@ -41,7 +41,7 @@ use deno_telemetry::OtelConsoleConfig;
 use deno_telemetry::OtelPropagators;
 use errors::WorkerError;
 use ext_runtime::conn_sync::ConnWatcher;
-use fs::s3_fs::S3FsConfig;
+use fs::s3_fs::S3FsConfigs;
 use fs::tmp_fs::TmpFsConfig;
 use http_utils::utils::get_upgrade_type;
 use hyper_v014::Body;
@@ -314,7 +314,7 @@ pub struct UserWorkerCreateOptions {
   cpu_time_soft_limit_ms: Option<u64>,
   cpu_time_hard_limit_ms: Option<u64>,
 
-  s3_fs_config: Option<S3FsConfig>,
+  s3_fs_config: Option<S3FsConfigs>,
   tmp_fs_config: Option<TmpFsConfig>,
   otel_config: Option<JsOtelConfig>,
 
