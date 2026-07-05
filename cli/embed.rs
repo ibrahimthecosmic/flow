@@ -122,6 +122,26 @@ pub fn shared_array_buffer_store() -> SharedArrayBufferStore {
   SHARED_ARRAY_BUFFER_STORE.get().cloned().unwrap_or_default()
 }
 
+/// Extra ambient type declarations appended to `deno types` output. flow
+/// registers its `lib.flow.d.ts` (the `FlowRuntime`/`Flow` globals and the
+/// user-worker create options) so `flow types` emits the complete environment.
+/// When unregistered (plain Deno), `deno types` output is unchanged.
+type ExtraTypesFactory = Box<dyn Fn() -> &'static str + Send + Sync>;
+
+static EXTRA_TYPES: OnceLock<ExtraTypesFactory> = OnceLock::new();
+
+/// Register the extra type declarations for `deno types`. Call once before
+/// `deno::main()`. Subsequent calls are ignored.
+pub fn register_extra_types(factory: ExtraTypesFactory) {
+  let _ = EXTRA_TYPES.set(factory);
+}
+
+/// The registered extra type declarations, or `None` when running as plain
+/// Deno.
+pub fn extra_types() -> Option<&'static str> {
+  EXTRA_TYPES.get().map(|factory| factory())
+}
+
 /// Runs once on a freshly bootstrapped main worker, *after* Deno's
 /// `bootstrapMainRuntime` has set up the global scope. flow uses this to
 /// install its additive globals (`FlowRuntime`/`Flow`) on top of a fully

@@ -119,6 +119,12 @@ fn install_flow_embedding() {
     ]
   }));
 
+  // Append flow's ambient globals (FlowRuntime/Flow, user-worker options) to
+  // `flow types` output, so it emits the complete typed environment.
+  deno::embed::register_extra_types(Box::new(|| {
+    include_str!("../../ext/runtime/lib.flow.d.ts")
+  }));
+
   deno::embed::register_main_worker_post_bootstrap(Box::new(|js_runtime| {
     // Stand up the user-worker pool on the current (main worker) tokio runtime.
     // `create_user_worker_pool` only spawns its loop task and returns, so the

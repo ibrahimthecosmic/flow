@@ -537,7 +537,12 @@ async fn run_subcommand(
       })
     }
     DenoSubcommand::Types => spawn_subcommand(async move {
-      let types = tsc::get_types_declaration_file_text();
+      let mut types = tsc::get_types_declaration_file_text();
+      // flow: append embedder-registered ambient types (no-op for plain Deno)
+      if let Some(extra) = embed::extra_types() {
+        types.push('\n');
+        types.push_str(extra);
+      }
       display::write_to_stdout_ignore_sigpipe(types.as_bytes())
     }),
     #[cfg(feature = "upgrade")]
