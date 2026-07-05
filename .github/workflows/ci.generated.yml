@@ -7,7 +7,6 @@ on:
       - v*
 permissions:
   contents: write
-  id-token: write
 concurrency:
   group: '${{ github.workflow }}-${{ !contains(github.event.pull_request.labels.*.name, ''ci-test-flaky'') && github.head_ref || github.run_id }}'
   cancel-in-progress: true
@@ -32,7 +31,7 @@ jobs:
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
         if: github.event_name == 'pull_request'
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Install Deno
         uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
         if: github.event_name == 'pull_request'
@@ -49,235 +48,12 @@ jobs:
         run: |-
           git fetch --depth=1 origin ${{ github.event.pull_request.base.sha }}
           deno run -A tools/check_deno_core_changes.js ${{ github.event.pull_request.base.sha }}
-  bench:
-    name: bench release linux-x86_64
-    needs:
-      - pre_build
-    if: needs.pre_build.outputs.skip_build != 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Configure git
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          git config --global core.symlinks true
-          git config --global fetch.parallel 32
-      - name: Clone repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        with:
-          fetch-depth: 5
-          submodules: false
-      - name: Clone rusty_v8 fork (v8 patch dependency)
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
-      - name: Restore cache cargo home
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        with:
-          path: |-
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.cargo/bin
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: never_saved
-          restore-keys: 118-cargo-home-linux-x86_64-bench-
-      - name: Install Node
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        with:
-          node-version: 22
-      - name: Pre-install rustup 1.28.2 (workaround broken 1.29.0)
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        shell: bash
-        run: |-
-          if command -v rustup >/dev/null 2>&1; then
-            if ! rustup --version 2>&1 | grep -q '1\.29\.0'; then exit 0; fi
-            echo "Detected broken rustup 1.29.0, replacing with 1.28.2"
-          fi
-          case "${RUNNER_OS}-${RUNNER_ARCH}" in
-            Linux-X64)     target=x86_64-unknown-linux-gnu; ext= ;;
-            Linux-ARM64)   target=aarch64-unknown-linux-gnu; ext= ;;
-            macOS-X64)     target=x86_64-apple-darwin; ext= ;;
-            macOS-ARM64)   target=aarch64-apple-darwin; ext= ;;
-            Windows-X64)   target=x86_64-pc-windows-msvc; ext=.exe ;;
-            Windows-ARM64) target=aarch64-pc-windows-msvc; ext=.exe ;;
-            *) echo "Unsupported: ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
-          esac
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL \
-            "https://static.rust-lang.org/rustup/archive/1.28.2/${target}/rustup-init${ext}" \
-            -o "rustup-init${ext}"
-          chmod +x "rustup-init${ext}"
-          "./rustup-init${ext}" -y --default-toolchain none --no-modify-path
-          rm "rustup-init${ext}"
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
-      - uses: dsherret/rust-toolchain-file@3551321aa44dd44a0393eb3b6bdfbc5d25ecf621
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-      - name: Clone submodule ./tests/bench/testdata/lsp_benchdata
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        run: git submodule update --init --recursive --depth=1 -- ./tests/bench/testdata/lsp_benchdata
-      - name: Clone submodule ./tests/util/std
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        run: git submodule update --init --recursive --depth=1 -- ./tests/util/std
-      - name: Set up incremental LTO and sysroot build
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          # Setting up sysroot
-          export DEBIAN_FRONTEND=noninteractive
-          # Avoid running man-db triggers, which sometimes takes several minutes
-          # to complete.
-          sudo apt-get -qq remove --purge -y man-db > /dev/null 2> /dev/null
-          # Remove older clang before we install
-          sudo apt-get -qq remove   'clang-12*' 'clang-13*' 'clang-14*' 'clang-15*' 'clang-16*' 'clang-17*' 'clang-18*' 'clang-19*' 'clang-20*' 'clang-21*' 'llvm-12*' 'llvm-13*' 'llvm-14*' 'llvm-15*' 'llvm-16*' 'llvm-17*' 'llvm-18*' 'llvm-19*' 'llvm-20*' 'llvm-21*' 'lld-12*' 'lld-13*' 'lld-14*' 'lld-15*' 'lld-16*' 'lld-17*' 'lld-18*' 'lld-19*' 'lld-20*' 'lld-21*' > /dev/null 2> /dev/null
-
-          # Install clang-XXX, lld-XXX, and debootstrap.
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" |
-            sudo dd of=/etc/apt/sources.list.d/llvm-toolchain-noble-22.list
-          curl https://apt.llvm.org/llvm-snapshot.gpg.key |
-            gpg --dearmor                                 |
-          sudo dd of=/etc/apt/trusted.gpg.d/llvm-snapshot.gpg
-          sudo apt-get update
-          # this was unreliable sometimes, so try again if it fails
-          sudo apt-get install -y --no-install-recommends clang-22 lld-22 clang-tools-22 clang-format-22 clang-tidy-22 || (echo 'Failed. Trying again.' && sudo apt-get clean && sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-22 lld-22 clang-tools-22 clang-format-22 clang-tidy-22)
-          # Fix alternatives
-          (yes '' | sudo update-alternatives --force --all) > /dev/null 2> /dev/null || true
-
-          clang-22 -c -o /tmp/memfd_create_shim.o tools/memfd_create_shim.c -fPIC
-          clang-22 -c -o /tmp/glibc_math_shim.o tools/glibc_math_shim.c -fPIC
-
-          echo "Decompressing sysroot..."
-          wget -q https://github.com/denoland/deno_sysroot_build/releases/download/sysroot-20250207/sysroot-`uname -m`.tar.xz -O /tmp/sysroot.tar.xz
-          cd /
-          xzcat /tmp/sysroot.tar.xz | sudo tar -x
-          sudo mount --rbind /dev /sysroot/dev
-          sudo mount --rbind /sys /sysroot/sys
-          sudo mount --rbind /home /sysroot/home
-          sudo mount -t proc /proc /sysroot/proc
-          cd
-
-          echo "Done."
-
-          # Configure the build environment. Both Rust and Clang will produce
-          # llvm bitcode only, so we can use lld's incremental LTO support.
-
-          # Load the sysroot's env vars
-          echo "sysroot env:"
-          cat /sysroot/.env
-          . /sysroot/.env
-
-          # Important notes:
-          #   1. -ldl seems to be required to avoid a failure in FFI tests. This flag seems
-          #      to be in the Rust default flags in the smoketest, so uncertain why we need
-          #      to be explicit here.
-          #   2. RUSTFLAGS and RUSTDOCFLAGS must be specified, otherwise the doctests fail
-          #      to build because the object formats are not compatible.
-          echo "
-          CARGO_PROFILE_BENCH_INCREMENTAL=false
-          CARGO_PROFILE_RELEASE_INCREMENTAL=false
-          RUSTFLAGS<<__1
-            -C linker-plugin-lto=true
-            -C linker=clang-22
-            -C link-arg=-fuse-ld=lld-22
-            -C link-arg=-Wl,--icf=safe
-            -C link-arg=-ldl
-            -C link-arg=-Wl,--allow-shlib-undefined
-            -C link-arg=-Wl,--thinlto-cache-dir=$(pwd)/target/release/lto-cache
-            -C link-arg=-Wl,--thinlto-cache-policy,cache_size_bytes=700m
-            -C link-arg=/tmp/memfd_create_shim.o
-            -C link-arg=/tmp/glibc_math_shim.o
-            -C link-arg=-Wl,--wrap=expf
-            -C link-arg=-Wl,--wrap=powf
-            -C link-arg=-Wl,--wrap=exp2f
-            -C link-arg=-Wl,--wrap=log2f
-            -C link-arg=-Wl,--wrap=logf
-            --cfg tokio_unstable
-            $RUSTFLAGS
-          __1
-          RUSTDOCFLAGS<<__1
-            -C linker-plugin-lto=true
-            -C linker=clang-22
-            -C link-arg=-fuse-ld=lld-22
-            -C link-arg=-Wl,--icf=safe
-            -C link-arg=-ldl
-            -C link-arg=-Wl,--allow-shlib-undefined
-            -C link-arg=-Wl,--thinlto-cache-dir=$(pwd)/target/release/lto-cache
-            -C link-arg=-Wl,--thinlto-cache-policy,cache_size_bytes=700m
-            -C link-arg=/tmp/memfd_create_shim.o
-            -C link-arg=/tmp/glibc_math_shim.o
-            -C link-arg=-Wl,--wrap=expf
-            -C link-arg=-Wl,--wrap=powf
-            -C link-arg=-Wl,--wrap=exp2f
-            -C link-arg=-Wl,--wrap=log2f
-            -C link-arg=-Wl,--wrap=logf
-            --cfg tokio_unstable
-            $RUSTFLAGS
-          __1
-          CC=/usr/bin/clang-22
-          CFLAGS=$CFLAGS
-          " > $GITHUB_ENV
-      - name: Install Deno
-        uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        with:
-          deno-version: v2.x
-      - name: Install benchmark tools
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        env:
-          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: ./tools/install_prebuilt.js wrk hyperfine
-      - name: Build deno
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        env:
-          DENO_SNAPSHOT_MINIFY_SOURCES: '1'
-        run: cargo build --release -p deno
-      - name: Run benchmarks
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        run: cargo bench -p bench_tests --bench deno_bench --locked
-      - name: Post benchmarks
-        if: '!startsWith(github.ref, ''refs/tags/'') && github.repository == ''denoland/deno'' && github.ref == ''refs/heads/main'''
-        env:
-          DENOBOT_PAT: '${{ secrets.DENOBOT_PAT }}'
-        run: |-
-          git clone --depth 1 --branch gh-pages                             \
-              https://${DENOBOT_PAT}@github.com/denoland/benchmark_data.git \
-              gh-pages
-          ./target/release/deno run --allow-all ./tools/build_benchmark_jsons.js --release
-          cd gh-pages
-          git config user.email "propelml@gmail.com"
-          git config user.name "denobot"
-          git add .
-          git commit --message "Update benchmarks"
-          git push origin gh-pages
-      - name: Worker info
-        if: '(contains(github.event.pull_request.labels.*.name, ''ci-bench'') || github.ref == ''refs/heads/main'') && !startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          cat /proc/cpuinfo
-          cat /proc/meminfo
-      - name: Cache cargo home
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && github.ref == ''refs/heads/main'''
-        with:
-          path: |-
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.cargo/bin
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: '118-cargo-home-linux-x86_64-bench-${{ github.sha }}'
   build-release-linux-x86_64:
     name: build release linux-x86_64
     needs:
       - pre_build
     if: needs.pre_build.outputs.skip_build != 'true'
     runs-on: ubuntu-24.04
-    environment:
-      name: '${{ (github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/'')) && ''build'' || '''' }}'
     timeout-minutes: 240
     defaults:
       run:
@@ -286,6 +62,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: full
       RUST_LIB_BACKTRACE: 0
+      DENO_TEST_UTIL_DENO_EXE: '${{ github.workspace }}/target/release/flow'
     steps:
       - name: Configure git
         run: |-
@@ -297,15 +74,9 @@ jobs:
           fetch-depth: 5
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Clone submodule ./tests/util/std
         run: git submodule update --init --recursive --depth=1 -- ./tests/util/std
-      - name: 'Create source tarballs (release, linux)'
-        if: 'github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          mkdir -p target/release
-          tar --exclude=".git*" --exclude=target --exclude=third_party/prebuilt \
-              -czvf target/release/deno_src.tar.gz -C .. deno
       - name: Install Deno
         uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
         with:
@@ -479,20 +250,13 @@ jobs:
         env:
           DENO_SNAPSHOT_MINIFY_SOURCES: '1'
         run: |-
-          if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
-            git submodule update --init tools/lzld
-            make -C tools/lzld
-            sed -i '' "s#-fuse-ld=lld #-fuse-ld=$GITHUB_WORKSPACE/tools/lzld/lzld -L$GITHUB_WORKSPACE/tools/lzld -llzld_arm64 #" .cargo/config.toml
-            grep -n fuse-ld .cargo/config.toml
-          fi
           df -h
-          cargo build --release --locked -p deno -p denort -p test_server --bin deno --bin denort --bin test_server --features=deno/panic-trace
-          cargo build --release --locked -p denort_desktop
+          cargo build --release --locked -p flow -p denort -p test_server --bin flow --bin denort --bin test_server --features=deno/panic-trace
           df -h
       - name: Check release snapshot flags
         run: |-
-          if strings target/release/deno | grep -F -- '--no-lazy --no-lazy-eval --no-lazy-streaming'; then
-            echo "release deno binary contains eager snapshot flags"
+          if strings target/release/flow | grep -F -- '--no-lazy --no-lazy-eval --no-lazy-streaming'; then
+            echo "release flow binary contains eager snapshot flags"
             exit 1
           fi
       - name: 'Check eager bootstrap does not static-import node:'
@@ -501,74 +265,17 @@ jobs:
             echo "eager bootstrap statically imports a node: module — use core.createLazyLoader so it stays out of the startup snapshot"
             exit 1
           fi
-      - name: Generate symcache
+      - name: Check flow binary
         env:
           NO_COLOR: 1
-        run: |-
-          target/release/deno -A tools/release/create_symcache.ts ./deno.symcache
-          du -h deno.symcache
-          du -h target/release/deno
-      - name: Pre-release (linux)
-        if: github.repository == 'denoland/deno'
-        run: |-
-          cd target/release
-          ./deno -A ../../tools/release/create_symcache.ts deno-x86_64-unknown-linux-gnu.symcache
-          strip ./deno
-          shasum -a 256 deno > deno-x86_64-unknown-linux-gnu.sha256sum
-          zip -r deno-x86_64-unknown-linux-gnu.zip deno
-          shasum -a 256 deno-x86_64-unknown-linux-gnu.zip > deno-x86_64-unknown-linux-gnu.zip.sha256sum
-          strip --strip-debug ./denort
-          zip -r denort-x86_64-unknown-linux-gnu.zip denort
-          shasum -a 256 denort-x86_64-unknown-linux-gnu.zip > denort-x86_64-unknown-linux-gnu.zip.sha256sum
-          strip ./libdenort.so
-          zip -r libdenort-x86_64-unknown-linux-gnu.zip libdenort.so
-          shasum -a 256 libdenort-x86_64-unknown-linux-gnu.zip > libdenort-x86_64-unknown-linux-gnu.zip.sha256sum
-          ./deno types > lib.deno.d.ts
-      - name: Build bsdiff helper
-        if: 'github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        run: cargo build --release -p bsdiff_helper
-      - name: Generate delta patch (linux)
-        if: 'github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          TARGET="x86_64-unknown-linux-gnu"
-          PREV_VERSION=$(curl -sf https://dl.deno.land/release-latest.txt | tr -d "v\n") || true
-          if [ -z "$PREV_VERSION" ]; then echo "No previous version found, skipping delta"; exit 0; fi
-          echo "Generating delta from $PREV_VERSION for $TARGET"
-          curl -fSL -o prev.zip "https://github.com/denoland/deno/releases/download/v${PREV_VERSION}/deno-${TARGET}.zip" || { echo "Previous release not found, skipping delta"; exit 0; }
-          unzip -o prev.zip -d prev/
-          ./target/release/bsdiff_helper prev/deno target/release/deno "target/release/deno-${TARGET}.from-${PREV_VERSION}.bsdiff"
-          cd target/release && shasum -a 256 "deno-${TARGET}.from-${PREV_VERSION}.bsdiff" > "deno-${TARGET}.from-${PREV_VERSION}.bsdiff.sha256sum"
-      - name: Upload canary to dl.deno.land
-        if: github.repository == 'denoland/deno' && github.ref == 'refs/heads/main'
-        env:
-          AWS_ACCESS_KEY_ID: '${{ vars.S3_ACCESS_KEY_ID }}'
-          AWS_SECRET_ACCESS_KEY: '${{ secrets.S3_SECRET_ACCESS_KEY }}'
-          AWS_ENDPOINT_URL_S3: '${{ vars.S3_ENDPOINT }}'
-          AWS_DEFAULT_REGION: '${{ vars.S3_REGION }}'
-        run: |-
-          aws s3 sync ./target/release/ s3://dl-deno-land/canary/$(git rev-parse HEAD)/ --exclude "*" --include "*.zip"
-          aws s3 sync ./target/release/ s3://dl-deno-land/canary/$(git rev-parse HEAD)/ --exclude "*" --include "*.sha256sum"
-          aws s3 sync ./target/release/ s3://dl-deno-land/canary/$(git rev-parse HEAD)/ --exclude "*" --include "*.symcache"
-          echo ${{ github.sha }} > canary-latest.txt
-          aws s3 cp canary-latest.txt s3://dl-deno-land/canary-$(rustc -vV | sed -n "s|host: ||p")-latest.txt
-          rm canary-latest.txt
-      - name: Build product size info
-        if: 'github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          du -hd1 "./target/release"
-          du -ha  "./target/release/deno"
-          du -ha  "./target/release/denort"
-      - name: Check deno binary
-        env:
-          NO_COLOR: 1
-        run: target/release/deno eval "console.log(1+2)" | grep 3
-      - name: Check deno binary (in sysroot)
-        run: sudo chroot /sysroot "$(pwd)/target/release/deno" --version
-      - name: Upload artifact release-linux-x86_64-deno
+        run: target/release/flow eval "console.log(1+2)" | grep 3
+      - name: Check flow binary (in sysroot)
+        run: sudo chroot /sysroot "$(pwd)/target/release/flow" --version
+      - name: Upload artifact release-linux-x86_64-flow
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: release-linux-x86_64-deno
-          path: target/release/deno
+          name: release-linux-x86_64-flow
+          path: target/release/flow
           retention-days: 3
       - name: Upload artifact release-linux-x86_64-denort
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
@@ -582,50 +289,6 @@ jobs:
           name: release-linux-x86_64-test-server
           path: target/release/test_server
           retention-days: 3
-      - name: Upload release to dl.deno.land (unix)
-        if: 'github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        env:
-          AWS_ACCESS_KEY_ID: '${{ vars.S3_ACCESS_KEY_ID }}'
-          AWS_SECRET_ACCESS_KEY: '${{ secrets.S3_SECRET_ACCESS_KEY }}'
-          AWS_ENDPOINT_URL_S3: '${{ vars.S3_ENDPOINT }}'
-          AWS_DEFAULT_REGION: '${{ vars.S3_REGION }}'
-        run: |-
-          aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.zip"
-          aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.sha256sum"
-          aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.symcache"
-          aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.bsdiff"
-      - name: Create release notes
-        if: 'github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          export PATH=$PATH:$(pwd)/target/release
-          ./tools/release/05_create_release_notes.ts
-      - name: Upload release to GitHub
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
-        if: 'github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        env:
-          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        with:
-          files: |-
-            target/release/deno-x86_64-unknown-linux-gnu.zip
-            target/release/deno-x86_64-unknown-linux-gnu.zip.sha256sum
-            target/release/deno-x86_64-unknown-linux-gnu.sha256sum
-            target/release/denort-x86_64-unknown-linux-gnu.zip
-            target/release/denort-x86_64-unknown-linux-gnu.zip.sha256sum
-            target/release/libdenort-x86_64-unknown-linux-gnu.zip
-            target/release/libdenort-x86_64-unknown-linux-gnu.zip.sha256sum
-            target/release/deno-x86_64-unknown-linux-musl.zip
-            target/release/deno-x86_64-unknown-linux-musl.zip.sha256sum
-            target/release/deno-x86_64-unknown-linux-musl.sha256sum
-            target/release/denort-x86_64-unknown-linux-musl.zip
-            target/release/denort-x86_64-unknown-linux-musl.zip.sha256sum
-            target/release/libdenort-x86_64-unknown-linux-musl.zip
-            target/release/libdenort-x86_64-unknown-linux-musl.zip.sha256sum
-            target/release/deno_src.tar.gz
-            target/release/lib.deno.d.ts
-            target/release/deno-*.bsdiff
-            target/release/deno-*.bsdiff.sha256sum
-          body_path: target/release/release-notes.md
-          draft: true
       - name: Cache cargo home
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
@@ -711,6 +374,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: full
       RUST_LIB_BACKTRACE: 0
+      DENO_TEST_UTIL_DENO_EXE: '${{ github.workspace }}/target/release/flow'
     steps:
       - name: Configure git
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
@@ -725,7 +389,7 @@ jobs:
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Clone submodule ./tests/node_compat/runner/suite
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && matrix.test_crate == ''node_compat'''
         run: git submodule update --init --recursive --depth=1 -- ./tests/node_compat/runner/suite
@@ -889,15 +553,15 @@ jobs:
           CC=/usr/bin/clang-22
           CFLAGS=$CFLAGS
           " > $GITHUB_ENV
-      - name: Download artifact release-linux-x86_64-deno
+      - name: Download artifact release-linux-x86_64-flow
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
         with:
-          name: release-linux-x86_64-deno
+          name: release-linux-x86_64-flow
           path: target/release
-      - name: Set target/release/deno permissions
+      - name: Set target/release/flow permissions
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        run: chmod +x target/release/deno
+        run: chmod +x target/release/flow
       - name: Download artifact release-linux-x86_64-denort
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && (matrix.test_crate == ''integration'' || matrix.test_crate == ''specs'')'
@@ -984,6 +648,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: full
       RUST_LIB_BACKTRACE: 0
+      DENO_TEST_UTIL_DENO_EXE: '${{ github.workspace }}/target/release/flow'
     steps:
       - name: Configure git
         if: '!startsWith(github.ref, ''refs/tags/'')'
@@ -998,7 +663,7 @@ jobs:
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
         if: '!startsWith(github.ref, ''refs/tags/'')'
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Clone submodule ./tests/util/std
         if: '!startsWith(github.ref, ''refs/tags/'')'
         run: git submodule update --init --recursive --depth=1 -- ./tests/util/std
@@ -1024,15 +689,15 @@ jobs:
         if: '!startsWith(github.ref, ''refs/tags/'')'
         with:
           python-version: 3.11
-      - name: Download artifact release-linux-x86_64-deno
+      - name: Download artifact release-linux-x86_64-flow
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         if: '!startsWith(github.ref, ''refs/tags/'')'
         with:
-          name: release-linux-x86_64-deno
+          name: release-linux-x86_64-flow
           path: target/release
-      - name: Set target/release/deno permissions
+      - name: Set target/release/flow permissions
         if: '!startsWith(github.ref, ''refs/tags/'')'
-        run: chmod +x target/release/deno
+        run: chmod +x target/release/flow
       - name: Configure hosts file for WPT
         if: '!startsWith(github.ref, ''refs/tags/'')'
         working-directory: tests/wpt/suite/
@@ -1040,7 +705,7 @@ jobs:
       - name: Run web platform tests (release)
         if: '!startsWith(github.ref, ''refs/tags/'')'
         env:
-          DENO_BIN: ./target/release/deno
+          DENO_BIN: ./target/release/flow
         run: |-
           deno run -RWNE --allow-run --lock=tools/deno.lock.json --config tests/config/deno.json \
               ./tests/wpt/wpt.ts setup
@@ -1048,31 +713,7 @@ jobs:
               ./tests/wpt/wpt.ts run --all --quiet --release --binary="$DENO_BIN" --json=wpt.json --wptreport=wptreport.json
       - name: Autobahn testsuite
         if: '!startsWith(github.ref, ''refs/tags/'')'
-        run: target/release/deno run -A --config tests/config/deno.json ext/websocket/autobahn/fuzzingclient.js
-      - name: Upload wpt results to dl.deno.land
-        if: '!startsWith(github.ref, ''refs/tags/'') && github.repository == ''denoland/deno'' && github.ref == ''refs/heads/main'''
-        env:
-          AWS_ACCESS_KEY_ID: '${{ vars.S3_ACCESS_KEY_ID }}'
-          AWS_SECRET_ACCESS_KEY: '${{ secrets.S3_SECRET_ACCESS_KEY }}'
-          AWS_ENDPOINT_URL_S3: '${{ vars.S3_ENDPOINT }}'
-          AWS_DEFAULT_REGION: '${{ vars.S3_REGION }}'
-        continue-on-error: true
-        run: |-
-          gzip ./wptreport.json
-          aws s3 cp ./wpt.json s3://dl-deno-land/wpt/$(git rev-parse HEAD).json
-          aws s3 cp ./wptreport.json.gz s3://dl-deno-land/wpt/$(git rev-parse HEAD)-wptreport.json.gz
-          echo $(git rev-parse HEAD) > wpt-latest.txt
-          aws s3 cp wpt-latest.txt s3://dl-deno-land/wpt-latest.txt
-      - name: Upload wpt results to wpt.fyi
-        if: '!startsWith(github.ref, ''refs/tags/'') && github.repository == ''denoland/deno'' && github.ref == ''refs/heads/main'''
-        env:
-          WPT_FYI_USER: deno
-          WPT_FYI_PW: '${{ secrets.WPT_FYI_PW }}'
-          GITHUB_TOKEN: '${{ secrets.DENOBOT_PAT }}'
-        continue-on-error: true
-        run: |-
-          ./target/release/deno run --allow-all --lock=tools/deno.lock.json \
-              ./tools/upload_wptfyi.js $(git rev-parse HEAD) --ghstatus
+        run: target/release/flow run -A --config tests/config/deno.json ext/websocket/autobahn/fuzzingclient.js
       - name: Cache wpt and autobahn test run hashes
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: '!startsWith(github.ref, ''refs/tags/'') && github.ref == ''refs/heads/main'''
@@ -1087,8 +728,6 @@ jobs:
       - pre_build
     if: needs.pre_build.outputs.skip_build != 'true'
     runs-on: ubuntu-24.04
-    environment:
-      name: '${{ (github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/'')) && ''build'' || '''' }}'
     timeout-minutes: 240
     defaults:
       run:
@@ -1097,6 +736,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: full
       RUST_LIB_BACKTRACE: 0
+      DENO_TEST_UTIL_DENO_EXE: '${{ github.workspace }}/target/debug/flow'
     steps:
       - name: Configure git
         run: |-
@@ -1108,7 +748,7 @@ jobs:
           fetch-depth: 5
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Clone submodule ./tests/util/std
         run: git submodule update --init --recursive --depth=1 -- ./tests/util/std
       - name: Restore cache cargo home
@@ -1276,18 +916,18 @@ jobs:
       - name: Build debug
         env:
           CARGO_PROFILE_DEV_DEBUG: 0
-        run: cargo build --locked -p deno -p denort -p test_server --bin deno --bin denort --bin test_server --features=deno/panic-trace
-      - name: Check deno binary
+        run: cargo build --locked -p flow -p denort -p test_server --bin flow --bin denort --bin test_server --features=deno/panic-trace
+      - name: Check flow binary
         env:
           NO_COLOR: 1
-        run: target/debug/deno eval "console.log(1+2)" | grep 3
-      - name: Check deno binary (in sysroot)
-        run: sudo chroot /sysroot "$(pwd)/target/debug/deno" --version
-      - name: Upload artifact debug-linux-x86_64-deno
+        run: target/debug/flow eval "console.log(1+2)" | grep 3
+      - name: Check flow binary (in sysroot)
+        run: sudo chroot /sysroot "$(pwd)/target/debug/flow" --version
+      - name: Upload artifact debug-linux-x86_64-flow
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
-          name: debug-linux-x86_64-deno
-          path: target/debug/deno
+          name: debug-linux-x86_64-flow
+          path: target/debug/flow
           retention-days: 3
       - name: Upload artifact debug-linux-x86_64-denort
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
@@ -1386,6 +1026,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: full
       RUST_LIB_BACKTRACE: 0
+      DENO_TEST_UTIL_DENO_EXE: '${{ github.workspace }}/target/debug/flow'
     steps:
       - name: Configure git
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
@@ -1400,7 +1041,7 @@ jobs:
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Clone submodule ./tests/node_compat/runner/suite
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && matrix.test_crate == ''node_compat'''
         run: git submodule update --init --recursive --depth=1 -- ./tests/node_compat/runner/suite
@@ -1564,15 +1205,15 @@ jobs:
           CC=/usr/bin/clang-22
           CFLAGS=$CFLAGS
           " > $GITHUB_ENV
-      - name: Download artifact debug-linux-x86_64-deno
+      - name: Download artifact debug-linux-x86_64-flow
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
         with:
-          name: debug-linux-x86_64-deno
+          name: debug-linux-x86_64-flow
           path: target/debug
-      - name: Set target/debug/deno permissions
+      - name: Set target/debug/flow permissions
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        run: chmod +x target/debug/deno
+        run: chmod +x target/debug/flow
       - name: Download artifact debug-linux-x86_64-denort
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && (matrix.test_crate == ''integration'' || matrix.test_crate == ''specs'')'
@@ -1653,8 +1294,6 @@ jobs:
       - pre_build
     if: needs.pre_build.outputs.skip_build != 'true'
     runs-on: '${{ !contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'' && ''ubuntu-24.04'' || ''ubuntu-24.04'' }}'
-    environment:
-      name: '${{ (github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/'')) && ''build'' || '''' }}'
     timeout-minutes: 240
     defaults:
       run:
@@ -1663,6 +1302,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: full
       RUST_LIB_BACKTRACE: 0
+      DENO_TEST_UTIL_DENO_EXE: '${{ github.workspace }}/target/release/flow'
     steps:
       - name: Configure git
         if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'')'
@@ -1677,16 +1317,10 @@ jobs:
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
         if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'')'
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Clone submodule ./tests/util/std
         if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'')'
         run: git submodule update --init --recursive --depth=1 -- ./tests/util/std
-      - name: 'Create source tarballs (release, linux)'
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          mkdir -p target/release
-          tar --exclude=".git*" --exclude=target --exclude=third_party/prebuilt \
-              -czvf target/release/deno_src.tar.gz -C .. deno
       - name: Install Deno
         uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
         if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'')'
@@ -1768,6 +1402,9 @@ jobs:
         run: |-
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
+          sudo ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux
+          sudo ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic
+          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm
           rustup target add x86_64-unknown-linux-musl
       - name: Configure canary build
         if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && !startsWith(github.ref, ''refs/tags/'')'
@@ -1777,22 +1414,15 @@ jobs:
         env:
           DENO_SNAPSHOT_MINIFY_SOURCES: '1'
         run: |-
-          if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
-            git submodule update --init tools/lzld
-            make -C tools/lzld
-            sed -i '' "s#-fuse-ld=lld #-fuse-ld=$GITHUB_WORKSPACE/tools/lzld/lzld -L$GITHUB_WORKSPACE/tools/lzld -llzld_arm64 #" .cargo/config.toml
-            grep -n fuse-ld .cargo/config.toml
-          fi
           df -h
-          cargo build --release --locked --target x86_64-unknown-linux-musl -p deno -p denort -p test_server --bin deno --bin denort --bin test_server --features=deno/panic-trace
-          cargo build --release --locked --target x86_64-unknown-linux-musl -p denort_desktop
-          cp target/x86_64-unknown-linux-musl/release/{deno,denort,test_server,libdenort.so} target/release/
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p flow -p denort -p test_server --bin flow --bin denort --bin test_server --features=deno/panic-trace
+          cp target/x86_64-unknown-linux-musl/release/{flow,denort,test_server} target/release/
           df -h
       - name: Check release snapshot flags
         if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'')'
         run: |-
-          if strings target/release/deno | grep -F -- '--no-lazy --no-lazy-eval --no-lazy-streaming'; then
-            echo "release deno binary contains eager snapshot flags"
+          if strings target/release/flow | grep -F -- '--no-lazy --no-lazy-eval --no-lazy-streaming'; then
+            echo "release flow binary contains eager snapshot flags"
             exit 1
           fi
       - name: 'Check eager bootstrap does not static-import node:'
@@ -1802,75 +1432,17 @@ jobs:
             echo "eager bootstrap statically imports a node: module — use core.createLazyLoader so it stays out of the startup snapshot"
             exit 1
           fi
-      - name: Generate symcache
+      - name: Check flow binary
         if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'')'
         env:
           NO_COLOR: 1
-        run: |-
-          target/release/deno -A tools/release/create_symcache.ts ./deno.symcache
-          du -h deno.symcache
-          du -h target/release/deno
-      - name: Pre-release (linux)
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && github.repository == ''denoland/deno'''
-        run: |-
-          cd target/release
-          ./deno -A ../../tools/release/create_symcache.ts deno-x86_64-unknown-linux-musl.symcache
-          strip ./deno
-          shasum -a 256 deno > deno-x86_64-unknown-linux-musl.sha256sum
-          zip -r deno-x86_64-unknown-linux-musl.zip deno
-          shasum -a 256 deno-x86_64-unknown-linux-musl.zip > deno-x86_64-unknown-linux-musl.zip.sha256sum
-          strip --strip-debug ./denort
-          zip -r denort-x86_64-unknown-linux-musl.zip denort
-          shasum -a 256 denort-x86_64-unknown-linux-musl.zip > denort-x86_64-unknown-linux-musl.zip.sha256sum
-          strip ./libdenort.so
-          zip -r libdenort-x86_64-unknown-linux-musl.zip libdenort.so
-          shasum -a 256 libdenort-x86_64-unknown-linux-musl.zip > libdenort-x86_64-unknown-linux-musl.zip.sha256sum
-          ./deno types > lib.deno.d.ts
-      - name: Build bsdiff helper
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        run: cargo build --release -p bsdiff_helper
-      - name: Generate delta patch (linux)
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          TARGET="x86_64-unknown-linux-musl"
-          PREV_VERSION=$(curl -sf https://dl.deno.land/release-latest.txt | tr -d "v\n") || true
-          if [ -z "$PREV_VERSION" ]; then echo "No previous version found, skipping delta"; exit 0; fi
-          echo "Generating delta from $PREV_VERSION for $TARGET"
-          curl -fSL -o prev.zip "https://github.com/denoland/deno/releases/download/v${PREV_VERSION}/deno-${TARGET}.zip" || { echo "Previous release not found, skipping delta"; exit 0; }
-          unzip -o prev.zip -d prev/
-          ./target/release/bsdiff_helper prev/deno target/release/deno "target/release/deno-${TARGET}.from-${PREV_VERSION}.bsdiff"
-          cd target/release && shasum -a 256 "deno-${TARGET}.from-${PREV_VERSION}.bsdiff" > "deno-${TARGET}.from-${PREV_VERSION}.bsdiff.sha256sum"
-      - name: Upload canary to dl.deno.land
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && github.repository == ''denoland/deno'' && github.ref == ''refs/heads/main'''
-        env:
-          AWS_ACCESS_KEY_ID: '${{ vars.S3_ACCESS_KEY_ID }}'
-          AWS_SECRET_ACCESS_KEY: '${{ secrets.S3_SECRET_ACCESS_KEY }}'
-          AWS_ENDPOINT_URL_S3: '${{ vars.S3_ENDPOINT }}'
-          AWS_DEFAULT_REGION: '${{ vars.S3_REGION }}'
-        run: |-
-          aws s3 sync ./target/release/ s3://dl-deno-land/canary/$(git rev-parse HEAD)/ --exclude "*" --include "*.zip"
-          aws s3 sync ./target/release/ s3://dl-deno-land/canary/$(git rev-parse HEAD)/ --exclude "*" --include "*.sha256sum"
-          aws s3 sync ./target/release/ s3://dl-deno-land/canary/$(git rev-parse HEAD)/ --exclude "*" --include "*.symcache"
-          echo ${{ github.sha }} > canary-latest.txt
-          aws s3 cp canary-latest.txt s3://dl-deno-land/canary-$(rustc -vV | sed -n "s|host: ||p")-latest.txt
-          rm canary-latest.txt
-      - name: Build product size info
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && (github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/''))'
-        run: |-
-          du -hd1 "./target/release"
-          du -ha  "./target/release/deno"
-          du -ha  "./target/release/denort"
-      - name: Check deno binary
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'')'
-        env:
-          NO_COLOR: 1
-        run: target/release/deno eval "console.log(1+2)" | grep 3
-      - name: Upload artifact release-linux-musl-x86_64-deno
+        run: target/release/flow eval "console.log(1+2)" | grep 3
+      - name: Upload artifact release-linux-musl-x86_64-flow
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'')'
         with:
-          name: release-linux-musl-x86_64-deno
-          path: target/release/deno
+          name: release-linux-musl-x86_64-flow
+          path: target/release/flow
           retention-days: 3
       - name: Upload artifact release-linux-musl-x86_64-denort
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
@@ -1886,50 +1458,6 @@ jobs:
           name: release-linux-musl-x86_64-test-server
           path: target/release/test_server
           retention-days: 3
-      - name: Upload release to dl.deno.land (unix)
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        env:
-          AWS_ACCESS_KEY_ID: '${{ vars.S3_ACCESS_KEY_ID }}'
-          AWS_SECRET_ACCESS_KEY: '${{ secrets.S3_SECRET_ACCESS_KEY }}'
-          AWS_ENDPOINT_URL_S3: '${{ vars.S3_ENDPOINT }}'
-          AWS_DEFAULT_REGION: '${{ vars.S3_REGION }}'
-        run: |-
-          aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.zip"
-          aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.sha256sum"
-          aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.symcache"
-          aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.bsdiff"
-      - name: Create release notes
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        run: |-
-          export PATH=$PATH:$(pwd)/target/release
-          ./tools/release/05_create_release_notes.ts
-      - name: Upload release to GitHub
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
-        if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'') && github.repository == ''denoland/deno'' && startsWith(github.ref, ''refs/tags/'')'
-        env:
-          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        with:
-          files: |-
-            target/release/deno-x86_64-unknown-linux-gnu.zip
-            target/release/deno-x86_64-unknown-linux-gnu.zip.sha256sum
-            target/release/deno-x86_64-unknown-linux-gnu.sha256sum
-            target/release/denort-x86_64-unknown-linux-gnu.zip
-            target/release/denort-x86_64-unknown-linux-gnu.zip.sha256sum
-            target/release/libdenort-x86_64-unknown-linux-gnu.zip
-            target/release/libdenort-x86_64-unknown-linux-gnu.zip.sha256sum
-            target/release/deno-x86_64-unknown-linux-musl.zip
-            target/release/deno-x86_64-unknown-linux-musl.zip.sha256sum
-            target/release/deno-x86_64-unknown-linux-musl.sha256sum
-            target/release/denort-x86_64-unknown-linux-musl.zip
-            target/release/denort-x86_64-unknown-linux-musl.zip.sha256sum
-            target/release/libdenort-x86_64-unknown-linux-musl.zip
-            target/release/libdenort-x86_64-unknown-linux-musl.zip.sha256sum
-            target/release/deno_src.tar.gz
-            target/release/lib.deno.d.ts
-            target/release/deno-*.bsdiff
-            target/release/deno-*.bsdiff.sha256sum
-          body_path: target/release/release-notes.md
-          draft: true
   lint:
     name: 'lint ${{ matrix.profile }} ${{ matrix.os }}-${{ matrix.arch }}'
     needs:
@@ -1959,7 +1487,7 @@ jobs:
           fetch-depth: 5
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Clone submodule ./tests/util/std
         run: git submodule update --init --recursive --depth=1 -- ./tests/util/std
       - name: Restore cache cargo home
@@ -2080,7 +1608,7 @@ jobs:
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
         if: '!startsWith(github.ref, ''refs/tags/'')'
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Restore cache cargo home
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         if: '!startsWith(github.ref, ''refs/tags/'')'
@@ -2311,7 +1839,7 @@ jobs:
           submodules: false
       - name: Clone rusty_v8 fork (v8 patch dependency)
         if: '!startsWith(github.ref, ''refs/tags/'')'
-        run: 'git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
+        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
       - name: Install Rust (nightly)
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         if: '!startsWith(github.ref, ''refs/tags/'')'
@@ -2327,7 +1855,6 @@ jobs:
   ci-status:
     name: ci status
     needs:
-      - bench
       - build-release-linux-x86_64
       - test-release-linux-x86_64
       - wpt-release-linux-x86_64
@@ -2347,24 +1874,6 @@ jobs:
             echo 'CI failed'
             exit 1
           fi
-  publish-canary:
-    name: publish canary
-    needs:
-      - build-release-linux-x86_64
-      - build-debug-linux-x86_64
-      - build-release-linux-musl-x86_64
-    if: github.repository == 'denoland/deno' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Upload canary version file to dl.deno.land
-        env:
-          AWS_ACCESS_KEY_ID: '${{ vars.S3_ACCESS_KEY_ID }}'
-          AWS_SECRET_ACCESS_KEY: '${{ secrets.S3_SECRET_ACCESS_KEY }}'
-          AWS_ENDPOINT_URL_S3: '${{ vars.S3_ENDPOINT }}'
-          AWS_DEFAULT_REGION: '${{ vars.S3_REGION }}'
-        run: |-
-          echo ${{ github.sha }} > canary-latest.txt
-          aws s3 cp canary-latest.txt s3://dl-deno-land/canary-latest.txt
 
 # gagen:pin actions/cache/restore@v4 = 0057852bfaa89a56745cba8c7296529d2fc39830
 # gagen:pin actions/cache/save@v4 = 0057852bfaa89a56745cba8c7296529d2fc39830
@@ -2378,4 +1887,3 @@ jobs:
 # gagen:pin denoland/setup-deno@v2 = 667a34cdef165d8d2b2e98dde39547c9daac7282
 # gagen:pin dsherret/rust-toolchain-file@v1 = 3551321aa44dd44a0393eb3b6bdfbc5d25ecf621
 # gagen:pin dtolnay/rust-toolchain@master = 3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
-# gagen:pin softprops/action-gh-release@v2 = 153bb8e04406b158c6c84fc1615b65b24149a1fe

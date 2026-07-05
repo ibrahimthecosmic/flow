@@ -33,10 +33,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 xxhash-rust = { workspace = true, features = ["std", "xxh3"] }
 
-blas-src = { version = "0.8", features = ['openblas'] }
+# ndarray's default pure-Rust `matrixmultiply` backend is used instead of a
+# BLAS backend: the AI ext only uses ndarray for tiny embedding post-processing
+# (pooling/normalization) — the actual inference runs through ONNX Runtime
+# (`ort`). Dropping the `blas` feature removes the OpenBLAS system-lib link,
+# which has no musl build in apt and broke the Alpine cross-compile.
 convert_case = "0.6"
-ndarray = { version = "0.16", features = ['blas'] }
-openblas-src = { version = "0.10", features = ['cblas', 'system'] }
+ndarray = { version = "0.16" }
 rand = "0.8"
 tokenizers = { version = ">=0.13.4", default-features = false, features = ["onig"] }
 

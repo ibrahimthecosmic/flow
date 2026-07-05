@@ -1,5 +1,3 @@
-extern crate blas_src;
-
 mod consts;
 pub mod onnxruntime;
 mod utils;

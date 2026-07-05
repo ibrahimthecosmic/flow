@@ -4,7 +4,6 @@ import { parse as parseToml } from "jsr:@std/toml@1";
 import {
   Condition,
   conditions,
-  type ConfigValue,
   createWorkflow,
   defineArtifact,
   defineExprObj,
@@ -37,7 +36,6 @@ const isNotTag = isTag.not();
 const isMainOrTag = isMainBranch.or(isTag);
 const isPr = conditions.isPr();
 const hasCiFullLabel = conditions.hasPrLabel("ci-full");
-const hasCiBenchLabel = conditions.hasPrLabel("ci-bench");
 
 const Runners = {
   linuxX86: {
@@ -221,12 +219,6 @@ CFLAGS=$CFLAGS
 " > $GITHUB_ENV`,
 };
 
-const S3Envs: Readonly<Record<string, ConfigValue>> = {
-  AWS_ACCESS_KEY_ID: "${{ vars.S3_ACCESS_KEY_ID }}",
-  AWS_SECRET_ACCESS_KEY: "${{ secrets.S3_SECRET_ACCESS_KEY }}",
-  AWS_ENDPOINT_URL_S3: "${{ vars.S3_ENDPOINT }}",
-  AWS_DEFAULT_REGION: "${{ vars.S3_REGION }}",
-};
 
 function handleBuildItems(items: {
   skip_pr?: Condition | true;
@@ -299,8 +291,13 @@ const cloneRepoStep = step({
   // The prebuilt V8 static libs (glibc + musl) are still fetched from
   // RUSTY_V8_MIRROR at build time.
   name: "Clone rusty_v8 fork (v8 patch dependency)",
+  // Must be the `locker-v149.4.0` branch (adds the V8 Locker patch), NOT the
+  // plain `v149.4.0` tag. The prebuilt V8 static lib fetched from
+  // RUSTY_V8_MIRROR is built from the locker branch, so cloning the non-locker
+  // source generates Rust bindings that mismatch the prebuilt lib's ABI —
+  // which segfaults at runtime (e.g. the deno_core `convert` tests).
   run:
-    "git clone --depth 1 --branch v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8",
+    "git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8",
 });
 const cloneSubmodule = (path: string) =>
   step({
@@ -626,7 +623,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
     };
   };
 
-  const denoArtifact = createBinaryArtifact("deno");
+  const flowArtifact = createBinaryArtifact("flow");
   const denortArtifact = createBinaryArtifact("denort");
   const testServerArtifact = createBinaryArtifact("test_server");
   const env = {
@@ -634,6 +631,11 @@ const buildJobs = buildItems.map((rawBuildItem) => {
     RUST_BACKTRACE: "full",
     // disable anyhow's library backtrace
     RUST_LIB_BACKTRACE: 0,
+    // The test harness (test_util::deno_exe_path) defaults to target/<profile>/deno.
+    // flow ships the `flow` binary instead — a drop-in Deno CLI — so point the
+    // harness at it. The test/test-libs/wpt jobs download the `flow` artifact here.
+    DENO_TEST_UTIL_DENO_EXE:
+      `\${{ github.workspace }}/target/${buildItem.profile}/flow`,
   };
   const defaults = {
     run: {
@@ -645,7 +647,6 @@ const buildJobs = buildItems.map((rawBuildItem) => {
 
   const {
     installPythonStep,
-    setupPrebuiltMacStep,
     installLldStep,
   } = getOsSpecificSteps({
     isWindows,
@@ -665,11 +666,6 @@ const buildJobs = buildItems.map((rawBuildItem) => {
       needs: [preBuildJob],
       if: preBuildJob.outputs.skip_build.notEquals("true"),
       runsOn: buildItem.runner,
-      // This is required to successfully authenticate with Azure using OIDC for
-      // code signing.
-      environment: {
-        name: isMainOrTag.then("build").else(""),
-      },
       timeoutMinutes: 240,
       defaults,
       env,
@@ -681,208 +677,12 @@ const buildJobs = buildItems.map((rawBuildItem) => {
           ...buildItem,
           cachePrefix: "build-main",
         });
-        const tarSourcePublishStep = step({
-          name: "Create source tarballs (release, linux)",
-          if: buildItem.os.equals("linux")
-            .and(buildItem.arch.equals("x86_64")),
-          run: [
-            "mkdir -p target/release",
-            'tar --exclude=".git*" --exclude=target --exclude=third_party/prebuilt \\',
-            "    -czvf target/release/deno_src.tar.gz -C .. deno",
-          ],
-        });
-
-        const preRelease = step(
-          {
-            name: "Pre-release (linux)",
-            if: isLinux.and(isDenoland),
-            run: [
-              "cd target/release",
-              `./deno -A ../../tools/release/create_symcache.ts deno-${linuxTriple}.symcache`,
-              "strip ./deno",
-              `shasum -a 256 deno > deno-${linuxTriple}.sha256sum`,
-              `zip -r deno-${linuxTriple}.zip deno`,
-              `shasum -a 256 deno-${linuxTriple}.zip > deno-${linuxTriple}.zip.sha256sum`,
-              // denort is the `deno compile` base binary: libsui rewrites its
-              // ELF to embed user code, and that rewrite drops `.relr.dyn`
-              // relative relocations when the symbol table is gone, producing a
-              // compiled binary whose C++ static-init guards deadlock
-              // (`__cxa_guard_acquire failed to acquire mutex`). Keep .symtab
-              // (strip only debug info) so the relocations survive.
-              "strip --strip-debug ./denort",
-              `zip -r denort-${linuxTriple}.zip denort`,
-              `shasum -a 256 denort-${linuxTriple}.zip > denort-${linuxTriple}.zip.sha256sum`,
-              "strip ./libdenort.so",
-              `zip -r libdenort-${linuxTriple}.zip libdenort.so`,
-              `shasum -a 256 libdenort-${linuxTriple}.zip > libdenort-${linuxTriple}.zip.sha256sum`,
-              "./deno types > lib.deno.d.ts",
-            ],
-          },
-          step.dependsOn(setupPrebuiltMacStep, installDenoStep)({
-            name: "Install rust-codesign",
-            if: buildItem.os.equals("macos").and(isDenoland),
-            env: {
-              GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
-            },
-            run: "./tools/install_prebuilt.js rcodesign",
-          }),
-          {
-            name: "Pre-release (mac)",
-            if: isMacos.and(isDenoland),
-            env: {
-              "APPLE_CODESIGN_KEY": "${{ secrets.APPLE_CODESIGN_KEY }}",
-              "APPLE_CODESIGN_PASSWORD":
-                "${{ secrets.APPLE_CODESIGN_PASSWORD }}",
-            },
-            run: [
-              `target/release/deno -A tools/release/create_symcache.ts target/release/deno-${buildItem.arch}-apple-darwin.symcache`,
-              "strip -x -S target/release/deno",
-              'echo "Key is $(echo $APPLE_CODESIGN_KEY | base64 -d | wc -c) bytes"',
-              "rcodesign sign target/release/deno " +
-              "--code-signature-flags=runtime " +
-              '--p12-password="$APPLE_CODESIGN_PASSWORD" ' +
-              "--p12-file=<(echo $APPLE_CODESIGN_KEY | base64 -d) " +
-              "--entitlements-xml-file=cli/entitlements.plist",
-              "cd target/release",
-              `shasum -a 256 deno > deno-${buildItem.arch}-apple-darwin.sha256sum`,
-              `zip -r deno-${buildItem.arch}-apple-darwin.zip deno`,
-              `shasum -a 256 deno-${buildItem.arch}-apple-darwin.zip > deno-${buildItem.arch}-apple-darwin.zip.sha256sum`,
-              "strip -x -S ./denort",
-              `zip -r denort-${buildItem.arch}-apple-darwin.zip denort`,
-              `shasum -a 256 denort-${buildItem.arch}-apple-darwin.zip > denort-${buildItem.arch}-apple-darwin.zip.sha256sum`,
-              "strip -x -S ./libdenort.dylib",
-              `zip -r libdenort-${buildItem.arch}-apple-darwin.zip libdenort.dylib`,
-              `shasum -a 256 libdenort-${buildItem.arch}-apple-darwin.zip > libdenort-${buildItem.arch}-apple-darwin.zip.sha256sum`,
-            ],
-          },
-          {
-            // Note: Azure OIDC credentials are only valid for 5 minutes, so
-            // authentication must be done right before signing.
-            name: "Authenticate with Azure (windows)",
-            if: isWindows.and(isDenoland).and(isMainOrTag),
-            uses: "azure/login@v2",
-            with: {
-              "client-id": "${{ secrets.AZURE_CLIENT_ID }}",
-              "tenant-id": "${{ secrets.AZURE_TENANT_ID }}",
-              "subscription-id": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
-              "enable-AzPSSession": true,
-            },
-          },
-          {
-            name: "Code sign deno.exe (windows)",
-            if: isWindows.and(isDenoland).and(isMainOrTag),
-            uses: "Azure/artifact-signing-action@v0",
-            with: {
-              "endpoint": "https://eus.codesigning.azure.net/",
-              "trusted-signing-account-name": "deno-cli-code-signing",
-              "certificate-profile-name": "deno-cli-code-signing-cert",
-              "files-folder": "target/release",
-              "files-folder-filter": "deno.exe",
-              "file-digest": "SHA256",
-              "timestamp-rfc3161": "http://timestamp.acs.microsoft.com",
-              "timestamp-digest": "SHA256",
-              "exclude-environment-credential": true,
-              "exclude-workload-identity-credential": true,
-              "exclude-managed-identity-credential": true,
-              "exclude-shared-token-cache-credential": true,
-              "exclude-visual-studio-credential": true,
-              "exclude-visual-studio-code-credential": true,
-              "exclude-azure-cli-credential": false,
-            },
-          },
-          {
-            name: "Verify signature (windows)",
-            if: isWindows.and(isDenoland).and(isMainOrTag),
-            shell: "pwsh",
-            run: [
-              '$SignTool = Get-ChildItem -Path "C:\\Program Files*\\Windows Kits\\*\\bin\\*\\x64\\signtool.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1',
-              "$SignToolPath = $SignTool.FullName",
-              "& $SignToolPath verify /pa /v target\\release\\deno.exe",
-            ],
-          },
-          {
-            name: "Pre-release (windows)",
-            if: isWindows.and(isDenoland),
-            shell: "pwsh",
-            run: [
-              `Get-FileHash target/release/deno.exe -Algorithm SHA256 | Format-List > target/release/deno-${buildItem.arch}-pc-windows-msvc.sha256sum`,
-              `Compress-Archive -CompressionLevel Optimal -Force -Path target/release/deno.exe -DestinationPath target/release/deno-${buildItem.arch}-pc-windows-msvc.zip`,
-              `Get-FileHash target/release/deno-${buildItem.arch}-pc-windows-msvc.zip -Algorithm SHA256 | Format-List > target/release/deno-${buildItem.arch}-pc-windows-msvc.zip.sha256sum`,
-              `Compress-Archive -CompressionLevel Optimal -Force -Path target/release/denort.exe -DestinationPath target/release/denort-${buildItem.arch}-pc-windows-msvc.zip`,
-              `Get-FileHash target/release/denort-${buildItem.arch}-pc-windows-msvc.zip -Algorithm SHA256 | Format-List > target/release/denort-${buildItem.arch}-pc-windows-msvc.zip.sha256sum`,
-              `Compress-Archive -CompressionLevel Optimal -Force -Path target/release/denort.dll -DestinationPath target/release/libdenort-${buildItem.arch}-pc-windows-msvc.zip`,
-              `Get-FileHash target/release/libdenort-${buildItem.arch}-pc-windows-msvc.zip -Algorithm SHA256 | Format-List > target/release/libdenort-${buildItem.arch}-pc-windows-msvc.zip.sha256sum`,
-              `target/release/deno.exe -A tools/release/create_symcache.ts target/release/deno-${buildItem.arch}-pc-windows-msvc.symcache`,
-            ],
-          },
-          {
-            name: "Build bsdiff helper",
-            if: isDenoland.and(isTag),
-            run: [
-              "cargo build --release -p bsdiff_helper",
-            ],
-          },
-          {
-            name: "Generate delta patch (linux)",
-            if: isLinux.and(isDenoland).and(isTag),
-            run: [
-              `TARGET="${linuxTriple}"`,
-              'PREV_VERSION=$(curl -sf https://dl.deno.land/release-latest.txt | tr -d "v\\n") || true',
-              'if [ -z "$PREV_VERSION" ]; then echo "No previous version found, skipping delta"; exit 0; fi',
-              'echo "Generating delta from $PREV_VERSION for $TARGET"',
-              'curl -fSL -o prev.zip "https://github.com/denoland/deno/releases/download/v${PREV_VERSION}/deno-${TARGET}.zip" || { echo "Previous release not found, skipping delta"; exit 0; }',
-              "unzip -o prev.zip -d prev/",
-              './target/release/bsdiff_helper prev/deno target/release/deno "target/release/deno-${TARGET}.from-${PREV_VERSION}.bsdiff"',
-              'cd target/release && shasum -a 256 "deno-${TARGET}.from-${PREV_VERSION}.bsdiff" > "deno-${TARGET}.from-${PREV_VERSION}.bsdiff.sha256sum"',
-            ],
-          },
-          {
-            name: "Generate delta patch (mac)",
-            if: isMacos.and(isDenoland).and(isTag),
-            run: [
-              `TARGET="${buildItem.arch}-apple-darwin"`,
-              'PREV_VERSION=$(curl -sf https://dl.deno.land/release-latest.txt | tr -d "v\\n") || true',
-              'if [ -z "$PREV_VERSION" ]; then echo "No previous version found, skipping delta"; exit 0; fi',
-              'echo "Generating delta from $PREV_VERSION for $TARGET"',
-              'curl -fSL -o prev.zip "https://github.com/denoland/deno/releases/download/v${PREV_VERSION}/deno-${TARGET}.zip" || { echo "Previous release not found, skipping delta"; exit 0; }',
-              "unzip -o prev.zip -d prev/",
-              './target/release/bsdiff_helper prev/deno target/release/deno "target/release/deno-${TARGET}.from-${PREV_VERSION}.bsdiff"',
-              'cd target/release && shasum -a 256 "deno-${TARGET}.from-${PREV_VERSION}.bsdiff" > "deno-${TARGET}.from-${PREV_VERSION}.bsdiff.sha256sum"',
-            ],
-          },
-          {
-            name: "Generate delta patch (windows)",
-            if: isWindows.and(isDenoland).and(isTag),
-            shell: "pwsh",
-            run: [
-              `$Target = "${buildItem.arch}-pc-windows-msvc"`,
-              '$PrevVersion = (Invoke-RestMethod https://dl.deno.land/release-latest.txt).Trim() -replace "^v", ""',
-              'if (-not $PrevVersion) { Write-Host "No previous version found, skipping delta"; exit 0 }',
-              'Write-Host "Generating delta from $PrevVersion for $Target"',
-              'try { Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/download/v$PrevVersion/deno-$Target.zip" -OutFile prev.zip } catch { Write-Host "Previous release not found, skipping delta"; exit 0 }',
-              "Remove-Item -Recurse -Force prev -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Path prev | Out-Null",
-              "Expand-Archive -Force -Path prev.zip -DestinationPath prev",
-              '& .\\target\\release\\bsdiff_helper.exe "prev\\deno.exe" "target\\release\\deno.exe" "target\\release\\deno-$Target.from-$PrevVersion.bsdiff"',
-              'Get-FileHash "target\\release\\deno-$Target.from-$PrevVersion.bsdiff" -Algorithm SHA256 | Format-List > "target\\release\\deno-$Target.from-$PrevVersion.bsdiff.sha256sum"',
-            ],
-          },
-          step({
-            name: "Upload canary to dl.deno.land",
-            if: isDenoland.and(isMainBranch),
-            env: S3Envs,
-            run: [
-              'aws s3 sync ./target/release/ s3://dl-deno-land/canary/$(git rev-parse HEAD)/ --exclude "*" --include "*.zip"',
-              'aws s3 sync ./target/release/ s3://dl-deno-land/canary/$(git rev-parse HEAD)/ --exclude "*" --include "*.sha256sum"',
-              'aws s3 sync ./target/release/ s3://dl-deno-land/canary/$(git rev-parse HEAD)/ --exclude "*" --include "*.symcache"',
-              "echo ${{ github.sha }} > canary-latest.txt",
-              'aws s3 cp canary-latest.txt s3://dl-deno-land/canary-$(rustc -vV | sed -n "s|host: ||p")-latest.txt',
-              "rm canary-latest.txt",
-            ],
-          }),
-        );
-        const packagesToBuild = ["deno", "denort", "test_server"]
+        // flow (edge/cli) is the shipped product binary — a drop-in Deno CLI
+        // plus the edge layer. denort is the `deno compile` base; test_server
+        // backs the test suite. `deno` itself is not shipped separately.
+        const packagesToBuild = ["flow", "denort", "test_server"]
           .map((name) => `-p ${name}`).join(" ");
-        const binsToBuild = ["deno", "denort", "test_server"]
+        const binsToBuild = ["flow", "denort", "test_server"]
           .map((name) => `--bin ${name}`).join(" ");
         const cargoBuildReleaseStep = step
           // flow always builds its release binaries (glibc + musl). Upstream
@@ -909,31 +709,15 @@ const buildJobs = buildItems.map((rawBuildItem) => {
                 DENO_SNAPSHOT_MINIFY_SOURCES: "1",
               },
               run: [
-                // On macOS aarch64, link through lzld so system frameworks
-                // (CoreFoundation/Foundation/Security/CoreServices/Metal/...) are
-                // dlopen'd on first use instead of loaded at launch, cutting dyld
-                // startup cost. lzld needs an absolute -fuse-ld path (Apple clang
-                // rejects relative ones), so patch it in here rather than in the
-                // committed .cargo/config.toml. See tools/lzld.
-                'if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then',
-                "  git submodule update --init tools/lzld",
-                "  make -C tools/lzld",
-                "  sed -i '' \"s#-fuse-ld=lld #-fuse-ld=$GITHUB_WORKSPACE/tools/lzld/lzld -L$GITHUB_WORKSPACE/tools/lzld -llzld_arm64 #\" .cargo/config.toml",
-                "  grep -n fuse-ld .cargo/config.toml",
-                "fi",
                 // output fs space before and after building
                 "df -h",
                 `cargo build --release --locked${cargoTargetFlag} ${packagesToBuild} ${binsToBuild} --features=deno/panic-trace`,
-                // Build the desktop runtime shared library (libdenort cdylib) for
-                // laufey-based desktop apps. Separate invocation because the
-                // panic-trace feature only applies to the deno/denort binaries.
-                `cargo build --release --locked${cargoTargetFlag} -p denort_desktop`,
                 // Cross-compiled musl artifacts land under target/<triple>/release;
                 // copy them into target/release so all downstream packaging/upload
                 // steps (which assume the native path) work unchanged.
                 ...(isMusl
                   ? [
-                    `cp target/${linuxTriple}/release/{deno,denort,test_server,libdenort.so} target/release/`,
+                    `cp target/${linuxTriple}/release/{flow,denort,test_server} target/release/`,
                   ]
                   : []),
                 "df -h",
@@ -943,8 +727,8 @@ const buildJobs = buildItems.map((rawBuildItem) => {
               name: "Check release snapshot flags",
               if: isLinux,
               run: [
-                "if strings target/release/deno | grep -F -- '--no-lazy --no-lazy-eval --no-lazy-streaming'; then",
-                '  echo "release deno binary contains eager snapshot flags"',
+                "if strings target/release/flow | grep -F -- '--no-lazy --no-lazy-eval --no-lazy-streaming'; then",
+                '  echo "release flow binary contains eager snapshot flags"',
                 "  exit 1",
                 "fi",
               ],
@@ -964,25 +748,6 @@ const buildJobs = buildItems.map((rawBuildItem) => {
                 "fi",
               ],
             },
-            {
-              name: "Generate symcache",
-              run: [
-                "target/release/deno -A tools/release/create_symcache.ts ./deno.symcache",
-                "du -h deno.symcache",
-                "du -h target/release/deno",
-              ],
-              env: { NO_COLOR: 1 },
-            },
-            preRelease,
-            {
-              name: "Build product size info",
-              if: isMainOrTag,
-              run: [
-                `du -hd1 "./target/${buildItem.profile}"`,
-                `du -ha  "./target/${buildItem.profile}/deno"`,
-                `du -ha  "./target/${buildItem.profile}/denort"`,
-              ],
-            },
           );
         const cargoBuildStep = step
           .dependsOn(
@@ -990,8 +755,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             restoreCacheStep,
             installRustStep,
             sysRootStep,
-          )
-          .comesAfter(tarSourcePublishStep)(
+          )(
             {
               name: "Build debug",
               if: isDebug,
@@ -1003,109 +767,26 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             {
               // Run a minimal check to ensure that binary is not corrupted, regardless
               // of our build mode
-              name: "Check deno binary",
+              name: "Check flow binary",
               run:
-                `target/${buildItem.profile}/deno eval "console.log(1+2)" | grep 3`,
+                `target/${buildItem.profile}/flow eval "console.log(1+2)" | grep 3`,
               env: { NO_COLOR: 1 },
             },
             {
               // Verify that the binary actually works in the Ubuntu-16.04 sysroot.
-              name: "Check deno binary (in sysroot)",
+              name: "Check flow binary (in sysroot)",
               if: buildItem.use_sysroot,
               run:
-                `sudo chroot /sysroot "$(pwd)/target/${buildItem.profile}/deno" --version`,
+                `sudo chroot /sysroot "$(pwd)/target/${buildItem.profile}/flow" --version`,
             },
-            denoArtifact.upload(),
+            flowArtifact.upload(),
             denortArtifact.upload(),
             testServerArtifact.upload(),
           );
 
-        const shouldPublishCondition = isRelease.and(isDenoland)
-          .and(isTag);
-        const publishStep = step.if(shouldPublishCondition)(
-          step({
-            name: "Upload release to dl.deno.land (unix)",
-            if: isWindows.not(),
-            env: S3Envs,
-            run: [
-              'aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.zip"',
-              'aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.sha256sum"',
-              'aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.symcache"',
-              'aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.bsdiff"',
-            ],
-          }, {
-            name: "Upload release to dl.deno.land (windows)",
-            if: isWindows,
-            env: {
-              ...S3Envs,
-              CLOUDSDK_PYTHON: "${{env.pythonLocation}}\\python.exe",
-            },
-            run: [
-              'aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.zip"',
-              'aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.sha256sum"',
-              'aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.symcache"',
-              'aws s3 sync ./target/release/ s3://dl-deno-land/release/${GITHUB_REF#refs/*/}/ --exclude "*" --include "*.bsdiff"',
-            ],
-          }),
-          {
-            name: "Create release notes",
-            run: [
-              "export PATH=$PATH:$(pwd)/target/release",
-              "./tools/release/05_create_release_notes.ts",
-            ],
-          },
-          {
-            name: "Upload release to GitHub",
-            uses: "softprops/action-gh-release@v2",
-            env: {
-              GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
-            },
-            with: {
-              // flow ships x86_64 glibc + x86_64 musl (Alpine) Linux binaries
-              // only. Each release build item runs this step with the same list;
-              // softprops uploads whichever artifacts the current job produced.
-              files: [
-                "target/release/deno-x86_64-unknown-linux-gnu.zip",
-                "target/release/deno-x86_64-unknown-linux-gnu.zip.sha256sum",
-                "target/release/deno-x86_64-unknown-linux-gnu.sha256sum",
-                "target/release/denort-x86_64-unknown-linux-gnu.zip",
-                "target/release/denort-x86_64-unknown-linux-gnu.zip.sha256sum",
-                "target/release/libdenort-x86_64-unknown-linux-gnu.zip",
-                "target/release/libdenort-x86_64-unknown-linux-gnu.zip.sha256sum",
-                "target/release/deno-x86_64-unknown-linux-musl.zip",
-                "target/release/deno-x86_64-unknown-linux-musl.zip.sha256sum",
-                "target/release/deno-x86_64-unknown-linux-musl.sha256sum",
-                "target/release/denort-x86_64-unknown-linux-musl.zip",
-                "target/release/denort-x86_64-unknown-linux-musl.zip.sha256sum",
-                "target/release/libdenort-x86_64-unknown-linux-musl.zip",
-                "target/release/libdenort-x86_64-unknown-linux-musl.zip.sha256sum",
-                "target/release/deno_src.tar.gz",
-                "target/release/lib.deno.d.ts",
-                "target/release/deno-*.bsdiff",
-                "target/release/deno-*.bsdiff.sha256sum",
-              ].join("\n"),
-              body_path: "target/release/release-notes.md",
-              draft: true,
-            },
-          },
-        );
-
         return step.if(buildItem.skip.not())(
           cloneRepoStep,
           cloneStdSubmoduleStep,
-          // ensure this happens right after cloning
-          tarSourcePublishStep.if(shouldPublishCondition),
-          {
-            name: "Remove macOS cURL --ipv4 flag",
-            run: [
-              // cURL's --ipv4 flag is busted for now
-              "curl --version",
-              "which curl",
-              "cat /etc/hosts",
-              "rm ~/.curlrc || true",
-            ],
-            if: buildItem.os.equals("macos"),
-          },
           step({
             name: "Log versions",
             run: [
@@ -1138,13 +819,19 @@ const buildJobs = buildItems.map((rawBuildItem) => {
                 run: [
                   "sudo apt-get update",
                   "sudo apt-get install -y --no-install-recommends musl-tools",
+                  // libffi-sys builds its vendored libffi with musl-gcc, whose
+                  // include path lacks the Linux kernel headers (it fails on
+                  // `linux/limits.h`). Symlink them in from linux-libc-dev so
+                  // the musl C build can find them.
+                  "sudo ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux",
+                  "sudo ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic",
+                  "sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm",
                   `rustup target add ${linuxTriple}`,
                 ].join("\n"),
               }).comesAfter(installRustStep),
             ]
             : []),
           cargoBuildStep,
-          publishStep,
           saveCacheStep.if(buildItem.save_cache),
         );
       })(),
@@ -1218,7 +905,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
           installRustStep,
           installLldStep,
           sysRootStep,
-          denoArtifact.download(),
+          flowArtifact.download(),
           denortArtifact.download().if(
             testCrateNameExpr.equals("integration")
               .or(testCrateNameExpr.equals("specs")),
@@ -1337,14 +1024,18 @@ const buildJobs = buildItems.map((rawBuildItem) => {
         installRustStep,
         installLldStep,
         sysRootStep,
-        denoArtifact.download(),
+        flowArtifact.download(),
         testServerArtifact.download(),
         {
           name: "Test libs",
           run: `cargo test --locked --lib ${
             [...binCrates, ...libCrates].map((p) => `-p ${p}`).join(" ")
           }`,
-          env: { CARGO_PROFILE_DEV_DEBUG: 0 },
+          env: {
+            CARGO_PROFILE_DEV_DEBUG: 0,
+            DENO_TEST_UTIL_DENO_EXE:
+              `\${{ github.workspace }}/target/${buildItem.profile}/flow`,
+          },
         },
         saveCacheStep,
       ),
@@ -1381,7 +1072,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
           buildCacheSteps.restoreCacheStep,
           installDenoStep,
           installPythonStep,
-          denoArtifact.download(),
+          flowArtifact.download(),
           {
             name: "Configure hosts file for WPT",
             run: "./wpt make-hosts-file | sudo tee -a /etc/hosts",
@@ -1390,7 +1081,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
           {
             name: "Run web platform tests (debug)",
             if: isDebug,
-            env: { DENO_BIN: "./target/debug/deno" },
+            env: { DENO_BIN: "./target/debug/flow" },
             run: [
               "deno run -RWNE --allow-run --lock=tools/deno.lock.json --config tests/config/deno.json \\",
               "    ./tests/wpt/wpt.ts setup",
@@ -1402,7 +1093,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             name: "Run web platform tests (release)",
             if: isRelease,
             env: {
-              DENO_BIN: "./target/release/deno",
+              DENO_BIN: "./target/release/flow",
             },
             run: [
               "deno run -RWNE --allow-run --lock=tools/deno.lock.json --config tests/config/deno.json \\",
@@ -1415,38 +1106,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             name: "Autobahn testsuite",
             if: isRelease,
             run:
-              "target/release/deno run -A --config tests/config/deno.json ext/websocket/autobahn/fuzzingclient.js",
-          },
-          step({
-            name: "Upload wpt results to dl.deno.land",
-            continueOnError: true,
-            if: isRelease.and(isLinux).and(isDenoland).and(isMainBranch).and(
-              isNotTag,
-            ),
-            env: S3Envs,
-            run: [
-              "gzip ./wptreport.json",
-              "aws s3 cp ./wpt.json s3://dl-deno-land/wpt/$(git rev-parse HEAD).json",
-              "aws s3 cp ./wptreport.json.gz s3://dl-deno-land/wpt/$(git rev-parse HEAD)-wptreport.json.gz",
-              "echo $(git rev-parse HEAD) > wpt-latest.txt",
-              "aws s3 cp wpt-latest.txt s3://dl-deno-land/wpt-latest.txt",
-            ],
-          }),
-          {
-            name: "Upload wpt results to wpt.fyi",
-            continueOnError: true,
-            if: isRelease.and(isLinux).and(isDenoland).and(isMainBranch).and(
-              isNotTag,
-            ),
-            env: {
-              WPT_FYI_USER: "deno",
-              WPT_FYI_PW: "${{ secrets.WPT_FYI_PW }}",
-              GITHUB_TOKEN: "${{ secrets.DENOBOT_PAT }}",
-            },
-            run: [
-              "./target/release/deno run --allow-all --lock=tools/deno.lock.json \\",
-              "    ./tools/upload_wptfyi.js $(git rev-parse HEAD) --ghstatus",
-            ],
+              "target/release/flow run -A --config tests/config/deno.json ext/websocket/autobahn/fuzzingclient.js",
           },
           buildCacheSteps.saveCacheStep.if(isMainBranch.and(isNotTag)),
         ),
@@ -1461,88 +1121,6 @@ const buildJobs = buildItems.map((rawBuildItem) => {
     additionalJobs: isMusl ? [] : additionalJobs,
   };
 });
-
-// === bench job ===
-
-const benchProfile = defineExprObj(Runners.linuxX86Xl);
-const benchCacheSteps = createCargoCacheHomeStep({
-  ...benchProfile,
-  cachePrefix: "bench",
-});
-const benchJob = job(
-  "bench",
-  {
-    name: `bench release ${benchProfile.os}-${benchProfile.arch}`,
-    needs: [preBuildJob],
-    if: preBuildJob.outputs.skip_build.notEquals("true"),
-    runsOn: benchProfile.runner,
-    timeoutMinutes: 240,
-    defaults: {
-      run: {
-        // GH actions does not fail fast by default on
-        // Windows, so we set bash as the default shell
-        shell: "bash",
-      },
-    },
-    steps: step
-      .if(
-        (hasCiBenchLabel.or(isMainBranch)).and(isNotTag),
-      )(
-        cloneRepoStep,
-        benchCacheSteps.restoreCacheStep,
-        installNodeStep,
-        installRustStep,
-        cloneSubmodule("./tests/bench/testdata/lsp_benchdata"),
-        cloneStdSubmoduleStep,
-        step(sysRootConfig),
-        installDenoStep,
-        {
-          name: "Install benchmark tools",
-          env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" },
-          run: "./tools/install_prebuilt.js wrk hyperfine",
-        },
-        // We currently do a full deno build instead of getting this from the build
-        // job because the benchmarks inspect the target folder to see the sizes of
-        // libraries like v8 and swc as well as the snapshot sizes. Maybe in the future
-        // we could optimize this to not need this.
-        {
-          name: "Build deno",
-          env: {
-            DENO_SNAPSHOT_MINIFY_SOURCES: "1",
-          },
-          run: "cargo build --release -p deno",
-        },
-        {
-          name: "Run benchmarks",
-          run: "cargo bench -p bench_tests --bench deno_bench --locked",
-        },
-        {
-          name: "Post benchmarks",
-          if: isDenoland.and(isMainBranch),
-          env: {
-            DENOBOT_PAT: "${{ secrets.DENOBOT_PAT }}",
-          },
-          run: [
-            "git clone --depth 1 --branch gh-pages                             \\",
-            "    https://${DENOBOT_PAT}@github.com/denoland/benchmark_data.git \\",
-            "    gh-pages",
-            "./target/release/deno run --allow-all ./tools/build_benchmark_jsons.js --release",
-            "cd gh-pages",
-            'git config user.email "propelml@gmail.com"',
-            'git config user.name "denobot"',
-            "git add .",
-            'git commit --message "Update benchmarks"',
-            "git push origin gh-pages",
-          ],
-        },
-        {
-          name: "Worker info",
-          run: ["cat /proc/cpuinfo", "cat /proc/meminfo"],
-        },
-        benchCacheSteps.saveCacheStep,
-      ),
-  },
-);
 
 // === lint job ===
 
@@ -1605,27 +1183,6 @@ const lintJob = job("lint", {
           "deno run --allow-write --allow-read --allow-run --allow-net --allow-env ./tools/lint.js",
       },
       saveCacheStep,
-    );
-  })(),
-});
-
-// === publish-canary job ===
-
-const publishCanaryJob = job("publish-canary", {
-  name: "publish canary",
-  runsOn: ubuntuX86Runner,
-  needs: [...buildJobs.map((b) => b.buildJob)],
-  if: isDenoland.and(isMainBranch),
-  steps: (() => {
-    return step(
-      {
-        name: "Upload canary version file to dl.deno.land",
-        env: S3Envs,
-        run: [
-          "echo ${{ github.sha }} > canary-latest.txt",
-          "aws s3 cp canary-latest.txt s3://dl-deno-land/canary-latest.txt",
-        ],
-      },
     );
   })(),
 });
@@ -1765,7 +1322,6 @@ const ciStatusJob = job("ci-status", {
   // We use this job in the main branch rule status checks for PRs.
   // All jobs that are required to pass on a PR should be listed here.
   needs: [
-    benchJob,
     ...buildJobs.map((j) => [j.buildJob, ...j.additionalJobs]).flat(),
     lintJob,
     denoCoreTestJob,
@@ -1791,7 +1347,6 @@ const workflow = createWorkflow({
   name: "ci",
   permissions: {
     contents: "write",
-    "id-token": "write", // Required for GitHub OIDC with Azure for code signing
   },
   on: {
     // flow builds from its OWN release tags (`vX.Y.Z`), never Deno's — upstream
@@ -1810,13 +1365,11 @@ const workflow = createWorkflow({
   },
   jobs: [
     preBuildJob,
-    benchJob,
     ...buildJobs.map((j) => [j.buildJob, ...j.additionalJobs]).flat(),
     lintJob,
     denoCoreTestJob,
     denoCoreMiriJob,
     ciStatusJob,
-    publishCanaryJob,
   ],
 });
 
