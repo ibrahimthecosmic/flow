@@ -192,7 +192,7 @@ declare interface FlowWorkerEvent {
     | "BootFailure"
     | "UncaughtException"
     | "Shutdown"
-    | (string & {});
+    | (string & Record<never, never>);
   /** Event payload; shape depends on `event_type`. */
   event: { [key: string]: FlowJsonValue };
   /** Worker identity: service path, execution id, and similar. */

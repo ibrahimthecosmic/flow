@@ -7,8 +7,8 @@ HttpFS is a virtual filesystem mounted into flow user workers (e.g. at
 `/objects`). It is backed by any HTTP API that implements this protocol. The
 runtime's Rust client (`edge/crates/fs/impl/http_fs.rs`) is the sole consumer;
 conformance is defined by the test suite in
-`edge/crates/fs/tests/httpfs_conformance.rs` (TODO), not by any particular
-server implementation.
+`edge/crates/fs/tests/httpfs_conformance.rs`, not by any particular server
+implementation.
 
 Design goals, in priority order:
 
@@ -294,14 +294,18 @@ round trip — worker wall-clock timeouts keep running).
 
 ## 8. Conformance
 
-An implementation is conformant when the flow conformance suite passes against
-it. The suite exercises every endpoint, every error mapping, path edge cases
-(unicode names, deep nesting, root ops), pagination, ranged reads, overwrite
-flags, and — when capabilities declare them — multipart and copy. Run it with:
+The conformance suite (`edge/crates/fs/tests/httpfs_conformance.rs`) runs the
+Rust client against an in-process mock server that acts as the reference
+implementation of this protocol. It exercises every endpoint, the error/errno
+mappings, both auth transports, redirect handling (including credential
+stripping on cross-origin targets), pagination, ranged reads, overwrite flags,
+capability gating (version refusal, copy fallback, multipart vs. `EFBIG`), and
+the sync fs surface. Run it with:
 
 ```
-cargo test -p fs httpfs_conformance -- --ignored \
-  # HTTPFS_BASE_URL / HTTPFS_TOKEN / HTTPFS_AUTH_* env vars
+cargo test -p fs --test httpfs_conformance
 ```
 
-(TODO: suite lands with the HttpFS implementation.)
+Server implementers should treat the mock's behavior in that file as the
+executable companion to this document: a server that answers each request the
+way the mock does is conformant.

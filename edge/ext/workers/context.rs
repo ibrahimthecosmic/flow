@@ -15,6 +15,7 @@ use ext_event_worker::events::UncaughtExceptionEvent;
 use ext_event_worker::events::WorkerEventWithMetadata;
 use ext_runtime::MetricSource;
 use ext_runtime::SharedMetricSource;
+use fs::http_fs::HttpFsConfigs;
 use fs::s3_fs::S3FsConfigs;
 use fs::tmp_fs::TmpFsConfig;
 use hyper_v014::Body;
@@ -288,6 +289,7 @@ pub struct WorkerContextInitOpts {
   pub maybe_entrypoint: Option<String>,
   pub maybe_s3_fs_config: Option<S3FsConfigs>,
   pub maybe_tmp_fs_config: Option<TmpFsConfig>,
+  pub maybe_http_fs_config: Option<HttpFsConfigs>,
   pub maybe_otel_config: Option<OtelConfig>,
 }
 

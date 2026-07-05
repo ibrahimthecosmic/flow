@@ -6,6 +6,7 @@ use deno_io::fs::FsResult;
 use normalize_path::NormalizePath;
 
 pub mod deno_compile_fs;
+pub mod http_fs;
 pub mod prefix_fs;
 pub mod s3_fs;
 pub mod static_fs;

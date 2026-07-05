@@ -301,14 +301,14 @@ pub struct S3FsConfig {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum S3FsConfigs {
-  One(S3FsConfig),
+  One(Box<S3FsConfig>),
   Many(Vec<S3FsConfig>),
 }
 
 impl S3FsConfigs {
   pub fn into_vec(self) -> Vec<S3FsConfig> {
     match self {
-      Self::One(config) => vec![config],
+      Self::One(config) => vec![*config],
       Self::Many(configs) => configs,
     }
   }
@@ -316,7 +316,7 @@ impl S3FsConfigs {
 
 impl From<S3FsConfig> for S3FsConfigs {
   fn from(config: S3FsConfig) -> Self {
-    Self::One(config)
+    Self::One(Box::new(config))
   }
 }
 

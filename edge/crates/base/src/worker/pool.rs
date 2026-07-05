@@ -447,6 +447,7 @@ impl WorkerPool {
             maybe_entrypoint,
             maybe_s3_fs_config,
             maybe_tmp_fs_config,
+            maybe_http_fs_config,
             static_patterns,
             maybe_otel_config: otel_config,
             ..
@@ -468,6 +469,7 @@ impl WorkerPool {
 
                 maybe_s3_fs_config,
                 maybe_tmp_fs_config,
+                maybe_http_fs_config,
                 maybe_otel_config: otel_config,
               }),
               tx,

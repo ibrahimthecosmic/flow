@@ -41,6 +41,7 @@ use deno_telemetry::OtelConsoleConfig;
 use deno_telemetry::OtelPropagators;
 use errors::WorkerError;
 use ext_runtime::conn_sync::ConnWatcher;
+use fs::http_fs::HttpFsConfigs;
 use fs::s3_fs::S3FsConfigs;
 use fs::tmp_fs::TmpFsConfig;
 use http_utils::utils::get_upgrade_type;
@@ -316,6 +317,7 @@ pub struct UserWorkerCreateOptions {
 
   s3_fs_config: Option<S3FsConfigs>,
   tmp_fs_config: Option<TmpFsConfig>,
+  http_fs: Option<HttpFsConfigs>,
   otel_config: Option<JsOtelConfig>,
 
   context: Option<JsonMap>,
@@ -419,6 +421,7 @@ pub async fn op_user_worker_create(
 
       s3_fs_config: maybe_s3_fs_config,
       tmp_fs_config: maybe_tmp_fs_config,
+      http_fs: maybe_http_fs_config,
       otel_config: maybe_otel_config,
 
       context,
@@ -484,6 +487,7 @@ pub async fn op_user_worker_create(
 
       maybe_s3_fs_config,
       maybe_tmp_fs_config,
+      maybe_http_fs_config,
       maybe_otel_config,
     };
 

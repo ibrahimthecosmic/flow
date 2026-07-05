@@ -82,6 +82,8 @@ use ext_workers::context::WorkerKind;
 use ext_workers::context::WorkerRuntimeOpts;
 use fs::VfsSys;
 use fs::deno_compile_fs::DenoCompileFileSystem;
+use fs::http_fs::HttpFs;
+use fs::http_fs::HttpFsConfigs;
 use fs::prefix_fs::PrefixFs;
 use fs::s3_fs::S3Fs;
 use fs::s3_fs::S3FsConfigs;
@@ -319,6 +321,10 @@ pub trait GetRuntimeContext {
 }
 
 type DefaultRuntimeContext = ();
+
+/// The assembled worker fs chain, the S3 mounts that need teardown flushing,
+/// and whether any virtual (S3/HttpFS) mount is present.
+type BuiltFileSystem = (Arc<dyn deno_fs::FileSystem>, Vec<S3Fs>, bool);
 
 impl GetRuntimeContext for DefaultRuntimeContext {}
 
@@ -576,6 +582,7 @@ where
       static_patterns,
       maybe_s3_fs_config,
       maybe_tmp_fs_config,
+      maybe_http_fs_config,
       maybe_otel_config,
       ..
     } = init_opts.unwrap();
@@ -818,7 +825,7 @@ where
         };
 
         let build_file_system_fn = |base_fs: Arc<dyn deno_fs::FileSystem>| -> Result<
-          (Arc<dyn deno_fs::FileSystem>, Vec<S3Fs>),
+          BuiltFileSystem,
           AnyError,
         > {
           let tmp_fs =
@@ -831,37 +838,80 @@ where
           fs.set_runtime_state(&runtime_state);
 
           let mut mount_points = Vec::new();
-          let mut mounts = Vec::new();
+
+          let mut s3_mounts = Vec::new();
           for mut config in maybe_s3_fs_config
             .map(S3FsConfigs::into_vec)
             .unwrap_or_default()
           {
             let mount_point = config.take_mount_point();
-            validate_s3_mount_point(&mount_point, &mount_points)?;
-            mounts.push((mount_point.clone(), S3Fs::new(config)?));
+            validate_mount_point(&mount_point, &mount_points)?;
+            s3_mounts.push((mount_point.clone(), S3Fs::new(config)?));
             mount_points.push(mount_point);
           }
 
-          let s3_fses =
-            mounts.iter().map(|(_, s3_fs)| s3_fs.clone()).collect();
-          let mut mounts = mounts.into_iter();
+          let mut http_mounts = Vec::new();
+          for mut config in maybe_http_fs_config
+            .map(HttpFsConfigs::into_vec)
+            .unwrap_or_default()
+          {
+            let mount_point = config.take_mount_point();
+            validate_mount_point(&mount_point, &mount_points)?;
+            http_mounts.push((mount_point.clone(), HttpFs::new(config)?));
+            mount_points.push(mount_point);
+          }
 
-          Ok(match mounts.next() {
+          let s3_fses: Vec<S3Fs> =
+            s3_mounts.iter().map(|(_, s3_fs)| s3_fs.clone()).collect();
+          let has_virtual_mounts = !mount_points.is_empty();
+          let mut s3_mounts = s3_mounts.into_iter();
+          let mut http_mounts = http_mounts.into_iter();
+
+          // Each add_fs consumes the chain and re-types it to the added fs,
+          // so the S3 and HttpFS mounts are folded in stages.
+          let fs: Arc<dyn deno_fs::FileSystem> = match s3_mounts.next() {
             Some((first_mount_point, first_s3_fs)) => {
               let mut chain = fs.add_fs(first_mount_point, first_s3_fs);
 
               // subsequent layers inherit this flag through add_fs
               chain.set_check_sync_api(is_user_worker);
 
-              (
-                Arc::new(mounts.fold(chain, |chain, (mount_point, s3_fs)| {
-                  chain.add_fs(mount_point, s3_fs)
-                })),
-                s3_fses,
-              )
+              let chain = s3_mounts.fold(chain, |chain, (mount_point, s3_fs)| {
+                chain.add_fs(mount_point, s3_fs)
+              });
+
+              match http_mounts.next() {
+                Some((first_mount_point, first_http_fs)) => {
+                  let chain = chain.add_fs(first_mount_point, first_http_fs);
+                  Arc::new(http_mounts.fold(
+                    chain,
+                    |chain, (mount_point, http_fs)| {
+                      chain.add_fs(mount_point, http_fs)
+                    },
+                  ))
+                }
+                None => Arc::new(chain),
+              }
             }
-            None => (Arc::new(fs), s3_fses),
-          })
+            None => match http_mounts.next() {
+              Some((first_mount_point, first_http_fs)) => {
+                let mut chain = fs.add_fs(first_mount_point, first_http_fs);
+
+                // subsequent layers inherit this flag through add_fs
+                chain.set_check_sync_api(is_user_worker);
+
+                Arc::new(http_mounts.fold(
+                  chain,
+                  |chain, (mount_point, http_fs)| {
+                    chain.add_fs(mount_point, http_fs)
+                  },
+                ))
+              }
+              None => Arc::new(fs),
+            },
+          };
+
+          Ok((fs, s3_fses, has_virtual_mounts))
         };
 
         let static_files = if is_some_entry_point {
@@ -882,7 +932,7 @@ where
           static_files
         };
 
-        let (fs, s3_fses) = build_file_system_fn(if is_user_worker && should_block_fs {
+        let (fs, s3_fses, has_virtual_mounts) = build_file_system_fn(if is_user_worker && should_block_fs {
           let compile_base_dir = if matches!(entrypoint, Some(Entrypoint::ModuleCode(_)) | None)
               && is_some_entry_point
             {
@@ -1113,7 +1163,7 @@ where
           deno_http::deno_http::args(deno_http::Options::default()),
           deno_io::deno_io::args(Some(stdio.clone())),
           deno_fs::deno_fs::args(
-            if should_block_fs || !s3_fses.is_empty() || flags.restrict_host_fs {
+            if should_block_fs || has_virtual_mounts || flags.restrict_host_fs {
               fs.clone()
             } else {
               Arc::new(deno_fs::RealFs) as Arc<dyn deno_fs::FileSystem>
@@ -1123,7 +1173,7 @@ where
             deno_resolver::npm::DenoInNpmPackageChecker,
             npm::NpmResolver<VfsSys>,
             VfsSys,
-          >(Some(node_services), if should_block_fs || !s3_fses.is_empty() || flags.restrict_host_fs {
+          >(Some(node_services), if should_block_fs || has_virtual_mounts || flags.restrict_host_fs {
             fs.clone()
           } else {
             Arc::new(deno_fs::RealFs) as Arc<dyn deno_fs::FileSystem>
@@ -2715,31 +2765,31 @@ fn terminate_execution_if_cancelled(
   )
 }
 
-/// Rejects an S3 mount point that is not an absolute non-root path, or that
-/// equals or nests with `/tmp` or one of the mount points registered before
-/// it. `Path::starts_with` compares whole components, so `/s3-two` does not
-/// conflict with `/s3`.
-fn validate_s3_mount_point(
+/// Rejects a virtual-fs (S3/HttpFS) mount point that is not an absolute
+/// non-root path, or that equals or nests with `/tmp` or one of the mount
+/// points registered before it. `Path::starts_with` compares whole
+/// components, so `/s3-two` does not conflict with `/s3`.
+fn validate_mount_point(
   mount_point: &str,
   existing: &[String],
 ) -> Result<(), Error> {
   let path = Path::new(mount_point);
   if !path.is_absolute() || path == Path::new("/") {
     bail!(
-      "invalid S3 mount point '{mount_point}': must be an absolute path other than '/'"
+      "invalid mount point '{mount_point}': must be an absolute path other than '/'"
     );
   }
 
   let tmp = Path::new("/tmp");
   if path.starts_with(tmp) || tmp.starts_with(path) {
-    bail!("invalid S3 mount point '{mount_point}': conflicts with '/tmp'");
+    bail!("invalid mount point '{mount_point}': conflicts with '/tmp'");
   }
 
   for other in existing {
     let other_path = Path::new(other);
     if path.starts_with(other_path) || other_path.starts_with(path) {
       bail!(
-        "invalid S3 mount point '{mount_point}': conflicts with mount point '{other}'"
+        "invalid mount point '{mount_point}': conflicts with mount point '{other}'"
       );
     }
   }
@@ -2874,16 +2924,16 @@ mod test {
 
   use super::GetRuntimeContext;
   use super::RunOptionsBuilder;
-  use super::validate_s3_mount_point;
+  use super::validate_mount_point;
   use crate::runtime::DenoRuntime;
   use crate::server::ServerFlags;
   use crate::worker::DuplexStreamEntry;
   use crate::worker::WorkerBuilder;
 
   #[test]
-  fn test_validate_s3_mount_point() {
+  fn test_validate_mount_point() {
     let ok = |mount: &str, existing: &[&str]| {
-      validate_s3_mount_point(
+      validate_mount_point(
         mount,
         &existing.iter().map(ToString::to_string).collect::<Vec<_>>(),
       )
@@ -3006,6 +3056,7 @@ mod test {
 
             maybe_s3_fs_config: s3_fs_config.map(Into::into),
             maybe_tmp_fs_config: tmp_fs_config,
+            maybe_http_fs_config: None,
             maybe_otel_config: None,
           },
           Arc::default(),
@@ -3125,6 +3176,7 @@ mod test {
 
           maybe_s3_fs_config: None,
           maybe_tmp_fs_config: None,
+          maybe_http_fs_config: None,
           maybe_otel_config: None,
         },
         Arc::default(),
@@ -3210,6 +3262,7 @@ mod test {
           static_patterns: vec![],
           maybe_s3_fs_config: None,
           maybe_tmp_fs_config: None,
+          maybe_http_fs_config: None,
           maybe_otel_config: None,
         },
         Arc::default(),
@@ -3296,6 +3349,7 @@ mod test {
           static_patterns: vec![],
           maybe_s3_fs_config: None,
           maybe_tmp_fs_config: None,
+          maybe_http_fs_config: None,
           maybe_otel_config: None,
         },
         Arc::default(),
@@ -3939,6 +3993,7 @@ mod test {
             static_patterns: vec![],
             maybe_s3_fs_config: None,
             maybe_tmp_fs_config: None,
+            maybe_http_fs_config: None,
             maybe_otel_config: None,
             conf: WorkerRuntimeOpts::UserWorker(Box::new(
               UserWorkerRuntimeOpts {
@@ -3981,6 +4036,7 @@ mod test {
             static_patterns: vec![],
             maybe_s3_fs_config: None,
             maybe_tmp_fs_config: None,
+            maybe_http_fs_config: None,
             maybe_otel_config: None,
             conf: WorkerRuntimeOpts::UserWorker(Box::new(
               UserWorkerRuntimeOpts {
@@ -4019,6 +4075,7 @@ mod test {
             static_patterns: vec![],
             maybe_s3_fs_config: None,
             maybe_tmp_fs_config: None,
+            maybe_http_fs_config: None,
             maybe_otel_config: None,
             conf: WorkerRuntimeOpts::UserWorker(Box::new(
               UserWorkerRuntimeOpts {

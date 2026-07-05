@@ -9,6 +9,7 @@ mod r#impl;
 mod rt;
 
 pub use r#impl::deno_compile_fs;
+pub use r#impl::http_fs;
 pub use r#impl::prefix_fs;
 pub use r#impl::s3_fs;
 pub use r#impl::static_fs;

@@ -38,6 +38,7 @@ indexmap.workspace = true
 log.workspace = true
 once_cell.workspace = true
 percent-encoding.workspace = true
+reqwest.workspace = true
 rkyv = { workspace = true, features = ["validation"] }
 serde.workspace = true
 sha2.workspace = true
@@ -65,8 +66,12 @@ base.workspace = true
 
 ext_event_worker.workspace = true
 
+bytes.workspace = true
 ctor.workspace = true
 dotenvy.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 rand.workspace = true
 serial_test.workspace = true
 
