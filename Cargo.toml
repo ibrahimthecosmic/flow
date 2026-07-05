@@ -19,8 +19,6 @@ members = [
   "edge/crates/fs",
   "edge/crates/http_utils",
   "edge/crates/trex_core_stub",
-  "edge/ext/ai",
-  "edge/ext/ai/utilities",
   "edge/ext/env",
   "edge/ext/event_worker",
   "edge/ext/os",
@@ -180,8 +178,6 @@ dotenvy = "0.15.7"
 either = "1"
 enum-as-inner = "0.6.0"
 eszip_trait = { version = "0.1.0", path = "./edge/crates/eszip_trait" }
-ext_ai = { version = "0.1.0", path = "./edge/ext/ai" }
-ext_ai_v8_utilities = { version = "0.1.0", path = "./edge/ext/ai/utilities" }
 ext_env = { version = "0.1.0", path = "./edge/ext/env" }
 ext_event_worker = { version = "0.1.0", path = "./edge/ext/event_worker" }
 # edge references ext_node (trex's name for the node crate) — alias to flow's deno_node
@@ -191,7 +187,6 @@ ext_runtime = { version = "0.1.0", path = "./edge/ext/runtime" }
 ext_workers = { version = "0.1.0", path = "./edge/ext/workers" }
 fs = { version = "0.1.0", path = "./edge/crates/fs" }
 futures-util = "0.3.30"
-fxhash = "0.2"
 http_utils = { version = "0.1.0", path = "./edge/crates/http_utils" }
 http_v02 = { package = "http", version = "0.2.9" }
 hyper_v014 = { package = "hyper", version = "0.14.26", features = ["runtime", "http1"] }

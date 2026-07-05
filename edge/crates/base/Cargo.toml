@@ -29,7 +29,6 @@ deno_facade.workspace = true
 fs.workspace = true
 http_utils.workspace = true
 
-ext_ai.workspace = true
 ext_env.workspace = true
 ext_event_worker.workspace = true
 ext_node.workspace = true
@@ -113,7 +112,6 @@ deno_node_sqlite.workspace = true
 deno_process.workspace = true
 deno_webgpu.workspace = true
 
-ext_ai.workspace = true
 ext_env.workspace = true
 ext_event_worker.workspace = true
 ext_node.workspace = true

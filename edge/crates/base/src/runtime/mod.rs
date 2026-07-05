@@ -1008,7 +1008,6 @@ where
           deno_http::deno_http::lazy_init(),
           deno_io::deno_io::lazy_init(),
           deno_fs::deno_fs::lazy_init(),
-          ext_ai::ai::init(),
           ext_env::env::init(),
           deno_process::deno_process::init(None),
           ext_workers::user_workers::init(),

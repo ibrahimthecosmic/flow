@@ -1,6 +1,5 @@
 import { core, primordials } from "ext:core/mod.js";
 
-import { MAIN_WORKER_API, USER_WORKER_API } from "ext:ai/ai.js";
 import { FLOW_USER_WORKERS } from "ext:user_workers/user_workers.js";
 import { applyFlowTag } from "ext:runtime/http.js";
 import { waitUntil } from "ext:runtime/async_hook.js";
@@ -66,7 +65,6 @@ function installTrexNamespace(kind, terminationRequestTokenRid) {
   switch (kind) {
     case "main":
       propsTrex = {
-        ai: MAIN_WORKER_API,
         userWorkers: FLOW_USER_WORKERS,
         getRuntimeMetrics: () => /* async */ ops.op_runtime_metrics(),
         applyFlowTag: (src, dest) => applyFlowTag(src, dest),
@@ -144,7 +142,6 @@ function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
   switch (kind) {
     case "main":
       props = {
-        ai: MAIN_WORKER_API,
         userWorkers: FLOW_USER_WORKERS,
         getRuntimeMetrics: () => /* async */ ops.op_runtime_metrics(),
         applyFlowTag: (src, dest) => applyFlowTag(src, dest),
@@ -192,7 +189,6 @@ function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
 function installFlowNamespace(_kind, bootstrapContext) {
   let frozenContext;
   const props = {
-    ai: USER_WORKER_API,
     get context() {
       if (frozenContext === undefined) {
         // JSON round-trip: the context is JSON-derived by construction, and

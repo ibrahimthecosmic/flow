@@ -230,8 +230,6 @@ declare const FlowRuntime: {
  * inside USER workers).
  */
 declare const Flow: {
-  /** flow AI APIs (e.g. `new Flow.ai.Session(...)`). */
-  readonly ai: unknown;
   /**
    * The JSON `context` this worker was created with (deep-frozen, memoized).
    * Runtime-owned bootstrap keys are stripped.

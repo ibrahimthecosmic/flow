@@ -47,7 +47,6 @@ core.loadExtScript("ext:deno_fetch/27_eventsource.js");
 core.loadExtScript("ext:deno_webgpu/00_init.js");
 core.loadExtScript("ext:deno_canvas/02_surface.js");
 
-import "ext:ai/onnxruntime/cache_adapter.js";
 import {
   installWasmMemoryTracking,
   startWasmMemoryPolling,

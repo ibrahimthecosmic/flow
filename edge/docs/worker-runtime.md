@@ -24,38 +24,6 @@ FlowRuntime.parentPort.onmessage = (e) => {
 };
 ```
 
-### `Flow.ai` — model inference
-
-`Flow.ai.Session` runs inference from inside a worker:
-
-```ts
-// Built-in embedding model (runs locally via ONNX):
-const session = new Flow.ai.Session("gte-small");
-const embedding = await session.run("the text to embed", {
-  mean_pool: true,
-  normalize: true,
-});
-```
-
-Any other model name uses an external inference server, configured through the
-worker's environment (`envVars` in `create()`):
-
-- `AI_INFERENCE_API_HOST` — base URL of an Ollama or OpenAI-compatible server
-- `AI_INFERENCE_API_KEY` — optional bearer token
-
-```ts
-const session = new Flow.ai.Session("llama3");
-// mode: "ollama" (default) takes a prompt string;
-// mode: "openaicompatible" takes an OpenAI chat-completion body.
-const out = await session.run("Write a haiku about isolates", {
-  mode: "ollama",
-  stream: false,
-  timeout: 60, // seconds
-});
-```
-
-With `stream: true`, `run()` resolves to an async iterable of chunks.
-
 ### Version globals
 
 | Global         | Example                           |
