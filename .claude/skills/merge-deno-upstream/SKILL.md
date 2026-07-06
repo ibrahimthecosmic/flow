@@ -37,10 +37,17 @@ by merging the upgrade branch to `main`, tagging, and deleting the branch (step
 
 1. **Sync + branch (scripted).** Run `tools/sync_upstream.sh <newver> --upgrade`
    (e.g. `tools/sync_upstream.sh 2.10.1 --upgrade`). It adds the `upstream`
-   remote if missing, fetches ONLY the `v<newver>` commit (no tag import — tags
-   would collide with `upgrade/*` branch names), fast-forwards `deno` to it and
-   pushes it, then creates `upgrade/<newver>` off `main` and merges `deno` in.
-   Conflicts are expected — that is the port work below.
+   remote if missing, fetches ONLY the `v<newver>` commit (via
+   `git fetch --no-tags upstream refs/tags/v<newver>` into `FETCH_HEAD` — NO tag
+   is created locally), fast-forwards `deno` to it and pushes it, then creates
+   `upgrade/<newver>` off `main` and merges `deno` in. Conflicts are expected —
+   that is the port work below.
+   **NEVER fetch all upstream tags** (`git fetch upstream` without `--no-tags`,
+   or `git fetch --tags`): denoland ships hundreds, they pollute the local tag
+   namespace, a `v<x>` tag would collide with the `upgrade/<x>` branch, and they
+   later leak onto `origin` (see step 8). Only ever fetch the single target
+   commit by its `refs/tags/<tag>` refspec into `FETCH_HEAD`. If you must fetch
+   manually, mirror the script exactly.
 
 2. **Bring in the new Deno core.** The merge in step 1 brings the root crates
    (`cli/ runtime/ ext/ libs/`) from the `deno` mirror; flow's own root-crate
@@ -106,11 +113,24 @@ by merging the upgrade branch to `main`, tagging, and deleting the branch (step
 8. **Land it.** Once the upgrade branch builds + smoke-tests clean locally:
    ```
    git switch main && git merge --no-ff upgrade/<denover>
-   git tag v<flow-version>        # flow's own version; NOT necessarily <denover>
-   git push origin main --tags    # pushing the Flow tag triggers the build
-   git branch -d upgrade/<denover> && git push origin --delete upgrade/<denover>
+   git tag v<flow-version>              # flow's own version; NOT necessarily <denover>
+   git push origin main                 # branch push does NOT build
+   git push origin refs/tags/v<flow-version>   # push ONLY this tag -> triggers the build
+   git branch -d upgrade/<denover>      # (the upgrade branch is local-only; nothing to delete on origin)
    ```
    Commit per logical step; do not force-push `main`.
+
+   **NEVER `git push origin main --tags` / `git push --tags`.** The local clone
+   still carries Deno's ~434 inherited historical tags (`std/*`, `v0.*`, `v1.*`,
+   `v2.0`–`v2.8.*`), but `origin` must hold ONLY flow release tags. `--tags`
+   publishes all 434 of them AND — because GitHub Actions **suppresses
+   tag-triggered workflows when more than 3 tags are pushed at once** — the flow
+   build never even starts. Always push the single release tag by its full
+   refspec, as above. If junk tags ever leak onto origin, delete them (batched
+   `git push origin :refs/tags/<t>`, keeping only the `vX.Y.Z` releases) and then
+   delete + re-push the release tag ALONE to fire the build. See
+   `flow-release-and-install.md` and `flow-runtime-progress.md` (release
+   gotchas).
 
 **Commit identity:** author commits as the user
 (`MD. Ibrahim <ibrahimthecosmic@gmail.com>`). NEVER add "Claude"/Anthropic as
