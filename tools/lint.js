@@ -735,6 +735,7 @@ async function ensureNoNewTopLevelEntries() {
     "rust-toolchain.toml",
     "flake.nix",
     "flake.lock",
+    "install.sh",
   ]);
 
   const newEntries = currentEntries.filter((e) => !allowed.has(e));

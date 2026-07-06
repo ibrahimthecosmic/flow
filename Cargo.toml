@@ -195,7 +195,9 @@ futures-util = "0.3.30"
 http_utils = { version = "0.1.0", path = "./edge/crates/http_utils" }
 http_v02 = { package = "http", version = "0.2.9" }
 hyper_v014 = { package = "hyper", version = "0.14.26", features = ["runtime", "http1"] }
-reqwest_v011 = { package = "reqwest", version = "0.11", features = ["stream", "json", "multipart"] }
+# default-features = false drops native-tls (openssl-sys), which can't build
+# against the CI sysroot and isn't wanted anyway -- rustls everywhere.
+reqwest_v011 = { package = "reqwest", version = "0.11", default-features = false, features = ["rustls-tls", "stream", "json", "multipart"] }
 rkyv = "0.7"
 serial_test = "3.0.0"
 urlencoding = "2.1.2"
