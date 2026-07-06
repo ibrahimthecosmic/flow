@@ -68,37 +68,40 @@ Before building, install the required prerequisites (Rust, native compilers,
 cmake, protobuf, etc.) and clone with `--recurse-submodules` as described in
 [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md#building-from-source).
 
-### Building Deno
+### Building flow
 
-To compile after making changes:
+The workspace's `default-members` is `edge/cli`, so a bare `cargo build` builds
+the `flow` binary (a drop-in deno replacement with the edge-runtime layer). To
+compile after making changes:
 
 ```bash
 cargo build
 ```
 
-For faster iteration during development (less optimization):
+The resulting binary is at `./target/debug/flow`. To build the plain deno binary
+instead:
 
 ```bash
-cargo build --bin deno
+cargo build -p deno
 ```
 
 Execute your development build:
 
 ```bash
-./target/debug/deno eval 'console.log("Hello from dev build")'
+./target/debug/flow eval 'console.log("Hello from dev build")'
 ```
 
 ### Running with your changes
 
 ```bash
 # Run a local file
-./target/debug/deno run path/to/file.ts
+./target/debug/flow run path/to/file.ts
 
 # Run with permissions
-./target/debug/deno run --allow-net --allow-read script.ts
+./target/debug/flow run --allow-net --allow-read script.ts
 
 # Run the REPL
-./target/debug/deno
+./target/debug/flow
 ```
 
 ## Commands
@@ -106,8 +109,11 @@ Execute your development build:
 ### Compilation and Checks
 
 ```bash
-# Check for compilation errors (fast, no binary output)
+# Check flow (and its deps) for compilation errors (fast, no binary output)
 cargo check
+
+# Check the entire workspace
+cargo check --workspace
 
 # Check specific package
 cargo check -p deno_runtime
@@ -133,24 +139,28 @@ cargo build --release
 
 ### Running Tests
 
+Note: bare `cargo test` only runs flow's own tests (because of
+`default-members`) — use `--workspace` or `-p <package>` to run the test suites
+below.
+
 ```bash
 # Run all tests (this takes a while)
-cargo test
+cargo test --workspace
 
 # Filter tests by name
-cargo test <nameOfTest>
+cargo test --workspace <nameOfTest>
 
 # Run tests in a specific package
 cargo test -p deno_core
 
 # Run just the CLI integration tests
-cargo test --bin deno
+cargo test -p deno --bin deno
 
 # Run spec tests only
-cargo test specs
+cargo test -p specs_tests
 
 # Run a specific spec test
-cargo test spec::test_name
+cargo test -p specs_tests spec::test_name
 ```
 
 ### Unit Tests (`tests/unit/`)
@@ -160,19 +170,19 @@ them via `cargo test`:
 
 ```bash
 # Run all unit tests in a specific file
-cargo test unit::webcrypto_test
+cargo test -p unit_tests unit::webcrypto_test
 
 # Run all unit tests
-cargo test unit::
+cargo test -p unit_tests
 
 # Run Node.js compatibility unit tests (tests/unit_node/)
-cargo test unit_node::crypto_test
+cargo test -p unit_node_tests unit_node::crypto_test
 
 # Run all Node.js compat unit tests
-cargo test unit_node::
+cargo test -p unit_node_tests
 ```
 
-Do NOT run these directly with `./target/debug/deno test` — they depend on the
+Do NOT run these directly with `./target/debug/flow test` — they depend on the
 cargo test harness for correct setup.
 
 ### Test Organization
@@ -304,7 +314,7 @@ cargo outdated  # Requires cargo-outdated
 Use `lldb` directly:
 
 ```bash
-lldb ./target/debug/deno
+lldb ./target/debug/flow
 (lldb) run eval 'console.log("test")'
 ```
 
@@ -316,10 +326,10 @@ Use println debugging.
 
 ```bash
 # Set Rust log level
-DENO_LOG=debug ./target/debug/deno run script.ts
+DENO_LOG=debug ./target/debug/flow run script.ts
 
 # Specific module logging
-DENO_LOG=deno_core=debug ./target/debug/deno run script.ts
+DENO_LOG=deno_core=debug ./target/debug/flow run script.ts
 ```
 
 ### Debug Prints

@@ -3,7 +3,7 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
 /**
- * x - Developer CLI for contributing to Deno
+ * x - Developer CLI for contributing to flow
  *
  * Inspired by Servo's mach tool, this script provides a unified
  * interface for common development tasks like building, testing, and more.
@@ -101,9 +101,8 @@ Under the hood:
 
   return {
     "setup": {
-      description: "Initial setup: build deno and test_server",
-      help:
-        `Sets up the development environment by compiling both the main 'deno'
+      description: "Initial setup: build flow and test_server",
+      help: `Sets up the development environment by compiling the main 'flow'
 binary and the 'test_server' binary used by the test suite.
 
 Run this once after cloning the repository, or after pulling changes that
@@ -111,31 +110,32 @@ modify Rust code, to ensure you have working binaries for development and
 testing.
 
 Under the hood:
-  cargo build --bin deno --bin test_server`,
+  cargo build -p flow -p test_server`,
       async fn(_args: string[]) {
         $.logStep("Setting up development environment...");
-        $.logStep("Building deno and test_server...");
-        await $`cargo build --bin deno --bin test_server`.cwd(root);
+        $.logStep("Building flow and test_server...");
+        await $`cargo build -p flow -p test_server`.cwd(root);
         $.logStep("Setup complete.");
       },
     },
     "build": {
-      description: "Build the deno binary (debug mode)",
-      help: `Compiles the main 'deno' binary in debug mode (unoptimized, with
-debug symbols). The resulting binary is placed at ./target/debug/deno.
+      description: "Build the flow binary (debug mode)",
+      help: `Compiles the main 'flow' binary in debug mode (unoptimized, with
+debug symbols). The resulting binary is placed at ./target/debug/flow.
 
 Use this during normal development iteration. For a release-optimized
-build, run 'cargo build --release' directly.
+build, run 'cargo build --release' directly. To build the plain deno
+binary instead, run 'cargo build -p deno'.
 
 If you only need to check for compilation errors without producing a
 binary, use './x check' instead — it is significantly faster because
 it skips the linking step.
 
 Under the hood:
-  cargo build --bin deno`,
+  cargo build --bin flow`,
       async fn(_args: string[]) {
-        $.logStep("Building Deno...");
-        await $`cargo build --bin deno`.cwd(root);
+        $.logStep("Building flow...");
+        await $`cargo build --bin flow`.cwd(root);
         $.logStep("Build complete.");
       },
     },
@@ -150,10 +150,10 @@ errors, borrow-checker issues, and missing imports without the overhead
 of a full build.
 
 Under the hood:
-  cargo check`,
+  cargo check --workspace`,
       async fn(_args: string[]) {
         $.logStep("Checking (no linking)...");
-        await $`cargo check`.cwd(root);
+        await $`cargo check --workspace`.cwd(root);
         $.logStep("Check complete.");
       },
     },
@@ -215,7 +215,12 @@ Examples:
 Under the hood:
   cargo test -p unit_node_tests --test unit_node -- <filter>`,
     }),
-    "test-compat": cargoTestCommand(root, ["--test", "node_compat"], {
+    "test-compat": cargoTestCommand(root, [
+      "-p",
+      "node_compat_tests",
+      "--test",
+      "node_compat",
+    ], {
       description: "Run Node.js compatibility tests",
       stepName: "Node.js compatibility tests",
       help: `Runs the Node.js compatibility test suite. These tests use actual
@@ -236,7 +241,7 @@ Examples:
   ./x test-compat path      Run tests with "path" in their name
 
 Under the hood:
-  cargo test --test node_compat -- <filter>`,
+  cargo test -p node_compat_tests --test node_compat -- <filter>`,
     }),
     "test-spec": cargoTestCommand(root, [
       "-p",
@@ -332,16 +337,16 @@ Examples:
   ./x test-napi async       Run tests with "async" in their filename
 
 Under the hood:
-  cargo build -p test_napi
-  deno test --allow-read --allow-env --allow-ffi --allow-run \\
+  cargo build -p test_napi -p flow
+  flow test --allow-read --allow-env --allow-ffi --allow-run \\
     --v8-flags=--expose-gc tests/napi/`,
       async fn(args: string[]) {
         $.logStep("Building test_napi native module...");
-        await $`cargo build -p test_napi`.cwd(root);
+        await $`cargo build -p test_napi -p flow`.cwd(root);
         $.logStep("Running NAPI tests...");
         const filter = args.length > 0 ? args.map((a) => `--filter=${a}`) : [];
         await $`${
-          root.join("target/debug/deno").toString()
+          root.join("target/debug/flow").toString()
         } test --allow-read --allow-env --allow-ffi --allow-run --v8-flags=--expose-gc --config ${
           root.join("tests/config/deno.json").toString()
         } --no-lock ${filter} .`.cwd(root.join("tests/napi"));
@@ -398,7 +403,7 @@ Equivalent to running:
 function printHelp(COMMANDS: Record<string, Command>) {
   console.log();
   console.log(
-    `  ${bold(cyan("x"))} ${dim("-")} Developer CLI for contributing to Deno`,
+    `  ${bold(cyan("x"))} ${dim("-")} Developer CLI for contributing to flow`,
   );
   console.log();
   console.log(`  ${bold("USAGE")}`);
@@ -407,7 +412,7 @@ function printHelp(COMMANDS: Record<string, Command>) {
   console.log(`  ${bold("EXAMPLES")}`);
   console.log(
     `    ${dim("$")} ./x ${green("build")}              ${
-      dim("# build the deno binary")
+      dim("# build the flow binary")
     }`,
   );
   console.log(

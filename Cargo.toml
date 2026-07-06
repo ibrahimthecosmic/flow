@@ -101,6 +101,11 @@ members = [
 # feature, which is incompatible with the "session" feature used by the rest of the workspace.
 exclude = ["tests/util/std/hash/_wasm", "tests/sqlite_extension"]
 
+# Bare `cargo build`/`cargo check`/`cargo test` operate on flow (the edge CLI).
+# Use `--workspace` for the whole workspace or `-p <crate>` for other crates
+# (e.g. `cargo build -p deno` for the plain deno binary).
+default-members = ["edge/cli"]
+
 [workspace.package]
 authors = ["the Deno authors"]
 edition = "2024"

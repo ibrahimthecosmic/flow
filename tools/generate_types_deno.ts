@@ -21,7 +21,7 @@ const denoExec = rootDir.join(
 );
 
 $.logStep("Building Deno executable...");
-await $`cargo build`;
+await $`cargo build -p deno`;
 
 $.logStep("Creating declaration file...");
 await createDenoDtsFile();
