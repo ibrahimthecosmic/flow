@@ -1433,6 +1433,7 @@ jobs:
         if: '!(!contains(github.event.pull_request.labels.*.name, ''ci-full'') && github.event_name == ''pull_request'')'
         env:
           DENO_SNAPSHOT_MINIFY_SOURCES: '1'
+          DENO_SKIP_CROSS_BUILD_CHECK: '1'
         run: |-
           df -h
           cargo build --release --locked --target x86_64-unknown-linux-musl -p flow -p denort -p test_server --bin flow --bin denort --bin test_server --features=deno/panic-trace
