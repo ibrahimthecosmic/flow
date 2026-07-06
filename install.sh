@@ -34,16 +34,19 @@ if [ "$arch" != "x86_64" ]; then
 	exit 1
 fi
 
-# Pick the musl build on musl-based systems (e.g. Alpine), the glibc build
-# everywhere else.
-libc="gnu"
+# flow ships glibc binaries only; there is no musl build. On Alpine/musl,
+# use a glibc-based container image (e.g. debian-slim) instead.
 if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
-	libc="musl"
+	echo "error: flow requires glibc; musl-based systems (e.g. Alpine) are not supported." 1>&2
+	echo "Use a glibc-based image such as debian:stable-slim, or build from source: $repo_url#building-from-source" 1>&2
+	exit 1
 elif [ -f /etc/alpine-release ]; then
-	libc="musl"
+	echo "error: flow requires glibc; Alpine Linux is not supported." 1>&2
+	echo "Use a glibc-based image such as debian:stable-slim, or build from source: $repo_url#building-from-source" 1>&2
+	exit 1
 fi
 
-target="x86_64-unknown-linux-${libc}"
+target="x86_64-unknown-linux-gnu"
 
 if [ $# -eq 0 ]; then
 	flow_uri="${repo_url}/releases/latest/download/flow-${target}.zip"

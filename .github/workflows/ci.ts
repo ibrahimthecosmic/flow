@@ -48,12 +48,6 @@ const Runners = {
     arch: "x86_64",
     runner: ubuntuX86Runner,
   },
-  linuxX86Musl: {
-    os: "linux",
-    arch: "x86_64",
-    libc: "musl",
-    runner: ubuntuX86Runner,
-  },
   linuxArm: {
     os: "linux",
     arch: "aarch64",
@@ -224,10 +218,6 @@ function handleBuildItems(items: {
   skip?: Condition | boolean;
   os: "linux" | "macos" | "windows";
   arch: "x86_64" | "aarch64";
-  // C runtime for linux builds. Defaults to "gnu" (glibc). "musl" cross-compiles
-  // a static Alpine-compatible binary against the rusty_v8 fork's prebuilt musl
-  // static lib (served via RUSTY_V8_MIRROR).
-  libc?: "gnu" | "musl";
   runner: string | ExpressionValue;
   profile: string;
   use_sysroot?: boolean;
@@ -287,7 +277,7 @@ const cloneRepoStep = step({
   // cargo cannot resolve the dependency graph unless ../rusty_v8 exists. Every
   // job that runs cargo needs it, so clone it as part of the shared checkout.
   // Single line so it works under both bash and pwsh (lint runs on Windows).
-  // The prebuilt V8 static libs (glibc + musl) are still fetched from
+  // The prebuilt V8 static lib is still fetched from
   // RUSTY_V8_MIRROR at build time.
   name: "Clone rusty_v8 fork (v8 patch dependency)",
   // Must be the `locker-v149.4.0` branch (adds the V8 Locker patch), NOT the
@@ -547,10 +537,11 @@ const preBuildJob = job("pre_build", {
 
 // === build job ===
 
-// flow ships only two Linux binaries: x86_64 glibc (linux-x64) and x86_64 musl
-// (Alpine). macOS/Windows/ARM builds are dropped. The glibc release build runs
-// WPT, the glibc debug build runs the test/lint/wpt suites, and the musl build
-// is a release-only cross-compile that produces the Alpine binary.
+// flow ships a single binary: x86_64 Linux glibc. macOS/Windows/ARM builds are
+// dropped, and there is no musl/Alpine build (the rusty_v8 "musl" prebuilt was
+// glibc-compiled V8 in disguise; for containers use a glibc image such as
+// debian-slim). The release build runs WPT, the debug build runs the
+// test/lint/wpt suites.
 const buildItems = handleBuildItems([{
   ...Runners.linuxX86Xl,
   profile: "release",
@@ -560,10 +551,6 @@ const buildItems = handleBuildItems([{
   ...Runners.linuxX86,
   profile: "debug",
   use_sysroot: true,
-}, {
-  ...Runners.linuxX86Musl,
-  profile: "release",
-  skip_pr: true,
 }]);
 
 const buildJobs = buildItems.map((rawBuildItem) => {
@@ -571,25 +558,11 @@ const buildJobs = buildItems.map((rawBuildItem) => {
   const isLinux = buildItem.os.equals("linux");
   const isWindows = buildItem.os.equals("windows");
   const isMacos = buildItem.os.equals("macos");
-  // libc is known at generation time (plain value on the raw item), so musl
-  // handling is resolved statically rather than as a runtime `if` expression.
-  const libc = (rawBuildItem as { libc?: string }).libc ?? "gnu";
-  const isMusl = libc === "musl";
-  const linuxTriple = `${rawBuildItem.arch}-unknown-linux-${libc}`;
-  // musl builds must cross-compile with an explicit --target so the v8 build
-  // script fetches the musl prebuilt from RUSTY_V8_MIRROR; glibc builds compile
-  // natively for the host (no --target) exactly as before.
-  const cargoTargetFlag = isMusl ? ` --target ${linuxTriple}` : "";
-  // Disambiguate the musl job id/artifacts from the glibc x86_64 build (both are
-  // linux-x86_64 otherwise).
-  const profileName = `${buildItem.profile}-${buildItem.os}${
-    isMusl ? "-musl" : ""
-  }-${buildItem.arch}`;
+  const linuxTriple = `${rawBuildItem.arch}-unknown-linux-gnu`;
+  const profileName = `${buildItem.profile}-${buildItem.os}-${buildItem.arch}`;
   const jobIdForJob = (name: string) => `${name}-${profileName}`;
   const jobNameForJob = (name: string) =>
-    `${name} ${buildItem.profile} ${buildItem.os}${
-      isMusl ? "-musl" : ""
-    }-${buildItem.arch}`;
+    `${name} ${buildItem.profile} ${buildItem.os}-${buildItem.arch}`;
   const createBinaryArtifact = (name: string) => {
     const directory = `target/${buildItem.profile}`;
     const exeExt = rawBuildItem.os === "windows" ? ".exe" : "";
@@ -684,7 +657,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
         const binsToBuild = ["flow", "denort", "test_server"]
           .map((name) => `--bin ${name}`).join(" ");
         const cargoBuildReleaseStep = step
-          // flow always builds its release binaries (glibc + musl). Upstream
+          // flow always builds its release binary. Upstream
           // gated this on isDenoland-or-sysroot to avoid expensive release
           // builds on contributor PRs; for the fork we want every release
           // build item to actually build.
@@ -706,27 +679,11 @@ const buildJobs = buildItems.map((rawBuildItem) => {
               name: "Build release",
               env: {
                 DENO_SNAPSHOT_MINIFY_SOURCES: "1",
-                // The musl binary is a same-arch cross-compile
-                // (x86_64-gnu host -> x86_64-musl target). cli/build.rs
-                // refuses any host != target build because the CLI snapshot
-                // is generated by a host-compiled build script, but the blob
-                // only depends on the architecture/V8 build, not the libc,
-                // so it is binary-compatible here. The "Check flow binary"
-                // step below executes the result as a smoke test.
-                ...(isMusl ? { DENO_SKIP_CROSS_BUILD_CHECK: "1" } : {}),
               },
               run: [
                 // output fs space before and after building
                 "df -h",
-                `cargo build --release --locked${cargoTargetFlag} ${packagesToBuild} ${binsToBuild} --features=deno/panic-trace`,
-                // Cross-compiled musl artifacts land under target/<triple>/release;
-                // copy them into target/release so all downstream packaging/upload
-                // steps (which assume the native path) work unchanged.
-                ...(isMusl
-                  ? [
-                    `cp target/${linuxTriple}/release/{flow,denort,test_server} target/release/`,
-                  ]
-                  : []),
+                `cargo build --release --locked ${packagesToBuild} ${binsToBuild} --features=deno/panic-trace`,
                 "df -h",
               ],
             },
@@ -767,7 +724,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
               name: "Build debug",
               if: isDebug,
               run:
-                `cargo build --locked${cargoTargetFlag} ${packagesToBuild} ${binsToBuild} --features=deno/panic-trace`,
+                `cargo build --locked ${packagesToBuild} ${binsToBuild} --features=deno/panic-trace`,
               env: { CARGO_PROFILE_DEV_DEBUG: 0 },
             },
             cargoBuildReleaseStep,
@@ -798,9 +755,8 @@ const buildJobs = buildItems.map((rawBuildItem) => {
               //   release-latest.txt           the tag; `flow upgrade` reads
               //     it through the `releases/latest/download` redirect to
               //     resolve the newest version
-              // Both release jobs (glibc + musl) run this; whichever lands
-              // first creates the release, and `--clobber` keeps the shared
-              // release-latest.txt upload idempotent.
+              // `gh release create` is guarded so re-runs of the job are
+              // idempotent (`--clobber` re-uploads existing assets).
               name: "Publish release assets",
               if: isRelease.and(isTag),
               env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" },
@@ -852,28 +808,6 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             installPythonStep,
             installRustStep,
           ),
-          // Cross-compilation toolchain for the musl (Alpine) target. musl-tools
-          // provides musl-gcc; the rustup target lets cargo build the static
-          // x86_64-unknown-linux-musl binary.
-          ...(isMusl
-            ? [
-              step({
-                name: "Install musl toolchain",
-                run: [
-                  "sudo apt-get update",
-                  "sudo apt-get install -y --no-install-recommends musl-tools",
-                  // libffi-sys builds its vendored libffi with musl-gcc, whose
-                  // include path lacks the Linux kernel headers (it fails on
-                  // `linux/limits.h`). Symlink them in from linux-libc-dev so
-                  // the musl C build can find them.
-                  "sudo ln -sf /usr/include/linux /usr/include/x86_64-linux-musl/linux",
-                  "sudo ln -sf /usr/include/asm-generic /usr/include/x86_64-linux-musl/asm-generic",
-                  "sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/x86_64-linux-musl/asm",
-                  `rustup target add ${linuxTriple}`,
-                ].join("\n"),
-              }).comesAfter(installRustStep),
-            ]
-            : []),
           cargoBuildStep,
           saveCacheStep.if(buildItem.save_cache),
         );
@@ -1159,9 +1093,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
 
   return {
     buildJob,
-    // The musl build only produces the Alpine release binary; the test/wpt/libs
-    // suites run on the glibc x86_64 builds, so skip them for musl.
-    additionalJobs: isMusl ? [] : additionalJobs,
+    additionalJobs,
   };
 });
 
@@ -1169,7 +1101,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
 
 // flow lints on Linux only. Upstream also lints on macOS/Windows to catch
 // platform-specific #[cfg] clippy issues, but the fork ships only Linux and the
-// rusty_v8 fork publishes prebuilt V8 for gnu/musl only, so clippy on those
+// rusty_v8 fork publishes prebuilt V8 for linux gnu only, so clippy on those
 // runners would try to build V8 from source.
 const lintMatrix = defineMatrix({
   include: [{

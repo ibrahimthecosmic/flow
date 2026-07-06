@@ -12,7 +12,9 @@ It's built on [V8](https://v8.dev/), [Rust](https://www.rust-lang.org/), and
 
 ## Installation
 
-Flow ships prebuilt binaries for Linux x86_64 (glibc and musl/Alpine).
+Flow ships prebuilt binaries for Linux x86_64 (glibc). musl-based systems (e.g.
+Alpine) are not supported -- in containers, use a glibc-based image such as
+`debian:stable-slim`.
 
 Shell:
 
