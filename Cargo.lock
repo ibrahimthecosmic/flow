@@ -5824,6 +5824,8 @@ dependencies = [
  "deno_core",
  "deno_error",
  "deno_facade",
+ "deno_napi",
+ "deno_webgpu",
  "env_logger 0.10.0",
  "ext_event_worker",
  "ext_workers",

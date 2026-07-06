@@ -25,3 +25,7 @@ rustls.workspace = true
 tokio.workspace = true
 
 env_logger = "=0.10.0"
+
+[build-dependencies]
+deno_napi.workspace = true
+deno_webgpu.workspace = true
