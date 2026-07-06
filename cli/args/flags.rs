@@ -1002,8 +1002,8 @@ static DENO_HELP: &str = cstr!(
                   <p(245)>deno test  |  deno test test.ts</>
     <g>pack</>         Create an npm-compatible tarball from a Deno project
                   <p(245)>deno pack  |  deno pack --set-version 1.2.3</>
-    <g>upgrade</>      Upgrade deno executable to given version
-                  <p(245)>deno upgrade  |  deno upgrade 1.45.0  |  deno upgrade canary</>
+    <g>upgrade</>      Upgrade flow executable to given version
+                  <p(245)>flow upgrade  |  flow upgrade 2.9.1</>
 {after-help}
 
 <y>Docs:</> https://docs.deno.com
@@ -4655,39 +4655,29 @@ The declaration file could be saved and used for typing information."
 
 pub static UPGRADE_USAGE: &str = cstr!(
   "<g>Latest</>
-  <bold>deno upgrade</>
+  <bold>flow upgrade</>
 
 <g>Specific version</>
-  <bold>deno upgrade</> <p(245)>1.45.0</>
-  <bold>deno upgrade</> <p(245)>1.46.0-rc.1</>
-  <bold>deno upgrade</> <p(245)>9bc2dd29ad6ba334fd57a20114e367d3c04763d4</>
-
-<g>Channel</>
-  <bold>deno upgrade</> <p(245)>stable</>
-  <bold>deno upgrade</> <p(245)>alpha</>
-  <bold>deno upgrade</> <p(245)>beta</>
-  <bold>deno upgrade</> <p(245)>rc</>
-  <bold>deno upgrade</> <p(245)>canary</>
+  <bold>flow upgrade</> <p(245)>2.9.1</>
 
 <g>From a pull request</> <p(245)>(requires gh CLI)</>
-  <bold>deno upgrade</> <p(245)>pr 12345</>"
+  <bold>flow upgrade</> <p(245)>pr 12345</>"
 );
 
 fn upgrade_subcommand() -> Command {
   command(
     "upgrade",
-    color_print::cformat!("Upgrade deno executable to the given version.
+    color_print::cformat!("Upgrade flow executable to the given version.
 
 {}
 
-The version is resolved via <p(245)>https://dl.deno.land</> and then downloaded
-from either there or GitHub releases, replacing the current executable.
+The version is resolved via GitHub releases
+<p(245)>(https://github.com/ibrahimthecosmic/flow/releases)</> and the new
+binary is downloaded from there, replacing the current executable.
 
-If you want to not replace the current Deno executable but instead download an
+If you want to not replace the current Flow executable but instead download an
 update to a different location, use the <c>--output</> flag:
-  <p(245)>deno upgrade --output $HOME/my_deno</>
-
-<y>Read more:</> <c>https://docs.deno.com/go/upgrade</>", UPGRADE_USAGE),
+  <p(245)>flow upgrade --output $HOME/my_flow</>", UPGRADE_USAGE),
     UnstableArgsConfig::None,
   )
   .hide(cfg!(not(feature = "upgrade")))
@@ -4724,26 +4714,8 @@ update to a different location, use the <c>--output</> flag:
           .help_heading(UPGRADE_HEADING),
       )
       .arg(
-        Arg::new("canary")
-          .long("canary")
-          .help("Upgrade to canary builds")
-          .action(ArgAction::SetTrue)
-          .help_heading(UPGRADE_HEADING)// NOTE(bartlomieju): pre-v1.46 compat
-          .hide(true),
-      )
-      .arg(
-        Arg::new("release-candidate")
-          .long("rc")
-          .help("Upgrade to a release candidate")
-          .conflicts_with_all(["canary", "version"])
-          .action(ArgAction::SetTrue)
-          .help_heading(UPGRADE_HEADING)
-          // NOTE(bartlomieju): pre-v1.46 compat
-          .hide(true),
-      )
-      .arg(
         Arg::new("version-or-hash-or-channel")
-          .help(cstr!("Version <p(245)>(v1.46.0)</>, channel <p(245)>(alpha, beta, rc, canary)</>, commit hash <p(245)>(9bc2dd29ad6ba334fd57a20114e367d3c04763d4)</>, or <p(245)>pr 12345</> to install from a PR"))
+          .help(cstr!("Version <p(245)>(v2.9.1)</> or <p(245)>pr 12345</> to install from a PR"))
           .value_name("VERSION")
           .action(ArgAction::Append)
           .trailing_var_arg(true),
@@ -8216,8 +8188,6 @@ fn upgrade_parse(
 
   let dry_run = matches.get_flag("dry-run");
   let force = matches.get_flag("force");
-  let canary = matches.get_flag("canary");
-  let release_candidate = matches.get_flag("release-candidate");
   let no_delta = matches.get_flag("no-delta");
   let version = matches.remove_one::<String>("version");
   let output = matches.remove_one::<String>("output");
@@ -8234,7 +8204,7 @@ fn upgrade_parse(
     if pr_number.is_none() {
       return Err(clap::Error::raw(
         clap::error::ErrorKind::InvalidValue,
-        "Missing or invalid PR number. Usage: deno upgrade pr <number>\n",
+        "Missing or invalid PR number. Usage: flow upgrade pr <number>\n",
       ));
     }
     (None, pr_number, None)
@@ -8248,8 +8218,10 @@ fn upgrade_parse(
   flags.subcommand = DenoSubcommand::Upgrade(UpgradeFlags {
     dry_run,
     force,
-    release_candidate,
-    canary,
+    // flow only publishes stable releases; the canary/rc flags no longer
+    // exist on the CLI but remain in UpgradeFlags for upstream compat.
+    release_candidate: false,
+    canary: false,
     no_delta,
     version,
     output,
@@ -13544,36 +13516,6 @@ mod tests {
         ..Flags::default()
       }
     );
-  }
-
-  #[test]
-  fn upgrade_release_candidate() {
-    let r = flags_from_vec(svec!["deno", "upgrade", "--rc"]);
-    assert_eq!(
-      r.unwrap(),
-      Flags {
-        subcommand: DenoSubcommand::Upgrade(UpgradeFlags {
-          force: false,
-          dry_run: false,
-          canary: false,
-          no_delta: false,
-          release_candidate: true,
-          version: None,
-          output: None,
-          version_or_hash_or_channel: None,
-          checksum: None,
-          pr: None,
-          branch: None,
-        }),
-        ..Flags::default()
-      }
-    );
-
-    let r = flags_from_vec(svec!["deno", "upgrade", "--rc", "--canary"]);
-    assert!(r.is_err());
-
-    let r = flags_from_vec(svec!["deno", "upgrade", "--rc", "--version"]);
-    assert!(r.is_err());
   }
 
   #[test]

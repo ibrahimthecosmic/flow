@@ -1,6 +1,4 @@
-error: Invalid version passed (asdfasdf)
-
-Pass a semver version.
+error: Flow only publishes stable releases; there is no canary channel.
 
 Usage:
 Latest

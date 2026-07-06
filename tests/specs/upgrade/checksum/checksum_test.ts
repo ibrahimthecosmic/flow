@@ -3,9 +3,9 @@
 
 const version = "99.99.99";
 const target = Deno.build.target;
-const archiveName = `deno-${target}.zip`;
+const archiveName = `flow-${target}.zip`;
 const downloadUrl =
-  `http://localhost:4545/deno-upgrade/download/v${version}/${archiveName}`;
+  `http://localhost:4545/flow-upgrade/download/v${version}/${archiveName}`;
 
 // Fetch the archive and compute its SHA256 checksum
 const response = await fetch(downloadUrl);

@@ -1,6 +1,4 @@
-error: Invalid version passed (asdfasdf)
-
-Pass a semver version.
+error: Flow only publishes stable releases; pre-release versions are not available (2.9.0-rc.1)
 
 Usage:
 Latest

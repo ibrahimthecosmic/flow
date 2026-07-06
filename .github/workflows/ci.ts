@@ -219,7 +219,6 @@ CFLAGS=$CFLAGS
 " > $GITHUB_ENV`,
 };
 
-
 function handleBuildItems(items: {
   skip_pr?: Condition | true;
   skip?: Condition | boolean;
@@ -782,6 +781,42 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             flowArtifact.upload(),
             denortArtifact.upload(),
             testServerArtifact.upload(),
+            {
+              // On a `vX.Y.Z` tag push, attach the flow binary to the GitHub
+              // release. These assets are what `install.sh` and
+              // `flow upgrade` download:
+              //   flow-<triple>.zip            binary (named `flow` inside)
+              //   flow-<triple>.zip.sha256sum  checksum of the zip
+              //   release-latest.txt           the tag; `flow upgrade` reads
+              //     it through the `releases/latest/download` redirect to
+              //     resolve the newest version
+              // Both release jobs (glibc + musl) run this; whichever lands
+              // first creates the release, and `--clobber` keeps the shared
+              // release-latest.txt upload idempotent.
+              name: "Publish release assets",
+              if: isRelease.and(isTag),
+              env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" },
+              run: [
+                'TAG="${GITHUB_REF_NAME}"',
+                // `flow upgrade` compares the running binary's version with
+                // release tags, so a tag that doesn't match the workspace
+                // version would publish a release that can never be selected.
+                `BIN_VERSION="$(target/release/flow --version | head -n 1 | awk '{print $2}')"`,
+                'if [ "v$BIN_VERSION" != "$TAG" ]; then',
+                '  echo "tag $TAG does not match binary version v$BIN_VERSION (bump the version before tagging)"',
+                "  exit 1",
+                "fi",
+                "cd target/release",
+                `zip -q flow-${linuxTriple}.zip flow`,
+                `sha256sum flow-${linuxTriple}.zip > flow-${linuxTriple}.zip.sha256sum`,
+                'echo "$TAG" > release-latest.txt',
+                "cd ../..",
+                'if ! gh release view "$TAG" >/dev/null 2>&1; then',
+                '  gh release create "$TAG" --verify-tag --title "$TAG" --notes "Flow $TAG" || gh release view "$TAG" >/dev/null',
+                "fi",
+                `gh release upload "$TAG" target/release/flow-${linuxTriple}.zip target/release/flow-${linuxTriple}.zip.sha256sum target/release/release-latest.txt --clobber`,
+              ],
+            },
           );
 
         return step.if(buildItem.skip.not())(

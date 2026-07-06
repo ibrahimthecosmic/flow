@@ -1,8 +1,13 @@
 {
   "tests": {
-    "canary": {
-      "args": "upgrade --canary asdfasdf",
-      "output": "canary.out",
+    "channel": {
+      "args": "upgrade canary",
+      "output": "channel.out",
+      "exitCode": 1
+    },
+    "prerelease": {
+      "args": "upgrade 2.9.0-rc.1",
+      "output": "prerelease.out",
       "exitCode": 1
     },
     "version": {
