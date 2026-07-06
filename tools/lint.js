@@ -710,6 +710,7 @@ async function ensureNoNewTopLevelEntries() {
     ".github",
     "x",
     "cli",
+    "doc",
     // flow's edge-runtime layer
     "edge",
     "ext",

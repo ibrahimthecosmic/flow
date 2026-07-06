@@ -17,6 +17,7 @@ jobs:
     outputs:
       skip_build: '${{ steps.check.outputs.skip_build }}'
       skip_deno_core_test: '${{ steps.deno_core_changes.outputs.skip_deno_core_test }}'
+      docs_only: '${{ steps.docs_only_changes.outputs.docs_only }}'
     steps:
       - name: Configure git
         if: github.event_name == 'pull_request'
@@ -48,11 +49,14 @@ jobs:
         run: |-
           git fetch --depth=1 origin ${{ github.event.pull_request.base.sha }}
           deno run -A tools/check_deno_core_changes.js ${{ github.event.pull_request.base.sha }}
+      - id: docs_only_changes
+        if: github.event_name == 'pull_request'
+        run: 'deno run -A tools/check_docs_only_changes.js ${{ github.event.pull_request.base.sha }}'
   build-release-linux-x86_64:
     name: build release linux-x86_64
     needs:
       - pre_build
-    if: needs.pre_build.outputs.skip_build != 'true'
+    if: needs.pre_build.outputs.skip_build != 'true' && needs.pre_build.outputs.docs_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     defaults:
@@ -93,7 +97,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: never_saved
-          restore-keys: 118-cargo-home-linux-x86_64-build-main-
+          restore-keys: 119-cargo-home-linux-x86_64-build-main-
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         if: 'github.ref != ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
@@ -105,7 +109,7 @@ jobs:
             !./target/*/*.zip
             !./target/*/*.tar.gz
           key: never_saved
-          restore-keys: 118-cargo-target-linux-x86_64-release-build-main-
+          restore-keys: 119-cargo-target-linux-x86_64-release-build-main-
       - name: Apply and update mtime cache
         uses: ./.github/mtime_cache
         with:
@@ -320,7 +324,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: '118-cargo-home-linux-x86_64-build-main-${{ github.sha }}'
+          key: '119-cargo-home-linux-x86_64-build-main-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
@@ -331,7 +335,7 @@ jobs:
             !./target/*/gn_root
             !./target/*/*.zip
             !./target/*/*.tar.gz
-          key: '118-cargo-target-linux-x86_64-release-build-main-${{ github.sha }}'
+          key: '119-cargo-target-linux-x86_64-release-build-main-${{ github.sha }}'
   test-release-linux-x86_64:
     name: 'test ${{ matrix.test_crate }} ${{ matrix.shard_label }}release linux-x86_64'
     needs:
@@ -428,7 +432,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: never_saved
-          restore-keys: '118-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-'
+          restore-keys: '119-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-'
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref != ''refs/heads/main'''
@@ -440,7 +444,7 @@ jobs:
             !./target/*/*.zip
             !./target/*/*.tar.gz
           key: never_saved
-          restore-keys: '118-cargo-target-linux-x86_64-release-test-${{ matrix.test_crate }}-'
+          restore-keys: '119-cargo-target-linux-x86_64-release-test-${{ matrix.test_crate }}-'
       - name: Apply and update mtime cache
         uses: ./.github/mtime_cache
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
@@ -643,7 +647,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: '118-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-${{ github.sha }}'
+          key: '119-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref == ''refs/heads/main'''
@@ -654,7 +658,7 @@ jobs:
             !./target/*/gn_root
             !./target/*/*.zip
             !./target/*/*.tar.gz
-          key: '118-cargo-target-linux-x86_64-release-test-${{ matrix.test_crate }}-${{ github.sha }}'
+          key: '119-cargo-target-linux-x86_64-release-test-${{ matrix.test_crate }}-${{ github.sha }}'
   wpt-release-linux-x86_64:
     name: wpt release linux-x86_64
     needs:
@@ -698,7 +702,7 @@ jobs:
             ./target/wpt_input_hash
             ./target/autobahn_input_hash
           key: never_saved
-          restore-keys: 118-wpt-target-linux-x86_64-release-
+          restore-keys: 119-wpt-target-linux-x86_64-release-
       - name: Install Deno
         uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
         if: '!startsWith(github.ref, ''refs/tags/'')'
@@ -741,12 +745,12 @@ jobs:
           path: |-
             ./target/wpt_input_hash
             ./target/autobahn_input_hash
-          key: '118-wpt-target-linux-x86_64-release-${{ github.sha }}'
+          key: '119-wpt-target-linux-x86_64-release-${{ github.sha }}'
   build-debug-linux-x86_64:
     name: build debug linux-x86_64
     needs:
       - pre_build
-    if: needs.pre_build.outputs.skip_build != 'true'
+    if: needs.pre_build.outputs.skip_build != 'true' && needs.pre_build.outputs.docs_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     defaults:
@@ -783,7 +787,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: never_saved
-          restore-keys: 118-cargo-home-linux-x86_64-build-main-
+          restore-keys: 119-cargo-home-linux-x86_64-build-main-
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         if: 'github.ref != ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
@@ -795,7 +799,7 @@ jobs:
             !./target/*/*.zip
             !./target/*/*.tar.gz
           key: never_saved
-          restore-keys: 118-cargo-target-linux-x86_64-debug-build-main-
+          restore-keys: 119-cargo-target-linux-x86_64-debug-build-main-
       - name: Apply and update mtime cache
         uses: ./.github/mtime_cache
         with:
@@ -972,7 +976,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: '118-cargo-home-linux-x86_64-build-main-${{ github.sha }}'
+          key: '119-cargo-home-linux-x86_64-build-main-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
@@ -983,7 +987,7 @@ jobs:
             !./target/*/gn_root
             !./target/*/*.zip
             !./target/*/*.tar.gz
-          key: '118-cargo-target-linux-x86_64-debug-build-main-${{ github.sha }}'
+          key: '119-cargo-target-linux-x86_64-debug-build-main-${{ github.sha }}'
   test-debug-linux-x86_64:
     name: 'test ${{ matrix.test_crate }} ${{ matrix.shard_label }}debug linux-x86_64'
     needs:
@@ -1080,7 +1084,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: never_saved
-          restore-keys: '118-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-'
+          restore-keys: '119-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-'
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref != ''refs/heads/main'''
@@ -1092,7 +1096,7 @@ jobs:
             !./target/*/*.zip
             !./target/*/*.tar.gz
           key: never_saved
-          restore-keys: '118-cargo-target-linux-x86_64-debug-test-${{ matrix.test_crate }}-'
+          restore-keys: '119-cargo-target-linux-x86_64-debug-test-${{ matrix.test_crate }}-'
       - name: Apply and update mtime cache
         uses: ./.github/mtime_cache
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
@@ -1296,7 +1300,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: '118-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-${{ github.sha }}'
+          key: '119-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref == ''refs/heads/main'''
@@ -1307,7 +1311,7 @@ jobs:
             !./target/*/gn_root
             !./target/*/*.zip
             !./target/*/*.tar.gz
-          key: '118-cargo-target-linux-x86_64-debug-test-${{ matrix.test_crate }}-${{ github.sha }}'
+          key: '119-cargo-target-linux-x86_64-debug-test-${{ matrix.test_crate }}-${{ github.sha }}'
   lint:
     name: 'lint ${{ matrix.profile }} ${{ matrix.os }}-${{ matrix.arch }}'
     needs:
@@ -1352,7 +1356,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: never_saved
-          restore-keys: '118-cargo-home-${{ matrix.os }}-${{ matrix.arch }}-lint-'
+          restore-keys: '119-cargo-home-${{ matrix.os }}-${{ matrix.arch }}-lint-'
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         if: 'github.ref != ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
@@ -1364,7 +1368,7 @@ jobs:
             !./target/*/*.zip
             !./target/*/*.tar.gz
           key: never_saved
-          restore-keys: '118-cargo-target-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.profile }}-lint-'
+          restore-keys: '119-cargo-target-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.profile }}-lint-'
       - name: Apply and update mtime cache
         uses: ./.github/mtime_cache
         with:
@@ -1418,7 +1422,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: '118-cargo-home-${{ matrix.os }}-${{ matrix.arch }}-lint-${{ github.sha }}'
+          key: '119-cargo-home-${{ matrix.os }}-${{ matrix.arch }}-lint-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
@@ -1429,12 +1433,12 @@ jobs:
             !./target/*/gn_root
             !./target/*/*.zip
             !./target/*/*.tar.gz
-          key: '118-cargo-target-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.profile }}-lint-${{ github.sha }}'
+          key: '119-cargo-target-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.profile }}-lint-${{ github.sha }}'
   deno-core-test:
     name: deno_core test linux-x86_64
     needs:
       - pre_build
-    if: needs.pre_build.outputs.skip_build != 'true' && needs.pre_build.outputs.skip_deno_core_test != 'true'
+    if: needs.pre_build.outputs.skip_build != 'true' && needs.pre_build.outputs.skip_deno_core_test != 'true' && needs.pre_build.outputs.docs_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
@@ -1471,7 +1475,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: never_saved
-          restore-keys: 118-cargo-home-linux-x86_64-deno-core-test-
+          restore-keys: 119-cargo-home-linux-x86_64-deno-core-test-
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         if: '!startsWith(github.ref, ''refs/tags/'') && github.ref != ''refs/heads/main'''
@@ -1483,7 +1487,7 @@ jobs:
             !./target/*/*.zip
             !./target/*/*.tar.gz
           key: never_saved
-          restore-keys: 118-cargo-target-linux-x86_64-release-deno-core-test-
+          restore-keys: 119-cargo-target-linux-x86_64-release-deno-core-test-
       - name: Apply and update mtime cache
         uses: ./.github/mtime_cache
         if: '!startsWith(github.ref, ''refs/tags/'')'
@@ -1649,7 +1653,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: '118-cargo-home-linux-x86_64-deno-core-test-${{ github.sha }}'
+          key: '119-cargo-home-linux-x86_64-deno-core-test-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: '!startsWith(github.ref, ''refs/tags/'') && github.ref == ''refs/heads/main'''
@@ -1660,12 +1664,12 @@ jobs:
             !./target/*/gn_root
             !./target/*/*.zip
             !./target/*/*.tar.gz
-          key: '118-cargo-target-linux-x86_64-release-deno-core-test-${{ github.sha }}'
+          key: '119-cargo-target-linux-x86_64-release-deno-core-test-${{ github.sha }}'
   deno-core-miri:
     name: deno_core miri linux-x86_64
     needs:
       - pre_build
-    if: needs.pre_build.outputs.skip_build != 'true'
+    if: needs.pre_build.outputs.skip_build != 'true' && needs.pre_build.outputs.docs_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     defaults:
