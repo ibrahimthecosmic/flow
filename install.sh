@@ -72,17 +72,79 @@ chmod +x "$exe"
 rm "$exe.zip"
 
 echo "Flow was installed successfully to $exe"
+echo
 
-if command -v flow >/dev/null; then
+# Pick the shell profile to update.
+case $SHELL in
+*/zsh) shell_profile="$HOME/.zshrc" ;;
+*/bash) shell_profile="$HOME/.bashrc" ;;
+*) shell_profile="$HOME/.profile" ;;
+esac
+
+# Append a block to the profile at most once. Skips if the marker is already
+# present. $1: line to append. Returns 0 if it wrote something.
+add_to_profile() {
+	if [ -f "$shell_profile" ] && grep -qsF "# flow installer" "$shell_profile"; then
+		# Marker exists; only append if this exact line isn't there yet.
+		if grep -qsF "$1" "$shell_profile"; then
+			return 1
+		fi
+		printf '%s\n' "$1" >>"$shell_profile"
+	else
+		printf '\n# flow installer\n%s\n' "$1" >>"$shell_profile"
+	fi
+	return 0
+}
+
+profile_changed=0
+
+# When invoked via `curl ... | sh`, stdin is the pipe, so read prompts from the
+# controlling terminal instead. If there is no tty, fall back to printing manual
+# instructions.
+if [ -r /dev/tty ]; then
+	printf "Add flow to your PATH in %s? [y/N] " "$shell_profile"
+	read -r reply </dev/tty || reply=""
+	case $reply in
+	[Yy]*)
+		if add_to_profile "export PATH=\"$bin_dir:\$PATH\""; then
+			echo "  Added flow to your PATH in $shell_profile"
+			profile_changed=1
+		else
+			echo "  flow is already on your PATH in $shell_profile"
+		fi
+		;;
+	esac
+
+	printf "Add a 'deno' alias for flow (alias deno='flow')? [y/N] "
+	read -r reply </dev/tty || reply=""
+	case $reply in
+	[Yy]*)
+		if add_to_profile "alias deno='flow'"; then
+			echo "  Added 'deno' alias in $shell_profile"
+			profile_changed=1
+		else
+			echo "  'deno' alias is already present in $shell_profile"
+		fi
+		;;
+	esac
+
+	echo
+	if [ "$profile_changed" -eq 1 ]; then
+		echo "Restart your shell or run: source $shell_profile"
+	fi
+	if command -v flow >/dev/null; then
+		echo "Run 'flow --help' to get started"
+	else
+		echo "Run '$exe --help' to get started"
+	fi
+elif command -v flow >/dev/null; then
 	echo "Run 'flow --help' to get started"
 else
-	case $SHELL in
-	/bin/zsh) shell_profile=".zshrc" ;;
-	*) shell_profile=".bashrc" ;;
-	esac
-	echo "Manually add the directory to your \$HOME/$shell_profile (or similar):"
+	echo "Manually add the directory to your profile ($shell_profile or similar):"
 	echo "  export FLOW_INSTALL=\"$flow_install\""
 	echo "  export PATH=\"\$FLOW_INSTALL/bin:\$PATH\""
+	echo "Optionally alias deno to flow:"
+	echo "  alias deno='flow'"
 	echo "Run '$exe --help' to get started"
 fi
 
