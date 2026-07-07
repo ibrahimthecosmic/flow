@@ -65,16 +65,12 @@ declare interface FlowTmpFsConfig {
 }
 
 /**
- * Auth transport for an HttpFS mount: where the opaque token goes on every
- * request. Default: `{ header: "Authorization", scheme: "Bearer" }`.
- */
-declare type FlowHttpFsAuth =
-  | { header: string; scheme?: string }
-  | { query: string };
-
-/**
  * One HttpFS mount: a virtual filesystem backed by any HTTP API implementing
  * the HttpFS Protocol v1 (see edge/docs/httpfs-protocol.md).
+ *
+ * Unknown keys are ignored, so a typo (`header:` for `headers:`) silently
+ * yields a mount with no credentials rather than an error — double-check the
+ * field names when auth doesn't take.
  */
 declare interface FlowHttpFsConfig {
   /** Where the tree appears inside the worker (e.g. `/objects`). Required.
@@ -83,10 +79,14 @@ declare interface FlowHttpFsConfig {
   /** Protocol base URL, including any path prefix
    * (e.g. `https://api.example.com/fs/v1`). */
   baseUrl: string;
-  /** Opaque credential attached to every request. Scoping/revocation is the
-   * server's concern. */
-  token: string;
-  auth?: FlowHttpFsAuth;
+  /** Custom headers attached to every request (e.g. `Authorization`,
+   * `X-CSRF-Token`). Auth/scoping/revocation are the server's concern; the
+   * runtime just forwards what you configure. Omitted on cross-origin redirect
+   * targets (e.g. presigned URLs). */
+  headers?: Record<string, string>;
+  /** Custom query params appended to every request (same cross-origin rule as
+   * `headers`). Avoid protocol-reserved keys (`path`, `cursor`, `uploadId`, …). */
+  query?: Record<string, string>;
 }
 
 /** Deno-style permission set for a user worker (keys are snake_case). */

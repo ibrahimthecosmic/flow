@@ -20,9 +20,9 @@ Design goals, in priority order:
 3. **Backend-agnostic** — implementable over S3-backed stores, databases, plain
    disk, or anything else. Presigned-URL indirection and multipart upload are
    optional capabilities, not requirements.
-4. **Auth-agnostic** — the runtime is configured with an opaque token and where
-   to put it. Account model, roles, scoping, and revocation are entirely the
-   server's concern.
+4. **Auth-agnostic** — the runtime attaches caller-configured headers and query
+   params to every request; it has no notion of authentication. Account model,
+   roles, scoping, and revocation are entirely the server's concern.
 
 ## 1. Transport
 
@@ -35,27 +35,26 @@ Design goals, in priority order:
 - The client sends `accept-encoding` as usual; servers may compress JSON
   responses. File bytes are transferred verbatim.
 
-### 1.1 Authentication
+### 1.1 Custom headers & query
 
-The runtime is configured with an opaque `token` and a transport:
+The runtime is configured with two optional maps of caller-supplied `headers`
+and `query` params — anything auth needs (bearer token, API key, CSRF token,
+workspace id) lives here:
 
 ```jsonc
 // worker create option (see §7)
-"auth": { "header": "Authorization", "scheme": "Bearer" }
-// → Authorization: Bearer <token>
-
-"auth": { "header": "X-Api-Key" }
-// → X-Api-Key: <token>
-
-"auth": { "query": "token" }
-// → ?token=<token> appended to every request
+"headers": { "Authorization": "Bearer <token>", "X-CSRF-Token": "<t>" },
+"query":   { "wsId": "<id>" }
+// → every request carries those headers and ?wsId=<id>
 ```
 
-The client attaches the token to **every** request, including redirects only
+The client attaches both maps to **every** request, including redirects only
 when the redirect target has the same origin as `baseUrl` (a cross-origin
-redirect target, e.g. a presigned URL, is fetched without the token). Servers
-respond `401` for missing/invalid tokens and `403` for valid tokens lacking
-permission for the specific operation.
+redirect target, e.g. a presigned URL, is fetched with neither). Custom `query`
+keys are appended alongside protocol params — avoid the reserved names in §5
+(`path`, `cursor`, `uploadId`, `partNumber`, `contentType`, `overwrite`,
+`parents`, `recursive`). Servers respond `401` for missing/invalid credentials
+and `403` for valid credentials lacking permission for the specific operation.
 
 ## 2. Paths
 
@@ -208,8 +207,8 @@ POST /upload?path=&contentType=&sizeHint=
 
 POST /upload/part?uploadId=&partNumber=&size=
 → { "url": "https://...", "expiresAtMs": 1730000000000 }
-   (client PUTs the part bytes to `url` — same-origin: token attached;
-    cross-origin e.g. presigned: token omitted. Response's `etag` header is
+   (client PUTs the part bytes to `url` — same-origin: configured headers/query
+    attached; cross-origin e.g. presigned: omitted. Response's `etag` header is
     retained per part)
 
 POST /upload/commit?uploadId=
@@ -279,9 +278,8 @@ FlowRuntime.userWorkers.create({
     {
       mountPoint: "/objects",
       baseUrl: "https://api.example.com/fs/v1",
-      token: "<opaque>",
-      auth: { header: "Authorization", scheme: "Bearer" },
-      // auth: { query: "token" }  — alternative transport
+      headers: { Authorization: "Bearer <opaque>" },
+      query: { wsId: "<id>" }, // optional; both maps are optional
     }
   ],
 })
@@ -297,10 +295,10 @@ round trip — worker wall-clock timeouts keep running).
 The conformance suite (`edge/crates/fs/tests/httpfs_conformance.rs`) runs the
 Rust client against an in-process mock server that acts as the reference
 implementation of this protocol. It exercises every endpoint, the error/errno
-mappings, both auth transports, redirect handling (including credential
-stripping on cross-origin targets), pagination, ranged reads, overwrite flags,
-capability gating (version refusal, copy fallback, multipart vs. `EFBIG`), and
-the sync fs surface. Run it with:
+mappings, custom headers and query params (including same-origin attachment and
+cross-origin stripping), redirect handling, pagination, ranged reads, overwrite
+flags, capability gating (version refusal, copy fallback, multipart vs.
+`EFBIG`), and the sync fs surface. Run it with:
 
 ```
 cargo test -p fs --test httpfs_conformance

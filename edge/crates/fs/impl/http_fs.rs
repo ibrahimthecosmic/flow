@@ -43,6 +43,7 @@ use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use futures::future::LocalBoxFuture;
 use futures::future::Shared;
+use indexmap::IndexMap;
 use reqwest::Method;
 use reqwest::StatusCode;
 use reqwest::header;
@@ -73,29 +74,6 @@ const RETRY_DELAY: Duration = Duration::from_millis(200);
 
 type BackgroundTask = Shared<BoxFuture<'static, Result<(), Arc<JoinError>>>>;
 
-/// Auth transport: where the opaque token goes on every request
-/// (protocol §1.1).
-#[derive(Deserialize, Serialize, Debug, Clone)]
-#[serde(untagged)]
-pub enum HttpFsAuth {
-  Header {
-    header: String,
-    scheme: Option<String>,
-  },
-  Query {
-    query: String,
-  },
-}
-
-impl Default for HttpFsAuth {
-  fn default() -> Self {
-    Self::Header {
-      header: "Authorization".to_string(),
-      scheme: Some("Bearer".to_string()),
-    }
-  }
-}
-
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpFsConfig {
@@ -103,9 +81,13 @@ pub struct HttpFsConfig {
   /// mount point.
   mount_point: String,
   base_url: String,
-  token: String,
+  /// Custom headers attached to every request (e.g. `Authorization`,
+  /// `X-CSRF-Token`). Auth is the caller's concern, not the protocol's.
   #[serde(default)]
-  auth: HttpFsAuth,
+  headers: IndexMap<String, String>,
+  /// Custom query params appended to every request (protocol §1.1).
+  #[serde(default)]
+  query: IndexMap<String, String>,
 }
 
 /// One or many HttpFS mounts (the `httpFs` worker create option).
@@ -269,8 +251,11 @@ pub struct HttpFs {
 struct HttpFsInner {
   client: reqwest::Client,
   base_url: Url,
-  token: String,
-  auth: HttpFsAuth,
+  /// Custom headers attached to every same-origin request. Pre-parsed so an
+  /// invalid name/value fails at mount creation, not on the first fs op.
+  headers: header::HeaderMap,
+  /// Custom query pairs appended to every same-origin request.
+  query: Vec<(String, String)>,
   capabilities: tokio::sync::OnceCell<Capabilities>,
   cache: Mutex<MetaCache>,
   /// Flush tasks spawned by dropped file handles (see [`HttpObject`]'s `Drop`
@@ -304,9 +289,23 @@ impl HttpFs {
       config.base_url
     );
 
+    let headers = config
+      .headers
+      .iter()
+      .map(|(name, value)| {
+        let name = header::HeaderName::try_from(name.as_str())
+          .with_context(|| format!("invalid HttpFS header name: {name}"))?;
+        let value = header::HeaderValue::try_from(value.as_str())
+          .with_context(|| {
+            format!("invalid HttpFS header value for: {name}")
+          })?;
+        Ok((name, value))
+      })
+      .collect::<Result<header::HeaderMap, anyhow::Error>>()?;
+
     let client = reqwest::Client::builder()
-      // Redirects are handled manually so the token can be stripped from
-      // cross-origin targets (presigned URLs); reqwest only strips a fixed
+      // Redirects are handled manually so custom headers/query can be stripped
+      // from cross-origin targets (presigned URLs); reqwest only strips a fixed
       // set of sensitive headers, not custom ones like `X-Api-Key`.
       .redirect(reqwest::redirect::Policy::none())
       // Requests are driven from several runtimes (the worker's runtime for
@@ -322,8 +321,8 @@ impl HttpFs {
       inner: Arc::new(HttpFsInner {
         client,
         base_url,
-        token: config.token,
-        auth: config.auth,
+        headers,
+        query: config.query.into_iter().collect(),
         capabilities: tokio::sync::OnceCell::new(),
         cache: Mutex::default(),
         background_tasks: Mutex::default(),
@@ -428,9 +427,8 @@ impl HttpFsInner {
     (at.elapsed() < META_CACHE_TTL).then(|| entries.clone())
   }
 
-  /// Builds a request against a protocol endpoint, attaching the query
-  /// parameters and the credential (header transport is applied here; the
-  /// query transport is appended alongside `params`).
+  /// Builds a request against a protocol endpoint, attaching the protocol
+  /// query `params`, the caller's custom query pairs, and the custom headers.
   fn request(
     &self,
     method: Method,
@@ -449,29 +447,21 @@ impl HttpFsInner {
       for (name, value) in params {
         pairs.append_pair(name, value);
       }
-      if let HttpFsAuth::Query { query } = &self.auth {
-        pairs.append_pair(query, &self.token);
+      for (name, value) in &self.query {
+        pairs.append_pair(name, value);
       }
     }
 
-    self.authorize_header(self.client.request(method, url))
+    self.apply_headers(self.client.request(method, url))
   }
 
-  fn authorize_header(
+  /// Attaches the caller's custom headers. Applied per-request (never as client
+  /// defaults) so cross-origin redirect/presigned targets never inherit them.
+  fn apply_headers(
     &self,
     req: reqwest::RequestBuilder,
   ) -> reqwest::RequestBuilder {
-    match &self.auth {
-      HttpFsAuth::Header { header, scheme } => req.header(
-        header.as_str(),
-        match scheme {
-          Some(scheme) => format!("{scheme} {}", self.token),
-          None => self.token.clone(),
-        },
-      ),
-
-      HttpFsAuth::Query { .. } => req,
-    }
+    req.headers(self.headers.clone())
   }
 
   async fn send(
@@ -581,13 +571,16 @@ impl HttpFsInner {
       .map_err(|err| FsError::Io(io::Error::other(err)))?;
     let same_origin = target.origin() == self.base_url.origin();
 
-    if same_origin && let HttpFsAuth::Query { query } = &self.auth {
-      target.query_pairs_mut().append_pair(query, &self.token);
+    if same_origin {
+      let mut pairs = target.query_pairs_mut();
+      for (name, value) in &self.query {
+        pairs.append_pair(name, value);
+      }
     }
 
     let mut req = self.client.get(target);
     if same_origin {
-      req = self.authorize_header(req);
+      req = self.apply_headers(req);
     }
 
     self.send_idempotent(apply_range(req, range)).await
@@ -816,13 +809,16 @@ impl HttpFsInner {
       let same_origin = target.origin() == self.base_url.origin();
 
       let mut target = target;
-      if same_origin && let HttpFsAuth::Query { query } = &self.auth {
-        target.query_pairs_mut().append_pair(query, &self.token);
+      if same_origin {
+        let mut pairs = target.query_pairs_mut();
+        for (name, value) in &self.query {
+          pairs.append_pair(name, value);
+        }
       }
 
       let mut req = self.client.put(target);
       if same_origin {
-        req = self.authorize_header(req);
+        req = self.apply_headers(req);
       }
 
       let resp =
@@ -2304,52 +2300,44 @@ mod test {
 
   use deno_core::serde_json;
 
-  use super::HttpFsAuth;
   use super::HttpFsConfigs;
   use super::protocol_path;
 
   #[test]
   fn http_fs_configs_accepts_object_or_array() {
+    // Bare config: headers/query default to empty.
     let one: HttpFsConfigs = serde_json::from_value(serde_json::json!({
       "mountPoint": "/objects",
       "baseUrl": "https://api.example.com/fs/v1",
-      "token": "meow",
     }))
     .unwrap();
     let mut one = one.into_vec();
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].take_mount_point(), "/objects");
-    assert!(matches!(
-      &one[0].auth,
-      HttpFsAuth::Header { header, scheme: Some(scheme) }
-        if header == "Authorization" && scheme == "Bearer"
-    ));
+    assert!(one[0].headers.is_empty());
+    assert!(one[0].query.is_empty());
 
     let many: HttpFsConfigs = serde_json::from_value(serde_json::json!([
       {
         "mountPoint": "/a",
         "baseUrl": "https://api.example.com/fs/v1",
-        "token": "meow",
-        "auth": { "header": "X-Api-Key" },
+        "headers": { "Authorization": "Bearer meow", "X-Api-Key": "woof" },
       },
       {
         "mountPoint": "/b",
         "baseUrl": "https://api.example.com/fs/v1",
-        "token": "meow",
-        "auth": { "query": "token" },
+        "query": { "token": "meow", "wsId": "42" },
       },
     ]))
     .unwrap();
     let many = many.into_vec();
     assert_eq!(many.len(), 2);
-    assert!(matches!(
-      &many[0].auth,
-      HttpFsAuth::Header { header, scheme: None } if header == "X-Api-Key"
-    ));
-    assert!(matches!(
-      &many[1].auth,
-      HttpFsAuth::Query { query } if query == "token"
-    ));
+    assert_eq!(many[0].headers.get("Authorization").unwrap(), "Bearer meow");
+    assert_eq!(many[0].headers.get("X-Api-Key").unwrap(), "woof");
+    assert!(many[0].query.is_empty());
+    assert_eq!(many[1].query.get("token").unwrap(), "meow");
+    assert_eq!(many[1].query.get("wsId").unwrap(), "42");
+    assert!(many[1].headers.is_empty());
   }
 
   #[test]

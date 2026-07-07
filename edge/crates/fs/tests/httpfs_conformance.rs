@@ -63,13 +63,15 @@ const OPEN_APPEND: OpenOptions = OpenOptions {
   custom_flags: None,
 };
 
-#[derive(Clone, Debug, PartialEq)]
-enum MockAuth {
-  /// Expects `<name>: <value>` verbatim.
-  Header { name: &'static str, value: String },
-  /// Expects `?<name>=<value>`.
-  Query { name: &'static str, value: String },
-}
+/// Custom headers the client is configured with and must attach to every
+/// same-origin request. Names are lowercase — hyper normalizes incoming header
+/// names, and `http::HeaderName` sends them lowercased on the wire.
+const CRED_HEADERS: &[(&str, &str)] = &[
+  ("authorization", "Bearer s3cr3t-t0k3n"),
+  ("x-csrf-token", "csrf-v4l"),
+];
+/// Custom query pairs the client must append to every same-origin request.
+const CRED_QUERY: &[(&str, &str)] = &[("wsId", "ws-42"), ("region", "us-1")];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ReadMode {
@@ -91,7 +93,6 @@ struct State {
   multipart: bool,
   copy: bool,
 
-  auth: MockAuth,
   read_mode: ReadMode,
   cross_origin_base: Option<String>,
   /// One-shot status returned for the next protocol request.
@@ -99,13 +100,13 @@ struct State {
 
   /// `"<METHOD> <endpoint>"` for every protocol request received.
   log: Vec<String>,
-  /// Whether any credential (header or `token` query pair) accompanied a
-  /// cross-origin blob request.
+  /// Whether any configured header or query pair accompanied a cross-origin
+  /// blob request.
   cross_origin_saw_credential: bool,
 }
 
 impl State {
-  fn new(auth: MockAuth) -> Self {
+  fn new() -> Self {
     Self {
       files: HashMap::new(),
       dirs: HashSet::from(["/".to_string()]),
@@ -115,7 +116,6 @@ impl State {
       direct_write_max_bytes: 0,
       multipart: false,
       copy: true,
-      auth,
       read_mode: ReadMode::Direct,
       cross_origin_base: None,
       fail_next: None,
@@ -254,13 +254,35 @@ fn range_response(data: &[u8], range: Option<&str>) -> Response<Full<Bytes>> {
     .unwrap()
 }
 
-fn has_any_credential(
+/// True only if EVERY configured header and query pair rode along, correct —
+/// the client must attach the whole set to every same-origin request.
+fn credentials_ok(
   req: &Request<Incoming>,
   params: &HashMap<String, String>,
 ) -> bool {
-  req.headers().contains_key("authorization")
-    || req.headers().contains_key("x-api-key")
-    || params.contains_key("token")
+  CRED_HEADERS.iter().all(|(name, value)| {
+    req
+      .headers()
+      .get(*name)
+      .and_then(|it| it.to_str().ok())
+      .is_some_and(|it| it == *value)
+  }) && CRED_QUERY
+    .iter()
+    .all(|(name, value)| params.get(*name).is_some_and(|it| it == *value))
+}
+
+/// True if ANY configured header or query key rode along — used to prove a
+/// cross-origin target received NONE of them.
+fn saw_any_credential(
+  req: &Request<Incoming>,
+  params: &HashMap<String, String>,
+) -> bool {
+  CRED_HEADERS
+    .iter()
+    .any(|(name, _)| req.headers().contains_key(*name))
+    || CRED_QUERY
+      .iter()
+      .any(|(name, _)| params.contains_key(*name))
 }
 
 async fn handle(
@@ -277,7 +299,7 @@ async fn handle(
   // the client is expected to keep attaching it.
   if let Some(blob_path) = uri_path.strip_prefix("/blob") {
     let mut state = state.lock().unwrap();
-    if has_any_credential(&req, &params) {
+    if saw_any_credential(&req, &params) {
       state.cross_origin_saw_credential = true;
     }
 
@@ -296,7 +318,7 @@ async fn handle(
   // Same-origin blob route: the credential MUST still be attached.
   if let Some(blob_path) = uri_path.strip_prefix("/fs/v1/authed-blob") {
     let state = state.lock().unwrap();
-    if !auth_ok(&state.auth, &req, &params) {
+    if !credentials_ok(&req, &params) {
       return Ok(error_response(StatusCode::UNAUTHORIZED, "Unauthenticated"));
     }
 
@@ -328,7 +350,7 @@ async fn handle(
       ));
     }
 
-    if !auth_ok(&state.auth, &req, &params) {
+    if !credentials_ok(&req, &params) {
       return Ok(error_response(StatusCode::UNAUTHORIZED, "Unauthenticated"));
     }
   }
@@ -343,23 +365,6 @@ async fn handle(
   let mut state = state.lock().unwrap();
   let resp = route(&mut state, addr, &method, &endpoint, &params, range, body);
   Ok(resp)
-}
-
-fn auth_ok(
-  auth: &MockAuth,
-  req: &Request<Incoming>,
-  params: &HashMap<String, String>,
-) -> bool {
-  match auth {
-    MockAuth::Header { name, value } => req
-      .headers()
-      .get(*name)
-      .and_then(|it| it.to_str().ok())
-      .is_some_and(|it| it == value),
-    MockAuth::Query { name, value } => {
-      params.get(*name).is_some_and(|it| it == value)
-    }
-  }
 }
 
 fn route(
@@ -697,45 +702,28 @@ async fn spawn_server(state: SharedState) -> SocketAddr {
   addr
 }
 
-const TOKEN: &str = "s3cr3t-t0k3n";
-
-fn bearer_auth() -> MockAuth {
-  MockAuth::Header {
-    name: "authorization",
-    value: format!("Bearer {TOKEN}"),
-  }
-}
-
-fn http_fs_config(addr: SocketAddr, auth: serde_json::Value) -> HttpFsConfig {
+fn http_fs_config(addr: SocketAddr) -> HttpFsConfig {
+  let headers: serde_json::Map<String, serde_json::Value> = CRED_HEADERS
+    .iter()
+    .map(|(name, value)| (name.to_string(), json!(value)))
+    .collect();
+  let query: serde_json::Map<String, serde_json::Value> = CRED_QUERY
+    .iter()
+    .map(|(name, value)| (name.to_string(), json!(value)))
+    .collect();
   serde_json::from_value(json!({
     "mountPoint": "/objects",
     "baseUrl": format!("http://{addr}/fs/v1"),
-    "token": TOKEN,
-    "auth": auth,
+    "headers": headers,
+    "query": query,
   }))
   .unwrap()
 }
 
 async fn setup(state: State) -> (HttpFs, SharedState, SocketAddr) {
-  let auth_json = match &state.auth {
-    MockAuth::Header { name, value } => {
-      if let Some(scheme) = value.strip_suffix(TOKEN) {
-        let scheme = scheme.trim();
-        if scheme.is_empty() {
-          json!({ "header": name })
-        } else {
-          json!({ "header": name, "scheme": scheme })
-        }
-      } else {
-        panic!("mock auth value must end with the token");
-      }
-    }
-    MockAuth::Query { name, .. } => json!({ "query": name }),
-  };
-
   let state = Arc::new(Mutex::new(state));
   let addr = spawn_server(state.clone()).await;
-  let fs = HttpFs::new(http_fs_config(addr, auth_json)).unwrap();
+  let fs = HttpFs::new(http_fs_config(addr)).unwrap();
 
   (fs, state, addr)
 }
@@ -759,7 +747,7 @@ async fn read(fs: &HttpFs, path: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn roundtrip_write_stat_read_list_remove() {
-  let (fs, _state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, _state, _) = setup(State::new()).await;
 
   fs.mkdir_async(checked("reports"), true, None)
     .await
@@ -794,24 +782,11 @@ async fn roundtrip_write_stat_read_list_remove() {
 }
 
 #[tokio::test]
-async fn auth_header_without_scheme() {
-  let (fs, _state, _) = setup(State::new(MockAuth::Header {
-    name: "x-api-key",
-    value: TOKEN.to_string(),
-  }))
-  .await;
-
-  write(&fs, "a.txt", b"data").await;
-  assert_eq!(read(&fs, "a.txt").await, b"data");
-}
-
-#[tokio::test]
-async fn auth_query_transport() {
-  let (fs, _state, _) = setup(State::new(MockAuth::Query {
-    name: "token",
-    value: TOKEN.to_string(),
-  }))
-  .await;
+async fn custom_headers_and_query_attached() {
+  // Every protocol request 401s unless ALL configured headers AND query pairs
+  // are present (`credentials_ok`), so a successful roundtrip proves the whole
+  // set — multiple headers and multiple query pairs — attaches together.
+  let (fs, _state, _) = setup(State::new()).await;
 
   write(&fs, "a.txt", b"data").await;
   assert_eq!(read(&fs, "a.txt").await, b"data");
@@ -819,7 +794,7 @@ async fn auth_query_transport() {
 
 #[tokio::test]
 async fn capabilities_version_gate() {
-  let mut state = State::new(bearer_auth());
+  let mut state = State::new();
   state.caps_version = 2;
   let (fs, _state, _) = setup(state).await;
 
@@ -835,7 +810,7 @@ async fn capabilities_version_gate() {
 
 #[tokio::test]
 async fn errno_mappings() {
-  let (fs, _state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, _state, _) = setup(State::new()).await;
 
   // ENOENT
   let err = fs.stat_async(checked("missing")).await.err().unwrap();
@@ -889,10 +864,10 @@ async fn errno_mappings() {
 #[tokio::test]
 async fn read_redirect_cross_origin_strips_credential() {
   // A second origin (different port) hosting the blobs.
-  let blob_state = Arc::new(Mutex::new(State::new(bearer_auth())));
+  let blob_state = Arc::new(Mutex::new(State::new()));
   let blob_addr = spawn_server(blob_state.clone()).await;
 
-  let mut state = State::new(bearer_auth());
+  let mut state = State::new();
   state.read_mode = ReadMode::RedirectCrossOrigin;
   state.cross_origin_base = Some(format!("http://{blob_addr}"));
   let (fs, state, _) = setup(state).await;
@@ -910,7 +885,7 @@ async fn read_redirect_cross_origin_strips_credential() {
 
 #[tokio::test]
 async fn read_redirect_same_origin_keeps_credential() {
-  let mut state = State::new(bearer_auth());
+  let mut state = State::new();
   state.read_mode = ReadMode::RedirectSameOrigin;
   let (fs, _state, _) = setup(state).await;
 
@@ -923,7 +898,7 @@ async fn read_redirect_same_origin_keeps_credential() {
 
 #[tokio::test]
 async fn copy_uses_capability_when_declared() {
-  let (fs, state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, state, _) = setup(State::new()).await;
 
   write(&fs, "src.txt", b"copy me").await;
   fs.copy_file_async(checked("src.txt"), checked("dst.txt"))
@@ -944,7 +919,7 @@ async fn copy_uses_capability_when_declared() {
 
 #[tokio::test]
 async fn copy_falls_back_to_read_write_without_capability() {
-  let mut state = State::new(bearer_auth());
+  let mut state = State::new();
   state.copy = false;
   let (fs, state, _) = setup(state).await;
 
@@ -967,7 +942,7 @@ async fn copy_falls_back_to_read_write_without_capability() {
 
 #[tokio::test]
 async fn cp_copies_directories_recursively() {
-  let (fs, _state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, _state, _) = setup(State::new()).await;
 
   write(&fs, "tree/a.txt", b"a").await;
   write(&fs, "tree/sub/b.txt", b"b").await;
@@ -982,7 +957,7 @@ async fn cp_copies_directories_recursively() {
 
 #[tokio::test]
 async fn rename_moves_files_and_directories() {
-  let (fs, _state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, _state, _) = setup(State::new()).await;
 
   write(&fs, "old.txt", b"payload").await;
   fs.rename_async(checked("old.txt"), checked("new.txt"))
@@ -1002,7 +977,7 @@ async fn rename_moves_files_and_directories() {
 
 #[tokio::test]
 async fn list_paginates_with_cursor() {
-  let (fs, state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, state, _) = setup(State::new()).await;
 
   for idx in 0..5 {
     write(&fs, &format!("many/f{idx}.txt"), b"x").await;
@@ -1030,7 +1005,7 @@ async fn list_paginates_with_cursor() {
 
 #[tokio::test]
 async fn ranged_read_at() {
-  let (fs, _state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, _state, _) = setup(State::new()).await;
 
   write(&fs, "a.txt", b"0123456789").await;
 
@@ -1048,7 +1023,7 @@ async fn ranged_read_at() {
 
 #[tokio::test]
 async fn multipart_upload_over_direct_write_limit() {
-  let mut state = State::new(bearer_auth());
+  let mut state = State::new();
   state.direct_write_max_bytes = 8;
   state.multipart = true;
   let (fs, state, _) = setup(state).await;
@@ -1070,7 +1045,7 @@ async fn multipart_upload_over_direct_write_limit() {
 
 #[tokio::test]
 async fn oversized_write_without_multipart_is_efbig() {
-  let mut state = State::new(bearer_auth());
+  let mut state = State::new();
   state.direct_write_max_bytes = 8;
   let (fs, _state, _) = setup(state).await;
 
@@ -1087,7 +1062,7 @@ async fn oversized_write_without_multipart_is_efbig() {
 
 #[tokio::test]
 async fn idempotent_requests_retry_on_500() {
-  let (fs, state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, state, _) = setup(State::new()).await;
 
   write(&fs, "a.txt", b"data").await;
   fs.flush_background_tasks().await;
@@ -1099,7 +1074,7 @@ async fn idempotent_requests_retry_on_500() {
 
 #[tokio::test]
 async fn append_rewrites_with_existing_content() {
-  let (fs, _state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, _state, _) = setup(State::new()).await;
 
   write(&fs, "log.txt", b"hello").await;
 
@@ -1116,7 +1091,7 @@ async fn append_rewrites_with_existing_content() {
 
 #[tokio::test]
 async fn truncate_shrinks_and_extends() {
-  let (fs, _state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, _state, _) = setup(State::new()).await;
 
   write(&fs, "a.txt", b"0123456789").await;
 
@@ -1132,7 +1107,7 @@ async fn truncate_shrinks_and_extends() {
 
 #[tokio::test]
 async fn realpath_and_exists() {
-  let (fs, _state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, _state, _) = setup(State::new()).await;
 
   write(&fs, "dir/a.txt", b"x").await;
 
@@ -1152,7 +1127,7 @@ async fn realpath_and_exists() {
 // call parks the calling thread while the mock server must keep serving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_surface_works() {
-  let (fs, _state, _) = setup(State::new(bearer_auth())).await;
+  let (fs, _state, _) = setup(State::new()).await;
 
   let fs_clone = fs.clone();
   tokio::task::spawn_blocking(move || {
