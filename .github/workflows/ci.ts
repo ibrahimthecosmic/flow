@@ -360,8 +360,10 @@ function createCargoCacheHomeStep(m: {
   });
 
   return {
-    restoreCacheStep: steps.restoreCacheStep.if(isNotTag),
-    saveCacheStep: steps.saveCacheStep.if(isMainBranch.and(isNotTag)),
+    // Option A (edge/plans/ci-option-a-lean-tag-pipeline.md): restore always
+    // and also save on tags, so each tag build warms the cache for the next.
+    restoreCacheStep: steps.restoreCacheStep,
+    saveCacheStep: steps.saveCacheStep.if(isMainBranch.or(isTag)),
   };
 }
 
@@ -396,13 +398,18 @@ function createCacheSteps(m: {
   return {
     restoreCacheStep: step(
       cargoHomeCacheSteps.restoreCacheStep,
-      buildCacheSteps.restoreCacheStep.if(isMainBranch.not().and(isNotTag)),
+      // Option A (edge/plans/ci-option-a-lean-tag-pipeline.md): restore always;
+      // the `restore-keys: <prefix>-` fallback picks up the previous tag's
+      // `./target` (incl. the ThinLTO cache) so tag builds go incremental.
+      buildCacheSteps.restoreCacheStep,
       // this should always be done when saving OR restoring
       mtimeCacheAndRestoreStep,
     ),
     saveCacheStep: step(
       cargoHomeCacheSteps.saveCacheStep,
-      buildCacheSteps.saveCacheStep.if(isMainBranch.and(isNotTag)),
+      // Option A: save on tags too (only build-release reaches here on a tag,
+      // so there is no cache-key contention with the no-op test jobs).
+      buildCacheSteps.saveCacheStep.if(isMainBranch.or(isTag)),
     ),
   };
 }
@@ -564,11 +571,15 @@ const buildItems = handleBuildItems([{
   profile: "release",
   use_sysroot: true,
   wpt: isNotTag,
-}, {
-  ...Runners.linuxX86,
-  profile: "debug",
-  use_sysroot: true,
-}]);
+} // Option A (edge/plans/ci-option-a-lean-tag-pipeline.md): debug build disabled.
+  // On the tags-only trigger its test consumers (all isNotTag-gated) never run,
+  // so the debug artifacts are unused. Re-enable together with a PR/main trigger.
+  // {
+  //   ...Runners.linuxX86,
+  //   profile: "debug",
+  //   use_sysroot: true,
+  // },
+]);
 
 const buildJobs = buildItems.map((rawBuildItem) => {
   const buildItem = defineExprObj(rawBuildItem);

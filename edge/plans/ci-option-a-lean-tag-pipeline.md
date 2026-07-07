@@ -1,6 +1,8 @@
 # CI Option A — Lean tag pipeline (comment-out, don't delete)
 
-Status: **planned, not yet implemented**
+Status: **implemented 2026-07-07** — steps 1 (debug build disabled) and 2 (tag
+caching fixed) applied to `ci.ts`; step 3 (commenting the standalone
+`deno-core-*` no-op jobs) deferred per the recommendation below.
 
 ## Background
 

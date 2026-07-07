@@ -87,7 +87,6 @@ jobs:
           deno-version: v2.x
       - name: Restore cache cargo home
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'')'
         with:
           path: |-
             ~/.cargo/.crates.toml
@@ -100,7 +99,6 @@ jobs:
           restore-keys: 119-cargo-home-linux-x86_64-build-main-
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: 'github.ref != ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
         with:
           path: |-
             ./target
@@ -315,7 +313,7 @@ jobs:
           gh release upload "$TAG" target/release/flow-x86_64-unknown-linux-gnu.zip target/release/flow-x86_64-unknown-linux-gnu.zip.sha256sum target/release/release-latest.txt --clobber
       - name: Cache cargo home
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
+        if: 'github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/'')'
         with:
           path: |-
             ~/.cargo/.crates.toml
@@ -327,7 +325,7 @@ jobs:
           key: '119-cargo-home-linux-x86_64-build-main-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
+        if: 'github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/'')'
         with:
           path: |-
             ./target
@@ -435,7 +433,7 @@ jobs:
           restore-keys: '119-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-'
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref != ''refs/heads/main'''
+        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
         with:
           path: |-
             ./target
@@ -638,7 +636,7 @@ jobs:
           path: 'target/test_results_${{ matrix.test_crate }}.json'
       - name: Cache cargo home
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref == ''refs/heads/main'''
+        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && (github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/''))'
         with:
           path: |-
             ~/.cargo/.crates.toml
@@ -650,7 +648,7 @@ jobs:
           key: '119-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref == ''refs/heads/main'''
+        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && (github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/''))'
         with:
           path: |-
             ./target
@@ -746,572 +744,6 @@ jobs:
             ./target/wpt_input_hash
             ./target/autobahn_input_hash
           key: '119-wpt-target-linux-x86_64-release-${{ github.sha }}'
-  build-debug-linux-x86_64:
-    name: build debug linux-x86_64
-    needs:
-      - pre_build
-    if: needs.pre_build.outputs.skip_build != 'true' && needs.pre_build.outputs.docs_only != 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-    defaults:
-      run:
-        shell: bash
-    env:
-      CARGO_TERM_COLOR: always
-      RUST_BACKTRACE: full
-      RUST_LIB_BACKTRACE: 0
-      DENO_TEST_UTIL_DENO_EXE: '${{ github.workspace }}/target/debug/flow'
-    steps:
-      - name: Configure git
-        run: |-
-          git config --global core.symlinks true
-          git config --global fetch.parallel 32
-      - name: Clone repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          fetch-depth: 5
-          submodules: false
-      - name: Clone rusty_v8 fork (v8 patch dependency)
-        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
-      - name: Clone submodule ./tests/util/std
-        run: git submodule update --init --recursive --depth=1 -- ./tests/util/std
-      - name: Restore cache cargo home
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'')'
-        with:
-          path: |-
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.cargo/bin
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: never_saved
-          restore-keys: 119-cargo-home-linux-x86_64-build-main-
-      - name: Restore cache build output
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: 'github.ref != ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
-        with:
-          path: |-
-            ./target
-            !./target/*/gn_out
-            !./target/*/gn_root
-            !./target/*/*.zip
-            !./target/*/*.tar.gz
-          key: never_saved
-          restore-keys: 119-cargo-target-linux-x86_64-debug-build-main-
-      - name: Apply and update mtime cache
-        uses: ./.github/mtime_cache
-        with:
-          cache-path: ./target
-      - name: Pre-install rustup 1.28.2 (workaround broken 1.29.0)
-        shell: bash
-        run: |-
-          if command -v rustup >/dev/null 2>&1; then
-            if ! rustup --version 2>&1 | grep -q '1\.29\.0'; then exit 0; fi
-            echo "Detected broken rustup 1.29.0, replacing with 1.28.2"
-          fi
-          case "${RUNNER_OS}-${RUNNER_ARCH}" in
-            Linux-X64)     target=x86_64-unknown-linux-gnu; ext= ;;
-            Linux-ARM64)   target=aarch64-unknown-linux-gnu; ext= ;;
-            macOS-X64)     target=x86_64-apple-darwin; ext= ;;
-            macOS-ARM64)   target=aarch64-apple-darwin; ext= ;;
-            Windows-X64)   target=x86_64-pc-windows-msvc; ext=.exe ;;
-            Windows-ARM64) target=aarch64-pc-windows-msvc; ext=.exe ;;
-            *) echo "Unsupported: ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
-          esac
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL \
-            "https://static.rust-lang.org/rustup/archive/1.28.2/${target}/rustup-init${ext}" \
-            -o "rustup-init${ext}"
-          chmod +x "rustup-init${ext}"
-          "./rustup-init${ext}" -y --default-toolchain none --no-modify-path
-          rm "rustup-init${ext}"
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
-      - uses: dsherret/rust-toolchain-file@3551321aa44dd44a0393eb3b6bdfbc5d25ecf621
-      - name: Log versions
-        run: |-
-          echo '*** Python'
-          command -v python && python --version || echo 'No python found or bad executable'
-          echo '*** Rust'
-          command -v rustc && rustc --version || echo 'No rustc found or bad executable'
-          echo '*** Cargo'
-          command -v cargo && cargo --version || echo 'No cargo found or bad executable'
-          echo '*** Deno'
-          command -v deno && deno --version || echo 'No deno found or bad executable'
-          echo '*** Node'
-          command -v node && node --version || echo 'No node found or bad executable'
-          echo '*** Installed packages'
-          command -v dpkg && dpkg -l || echo 'No dpkg found or bad executable'
-      - name: Set up incremental LTO and sysroot build
-        run: |-
-          # Setting up sysroot
-          export DEBIAN_FRONTEND=noninteractive
-          # Avoid running man-db triggers, which sometimes takes several minutes
-          # to complete.
-          sudo apt-get -qq remove --purge -y man-db > /dev/null 2> /dev/null
-          # Remove older clang before we install
-          sudo apt-get -qq remove   'clang-12*' 'clang-13*' 'clang-14*' 'clang-15*' 'clang-16*' 'clang-17*' 'clang-18*' 'clang-19*' 'clang-20*' 'clang-21*' 'llvm-12*' 'llvm-13*' 'llvm-14*' 'llvm-15*' 'llvm-16*' 'llvm-17*' 'llvm-18*' 'llvm-19*' 'llvm-20*' 'llvm-21*' 'lld-12*' 'lld-13*' 'lld-14*' 'lld-15*' 'lld-16*' 'lld-17*' 'lld-18*' 'lld-19*' 'lld-20*' 'lld-21*' > /dev/null 2> /dev/null
-
-          # Install clang-XXX, lld-XXX, and debootstrap.
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" |
-            sudo dd of=/etc/apt/sources.list.d/llvm-toolchain-noble-22.list
-          curl https://apt.llvm.org/llvm-snapshot.gpg.key |
-            gpg --dearmor                                 |
-          sudo dd of=/etc/apt/trusted.gpg.d/llvm-snapshot.gpg
-          sudo apt-get update
-          # this was unreliable sometimes, so try again if it fails
-          sudo apt-get install -y --no-install-recommends clang-22 lld-22 clang-tools-22 clang-format-22 clang-tidy-22 || (echo 'Failed. Trying again.' && sudo apt-get clean && sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-22 lld-22 clang-tools-22 clang-format-22 clang-tidy-22)
-          # Fix alternatives
-          (yes '' | sudo update-alternatives --force --all) > /dev/null 2> /dev/null || true
-
-          clang-22 -c -o /tmp/memfd_create_shim.o tools/memfd_create_shim.c -fPIC
-          clang-22 -c -o /tmp/glibc_math_shim.o tools/glibc_math_shim.c -fPIC
-
-          echo "Decompressing sysroot..."
-          wget -q https://github.com/denoland/deno_sysroot_build/releases/download/sysroot-20250207/sysroot-`uname -m`.tar.xz -O /tmp/sysroot.tar.xz
-          cd /
-          xzcat /tmp/sysroot.tar.xz | sudo tar -x
-          sudo mount --rbind /dev /sysroot/dev
-          sudo mount --rbind /sys /sysroot/sys
-          sudo mount --rbind /home /sysroot/home
-          sudo mount -t proc /proc /sysroot/proc
-          cd
-
-          echo "Done."
-
-          # Configure the build environment. Both Rust and Clang will produce
-          # llvm bitcode only, so we can use lld's incremental LTO support.
-
-          # Load the sysroot's env vars
-          echo "sysroot env:"
-          cat /sysroot/.env
-          . /sysroot/.env
-
-          # Important notes:
-          #   1. -ldl seems to be required to avoid a failure in FFI tests. This flag seems
-          #      to be in the Rust default flags in the smoketest, so uncertain why we need
-          #      to be explicit here.
-          #   2. RUSTFLAGS and RUSTDOCFLAGS must be specified, otherwise the doctests fail
-          #      to build because the object formats are not compatible.
-          echo "
-          CARGO_PROFILE_BENCH_INCREMENTAL=false
-          CARGO_PROFILE_RELEASE_INCREMENTAL=false
-          RUSTFLAGS<<__1
-            -C linker-plugin-lto=true
-            -C linker=clang-22
-            -C link-arg=-fuse-ld=lld-22
-            -C link-arg=-Wl,--icf=safe
-            -C link-arg=-ldl
-            -C link-arg=-Wl,--allow-shlib-undefined
-            -C link-arg=-Wl,--thinlto-cache-dir=$(pwd)/target/release/lto-cache
-            -C link-arg=-Wl,--thinlto-cache-policy,cache_size_bytes=700m
-            -C link-arg=/tmp/memfd_create_shim.o
-            -C link-arg=/tmp/glibc_math_shim.o
-            -C link-arg=-Wl,--wrap=expf
-            -C link-arg=-Wl,--wrap=powf
-            -C link-arg=-Wl,--wrap=exp2f
-            -C link-arg=-Wl,--wrap=log2f
-            -C link-arg=-Wl,--wrap=logf
-            --cfg tokio_unstable
-            $RUSTFLAGS
-          __1
-          RUSTDOCFLAGS<<__1
-            -C linker-plugin-lto=true
-            -C linker=clang-22
-            -C link-arg=-fuse-ld=lld-22
-            -C link-arg=-Wl,--icf=safe
-            -C link-arg=-ldl
-            -C link-arg=-Wl,--allow-shlib-undefined
-            -C link-arg=-Wl,--thinlto-cache-dir=$(pwd)/target/release/lto-cache
-            -C link-arg=-Wl,--thinlto-cache-policy,cache_size_bytes=700m
-            -C link-arg=/tmp/memfd_create_shim.o
-            -C link-arg=/tmp/glibc_math_shim.o
-            -C link-arg=-Wl,--wrap=expf
-            -C link-arg=-Wl,--wrap=powf
-            -C link-arg=-Wl,--wrap=exp2f
-            -C link-arg=-Wl,--wrap=log2f
-            -C link-arg=-Wl,--wrap=logf
-            --cfg tokio_unstable
-            $RUSTFLAGS
-          __1
-          CC=/usr/bin/clang-22
-          CFLAGS=$CFLAGS
-          " > $GITHUB_ENV
-      - name: Build debug
-        env:
-          CARGO_PROFILE_DEV_DEBUG: 0
-        run: cargo build --locked -p flow -p denort -p test_server --bin flow --bin denort --bin test_server --features=deno/panic-trace
-      - name: Check flow binary
-        env:
-          NO_COLOR: 1
-        run: target/debug/flow eval "console.log(1+2)" | grep 3
-      - name: Check flow binary (in sysroot)
-        run: sudo chroot /sysroot "$(pwd)/target/debug/flow" --version
-      - name: Upload artifact debug-linux-x86_64-flow
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: debug-linux-x86_64-flow
-          path: target/debug/flow
-          retention-days: 3
-      - name: Upload artifact debug-linux-x86_64-denort
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: debug-linux-x86_64-denort
-          path: target/debug/denort
-          retention-days: 3
-      - name: Upload artifact debug-linux-x86_64-test-server
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: debug-linux-x86_64-test-server
-          path: target/debug/test_server
-          retention-days: 3
-      - name: Cache cargo home
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
-        with:
-          path: |-
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.cargo/bin
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: '119-cargo-home-linux-x86_64-build-main-${{ github.sha }}'
-      - name: Cache build output
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
-        with:
-          path: |-
-            ./target
-            !./target/*/gn_out
-            !./target/*/gn_root
-            !./target/*/*.zip
-            !./target/*/*.tar.gz
-          key: '119-cargo-target-linux-x86_64-debug-build-main-${{ github.sha }}'
-  test-debug-linux-x86_64:
-    name: 'test ${{ matrix.test_crate }} ${{ matrix.shard_label }}debug linux-x86_64'
-    needs:
-      - build-debug-linux-x86_64
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: bash
-    strategy:
-      matrix:
-        include:
-          - test_crate: integration
-            test_package: integration_tests
-            shard_index: '0'
-            shard_total: '2'
-            shard_label: '(1/2) '
-          - test_crate: integration
-            test_package: integration_tests
-            shard_index: '1'
-            shard_total: '2'
-            shard_label: '(2/2) '
-          - test_crate: node_compat
-            test_package: node_compat_tests
-            shard_index: '0'
-            shard_total: '3'
-            shard_label: '(1/3) '
-          - test_crate: node_compat
-            test_package: node_compat_tests
-            shard_index: '1'
-            shard_total: '3'
-            shard_label: '(2/3) '
-          - test_crate: node_compat
-            test_package: node_compat_tests
-            shard_index: '2'
-            shard_total: '3'
-            shard_label: '(3/3) '
-          - test_crate: specs
-            test_package: specs_tests
-            shard_index: '0'
-            shard_total: '2'
-            shard_label: '(1/2) '
-          - test_crate: specs
-            test_package: specs_tests
-            shard_index: '1'
-            shard_total: '2'
-            shard_label: '(2/2) '
-          - test_crate: unit
-            test_package: unit_tests
-            shard_index: '0'
-            shard_total: '1'
-            shard_label: ''
-          - test_crate: unit_node
-            test_package: unit_node_tests
-            shard_index: '0'
-            shard_total: '1'
-            shard_label: ''
-      fail-fast: false
-    env:
-      CARGO_TERM_COLOR: always
-      RUST_BACKTRACE: full
-      RUST_LIB_BACKTRACE: 0
-      DENO_TEST_UTIL_DENO_EXE: '${{ github.workspace }}/target/debug/flow'
-    steps:
-      - name: Configure git
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        run: |-
-          git config --global core.symlinks true
-          git config --global fetch.parallel 32
-      - name: Clone repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        with:
-          fetch-depth: 5
-          submodules: false
-      - name: Clone rusty_v8 fork (v8 patch dependency)
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        run: 'git clone --depth 1 --branch locker-v149.4.0 https://github.com/ibrahimthecosmic/rusty_v8.git ../rusty_v8'
-      - name: Clone submodule ./tests/node_compat/runner/suite
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && matrix.test_crate == ''node_compat'''
-        run: git submodule update --init --recursive --depth=1 -- ./tests/node_compat/runner/suite
-      - name: Clone submodule ./tests/util/std
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        run: git submodule update --init --recursive --depth=1 -- ./tests/util/std
-      - name: Restore cache cargo home
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        with:
-          path: |-
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.cargo/bin
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: never_saved
-          restore-keys: '119-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-'
-      - name: Restore cache build output
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref != ''refs/heads/main'''
-        with:
-          path: |-
-            ./target
-            !./target/*/gn_out
-            !./target/*/gn_root
-            !./target/*/*.zip
-            !./target/*/*.tar.gz
-          key: never_saved
-          restore-keys: '119-cargo-target-linux-x86_64-debug-test-${{ matrix.test_crate }}-'
-      - name: Apply and update mtime cache
-        uses: ./.github/mtime_cache
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        with:
-          cache-path: ./target
-      - name: Install Node
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        with:
-          node-version: 22
-      - name: Pre-install rustup 1.28.2 (workaround broken 1.29.0)
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        shell: bash
-        run: |-
-          if command -v rustup >/dev/null 2>&1; then
-            if ! rustup --version 2>&1 | grep -q '1\.29\.0'; then exit 0; fi
-            echo "Detected broken rustup 1.29.0, replacing with 1.28.2"
-          fi
-          case "${RUNNER_OS}-${RUNNER_ARCH}" in
-            Linux-X64)     target=x86_64-unknown-linux-gnu; ext= ;;
-            Linux-ARM64)   target=aarch64-unknown-linux-gnu; ext= ;;
-            macOS-X64)     target=x86_64-apple-darwin; ext= ;;
-            macOS-ARM64)   target=aarch64-apple-darwin; ext= ;;
-            Windows-X64)   target=x86_64-pc-windows-msvc; ext=.exe ;;
-            Windows-ARM64) target=aarch64-pc-windows-msvc; ext=.exe ;;
-            *) echo "Unsupported: ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
-          esac
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL \
-            "https://static.rust-lang.org/rustup/archive/1.28.2/${target}/rustup-init${ext}" \
-            -o "rustup-init${ext}"
-          chmod +x "rustup-init${ext}"
-          "./rustup-init${ext}" -y --default-toolchain none --no-modify-path
-          rm "rustup-init${ext}"
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
-      - uses: dsherret/rust-toolchain-file@3551321aa44dd44a0393eb3b6bdfbc5d25ecf621
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-      - name: Set up incremental LTO and sysroot build
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        run: |-
-          # Setting up sysroot
-          export DEBIAN_FRONTEND=noninteractive
-          # Avoid running man-db triggers, which sometimes takes several minutes
-          # to complete.
-          sudo apt-get -qq remove --purge -y man-db > /dev/null 2> /dev/null
-          # Remove older clang before we install
-          sudo apt-get -qq remove   'clang-12*' 'clang-13*' 'clang-14*' 'clang-15*' 'clang-16*' 'clang-17*' 'clang-18*' 'clang-19*' 'clang-20*' 'clang-21*' 'llvm-12*' 'llvm-13*' 'llvm-14*' 'llvm-15*' 'llvm-16*' 'llvm-17*' 'llvm-18*' 'llvm-19*' 'llvm-20*' 'llvm-21*' 'lld-12*' 'lld-13*' 'lld-14*' 'lld-15*' 'lld-16*' 'lld-17*' 'lld-18*' 'lld-19*' 'lld-20*' 'lld-21*' > /dev/null 2> /dev/null
-
-          # Install clang-XXX, lld-XXX, and debootstrap.
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" |
-            sudo dd of=/etc/apt/sources.list.d/llvm-toolchain-noble-22.list
-          curl https://apt.llvm.org/llvm-snapshot.gpg.key |
-            gpg --dearmor                                 |
-          sudo dd of=/etc/apt/trusted.gpg.d/llvm-snapshot.gpg
-          sudo apt-get update
-          # this was unreliable sometimes, so try again if it fails
-          sudo apt-get install -y --no-install-recommends clang-22 lld-22 clang-tools-22 clang-format-22 clang-tidy-22 || (echo 'Failed. Trying again.' && sudo apt-get clean && sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-22 lld-22 clang-tools-22 clang-format-22 clang-tidy-22)
-          # Fix alternatives
-          (yes '' | sudo update-alternatives --force --all) > /dev/null 2> /dev/null || true
-
-          clang-22 -c -o /tmp/memfd_create_shim.o tools/memfd_create_shim.c -fPIC
-          clang-22 -c -o /tmp/glibc_math_shim.o tools/glibc_math_shim.c -fPIC
-
-          echo "Decompressing sysroot..."
-          wget -q https://github.com/denoland/deno_sysroot_build/releases/download/sysroot-20250207/sysroot-`uname -m`.tar.xz -O /tmp/sysroot.tar.xz
-          cd /
-          xzcat /tmp/sysroot.tar.xz | sudo tar -x
-          sudo mount --rbind /dev /sysroot/dev
-          sudo mount --rbind /sys /sysroot/sys
-          sudo mount --rbind /home /sysroot/home
-          sudo mount -t proc /proc /sysroot/proc
-          cd
-
-          echo "Done."
-
-          # Configure the build environment. Both Rust and Clang will produce
-          # llvm bitcode only, so we can use lld's incremental LTO support.
-
-          # Load the sysroot's env vars
-          echo "sysroot env:"
-          cat /sysroot/.env
-          . /sysroot/.env
-
-          # Important notes:
-          #   1. -ldl seems to be required to avoid a failure in FFI tests. This flag seems
-          #      to be in the Rust default flags in the smoketest, so uncertain why we need
-          #      to be explicit here.
-          #   2. RUSTFLAGS and RUSTDOCFLAGS must be specified, otherwise the doctests fail
-          #      to build because the object formats are not compatible.
-          echo "
-          CARGO_PROFILE_BENCH_INCREMENTAL=false
-          CARGO_PROFILE_RELEASE_INCREMENTAL=false
-          RUSTFLAGS<<__1
-            -C linker-plugin-lto=true
-            -C linker=clang-22
-            -C link-arg=-fuse-ld=lld-22
-            -C link-arg=-Wl,--icf=safe
-            -C link-arg=-ldl
-            -C link-arg=-Wl,--allow-shlib-undefined
-            -C link-arg=-Wl,--thinlto-cache-dir=$(pwd)/target/release/lto-cache
-            -C link-arg=-Wl,--thinlto-cache-policy,cache_size_bytes=700m
-            -C link-arg=/tmp/memfd_create_shim.o
-            -C link-arg=/tmp/glibc_math_shim.o
-            -C link-arg=-Wl,--wrap=expf
-            -C link-arg=-Wl,--wrap=powf
-            -C link-arg=-Wl,--wrap=exp2f
-            -C link-arg=-Wl,--wrap=log2f
-            -C link-arg=-Wl,--wrap=logf
-            --cfg tokio_unstable
-            $RUSTFLAGS
-          __1
-          RUSTDOCFLAGS<<__1
-            -C linker-plugin-lto=true
-            -C linker=clang-22
-            -C link-arg=-fuse-ld=lld-22
-            -C link-arg=-Wl,--icf=safe
-            -C link-arg=-ldl
-            -C link-arg=-Wl,--allow-shlib-undefined
-            -C link-arg=-Wl,--thinlto-cache-dir=$(pwd)/target/release/lto-cache
-            -C link-arg=-Wl,--thinlto-cache-policy,cache_size_bytes=700m
-            -C link-arg=/tmp/memfd_create_shim.o
-            -C link-arg=/tmp/glibc_math_shim.o
-            -C link-arg=-Wl,--wrap=expf
-            -C link-arg=-Wl,--wrap=powf
-            -C link-arg=-Wl,--wrap=exp2f
-            -C link-arg=-Wl,--wrap=log2f
-            -C link-arg=-Wl,--wrap=logf
-            --cfg tokio_unstable
-            $RUSTFLAGS
-          __1
-          CC=/usr/bin/clang-22
-          CFLAGS=$CFLAGS
-          " > $GITHUB_ENV
-      - name: Download artifact debug-linux-x86_64-flow
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        with:
-          name: debug-linux-x86_64-flow
-          path: target/debug
-      - name: Set target/debug/flow permissions
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        run: chmod +x target/debug/flow
-      - name: Download artifact debug-linux-x86_64-denort
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && (matrix.test_crate == ''integration'' || matrix.test_crate == ''specs'')'
-        with:
-          name: debug-linux-x86_64-denort
-          path: target/debug
-      - name: Set target/debug/denort permissions
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && (matrix.test_crate == ''integration'' || matrix.test_crate == ''specs'')'
-        run: chmod +x target/debug/denort
-      - name: Download artifact debug-linux-x86_64-test-server
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && (matrix.test_crate == ''integration'' || matrix.test_crate == ''specs'' || matrix.test_crate == ''unit'' || matrix.test_crate == ''unit_node'')'
-        with:
-          name: debug-linux-x86_64-test-server
-          path: target/debug
-      - name: Set target/debug/test_server permissions
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && (matrix.test_crate == ''integration'' || matrix.test_crate == ''specs'' || matrix.test_crate == ''unit'' || matrix.test_crate == ''unit_node'')'
-        run: chmod +x target/debug/test_server
-      - name: Set up playwright cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        with:
-          path: ./.ms-playwright
-          key: 'playwright-${{ runner.os }}-${{ runner.arch }}'
-      - name: Build ffi (debug)
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && matrix.test_crate == ''specs'''
-        run: cargo build -p test_ffi
-      - name: Test (debug)
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'')'
-        env:
-          CARGO_PROFILE_DEV_DEBUG: 0
-          CI_SHARD_INDEX: '${{ github.event_name == ''pull_request'' && matrix.shard_index || '''' }}'
-          CI_SHARD_TOTAL: '${{ github.event_name == ''pull_request'' && matrix.shard_total || '''' }}'
-        run: 'cargo test -p ${{ matrix.test_package }} --test ${{ matrix.test_crate }}'
-      - name: Ensure no git changes
-        if: '!startsWith(github.ref, ''refs/tags/'') && github.event_name == ''pull_request'''
-        run: |-
-          if [[ -n "$(git status --porcelain)" ]]; then
-          echo "❌ Git working directory is dirty. Ensure `cargo test` is not modifying git tracked files."
-          echo ""
-          echo "📋 Status:"
-          git status
-          echo ""
-          exit 1
-          fi
-      - name: Upload test results
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && always()'
-        with:
-          name: 'test-results-linux-x86_64-debug-${{ matrix.test_crate }}${{ matrix.shard_total > 1 && format(''-shard-{0}'', matrix.shard_index) || '''' }}.json'
-          path: 'target/test_results_${{ matrix.test_crate }}.json'
-      - name: Cache cargo home
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref == ''refs/heads/main'''
-        with:
-          path: |-
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.cargo/bin
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: '119-cargo-home-linux-x86_64-test-${{ matrix.test_crate }}-${{ github.sha }}'
-      - name: Cache build output
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && (matrix.shard_index == 0 || github.event_name == ''pull_request'') && github.ref == ''refs/heads/main'''
-        with:
-          path: |-
-            ./target
-            !./target/*/gn_out
-            !./target/*/gn_root
-            !./target/*/*.zip
-            !./target/*/*.tar.gz
-          key: '119-cargo-target-linux-x86_64-debug-test-${{ matrix.test_crate }}-${{ github.sha }}'
   lint:
     name: 'lint ${{ matrix.profile }} ${{ matrix.os }}-${{ matrix.arch }}'
     needs:
@@ -1346,7 +778,6 @@ jobs:
         run: git submodule update --init --recursive --depth=1 -- ./tests/util/std
       - name: Restore cache cargo home
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'')'
         with:
           path: |-
             ~/.cargo/.crates.toml
@@ -1359,7 +790,6 @@ jobs:
           restore-keys: '119-cargo-home-${{ matrix.os }}-${{ matrix.arch }}-lint-'
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: 'github.ref != ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
         with:
           path: |-
             ./target
@@ -1413,7 +843,7 @@ jobs:
         run: deno run --allow-write --allow-read --allow-run --allow-net --allow-env ./tools/lint.js
       - name: Cache cargo home
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
+        if: 'github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/'')'
         with:
           path: |-
             ~/.cargo/.crates.toml
@@ -1425,7 +855,7 @@ jobs:
           key: '119-cargo-home-${{ matrix.os }}-${{ matrix.arch }}-lint-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: 'github.ref == ''refs/heads/main'' && !startsWith(github.ref, ''refs/tags/'')'
+        if: 'github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/'')'
         with:
           path: |-
             ./target
@@ -1478,7 +908,7 @@ jobs:
           restore-keys: 119-cargo-home-linux-x86_64-deno-core-test-
       - name: Restore cache build output
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && github.ref != ''refs/heads/main'''
+        if: '!startsWith(github.ref, ''refs/tags/'')'
         with:
           path: |-
             ./target
@@ -1644,7 +1074,7 @@ jobs:
         run: cargo run -p deno_core --example op2
       - name: Cache cargo home
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && github.ref == ''refs/heads/main'''
+        if: '!startsWith(github.ref, ''refs/tags/'') && (github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/''))'
         with:
           path: |-
             ~/.cargo/.crates.toml
@@ -1656,7 +1086,7 @@ jobs:
           key: '119-cargo-home-linux-x86_64-deno-core-test-${{ github.sha }}'
       - name: Cache build output
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
-        if: '!startsWith(github.ref, ''refs/tags/'') && github.ref == ''refs/heads/main'''
+        if: '!startsWith(github.ref, ''refs/tags/'') && (github.ref == ''refs/heads/main'' || startsWith(github.ref, ''refs/tags/''))'
         with:
           path: |-
             ./target
@@ -1712,8 +1142,6 @@ jobs:
       - build-release-linux-x86_64
       - test-release-linux-x86_64
       - wpt-release-linux-x86_64
-      - build-debug-linux-x86_64
-      - test-debug-linux-x86_64
       - lint
       - deno-core-test
       - deno-core-miri
