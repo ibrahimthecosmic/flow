@@ -572,8 +572,8 @@ mod test {
   #[tokio::test]
   async fn test_extract_v0() {
     test_extract_eszip(
-      PathBuf::from(format!("{}/npm-flow-js/index.ts", MIGRATE_TEST_DIR)),
-      PathBuf::from(format!("{}/npm-flow-js/v0.eszip", MIGRATE_TEST_DIR)),
+      PathBuf::from(format!("{}/npm-axios/index.ts", MIGRATE_TEST_DIR)),
+      PathBuf::from(format!("{}/npm-axios/v0.eszip", MIGRATE_TEST_DIR)),
     )
     .await;
   }
@@ -581,8 +581,8 @@ mod test {
   #[tokio::test]
   async fn test_extract_v1() {
     test_extract_eszip(
-      PathBuf::from(format!("{}/npm-flow-js/index.ts", MIGRATE_TEST_DIR)),
-      PathBuf::from(format!("{}/npm-flow-js/v1.eszip", MIGRATE_TEST_DIR)),
+      PathBuf::from(format!("{}/npm-axios/index.ts", MIGRATE_TEST_DIR)),
+      PathBuf::from(format!("{}/npm-axios/v1.eszip", MIGRATE_TEST_DIR)),
     )
     .await;
   }
@@ -591,9 +591,9 @@ mod test {
   #[should_panic]
   async fn test_extract_v0_corrupted() {
     test_extract_eszip(
-      PathBuf::from(format!("{}/npm-flow-js/index.ts", MIGRATE_TEST_DIR)),
+      PathBuf::from(format!("{}/npm-axios/index.ts", MIGRATE_TEST_DIR)),
       PathBuf::from(format!(
-        "{}/npm-flow-js/v0_corrupted.eszip",
+        "{}/npm-axios/v0_corrupted.eszip",
         MIGRATE_TEST_DIR
       )),
     )
@@ -604,9 +604,9 @@ mod test {
   #[should_panic]
   async fn test_extract_v1_corrupted() {
     test_extract_eszip(
-      PathBuf::from(format!("{}/npm-flow-js/index.ts", MIGRATE_TEST_DIR)),
+      PathBuf::from(format!("{}/npm-axios/index.ts", MIGRATE_TEST_DIR)),
       PathBuf::from(format!(
-        "{}/npm-flow-js/v1_corrupted.eszip",
+        "{}/npm-axios/v1_corrupted.eszip",
         MIGRATE_TEST_DIR
       )),
     )
@@ -643,7 +643,7 @@ mod test {
   async fn test_vfs_registry_migration_v0() {
     test_vfs_npm_registry_migration_1_45_x(
       fs::read(PathBuf::from(format!(
-        "{}/npm-flow-js/v0.eszip",
+        "{}/npm-axios/v0.eszip",
         MIGRATE_TEST_DIR
       )))
       .await
@@ -656,7 +656,7 @@ mod test {
   async fn test_vfs_registry_migration_v1() {
     test_vfs_npm_registry_migration_1_45_x(
       fs::read(PathBuf::from(format!(
-        "{}/npm-flow-js/v1.eszip",
+        "{}/npm-axios/v1.eszip",
         MIGRATE_TEST_DIR
       )))
       .await
@@ -669,7 +669,7 @@ mod test {
   async fn test_vfs_registry_migration_v1_1_xx_hash3() {
     test_vfs_npm_registry_migration_1_45_x(
       fs::read(PathBuf::from(format!(
-        "{}/npm-flow-js/v1_1_xx_hash3.eszip",
+        "{}/npm-axios/v1_1_xx_hash3.eszip",
         MIGRATE_TEST_DIR
       )))
       .await
@@ -682,7 +682,7 @@ mod test {
   async fn test_vfs_registry_migration_v1_1_no_checksum() {
     test_vfs_npm_registry_migration_1_45_x(
       fs::read(PathBuf::from(format!(
-        "{}/npm-flow-js/v1_1_no_checksum.eszip",
+        "{}/npm-axios/v1_1_no_checksum.eszip",
         MIGRATE_TEST_DIR
       )))
       .await
