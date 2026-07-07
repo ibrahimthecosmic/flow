@@ -1,0 +1,9 @@
+{
+  "tempDir": true,
+  "tests": {
+    "bundle_unbundle": {
+      "args": "run -A main.js",
+      "output": "main.out"
+    }
+  }
+}

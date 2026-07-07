@@ -27,6 +27,7 @@ use tokio::time::timeout;
 
 mod flags;
 mod flow_config;
+mod flow_eszip;
 mod flow_events;
 
 /// `flow` is a drop-in Deno binary plus the edge layer. Everything except the
@@ -116,6 +117,7 @@ fn install_flow_embedding() {
     vec![
       ext_workers::user_workers_ops::init(),
       flow_events::flow_events_ops::init(),
+      flow_eszip::flow_eszip_ops::init(),
     ]
   }));
 

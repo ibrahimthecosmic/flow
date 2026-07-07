@@ -732,6 +732,11 @@ const NOT_IMPORTED_OPS = [
   "op_flow_events_accept",
   "op_flow_events_cancel",
   "op_flow_events_release",
+  // flow: FlowRuntime.bundle/unbundle (keep in sync with the `flow_eszip_ops`
+  // extension in edge/cli/src/flow_eszip.rs).
+  "op_eszip_bundle",
+  "op_eszip_unbundle_open",
+  "op_eszip_unbundle_next",
 ];
 
 function removeImportedOps() {

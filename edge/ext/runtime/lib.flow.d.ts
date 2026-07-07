@@ -199,6 +199,54 @@ declare interface FlowWorkerEvent {
   metadata: { [key: string]: FlowJsonValue };
 }
 
+/** Options for `FlowRuntime.bundle` (the programmatic twin of
+ * `flow eszip bundle`). */
+declare interface FlowBundleOptions {
+  /** Glob patterns of static files to bundle alongside the module graph. */
+  staticPatterns?: string[];
+  /** Integrity checksum baked into the eszip. Default: none. */
+  checksum?: "none" | "sha256" | "xxhash3";
+  /** Abort bundling after this many milliseconds. */
+  timeoutMs?: number;
+  /** Re-download remote modules instead of using the local cache. */
+  noModuleCache?: boolean;
+  /** Path to an import map applied while building the module graph. */
+  importMapPath?: string;
+}
+
+/** Per-file metadata emitted by a `FlowRuntime.unbundle` "file" event. */
+declare interface FlowUnbundledFile {
+  /** Module specifier the file had inside the eszip. */
+  specifier: string;
+  /** Destination path relative to the extraction root. */
+  path: string;
+  /** "module" = graph module, "static" = static asset, "vfs" = a file of the
+   * bundled `node_modules` virtual filesystem. */
+  kind: "module" | "static" | "vfs";
+  /** File size in bytes. */
+  size: number;
+}
+
+/**
+ * An unbundle job returned by `FlowRuntime.unbundle`. "finish" fires after
+ * every file was emitted (and, when an output directory was given, written
+ * to disk); a "file" listener that throws aborts the job with "error".
+ */
+declare interface FlowUnbundled {
+  on(
+    event: "file",
+    listener: (
+      metadata: FlowUnbundledFile,
+      stream: ReadableStream<Uint8Array>,
+    ) => void,
+  ): FlowUnbundled;
+  on(event: "finish", listener: () => void): FlowUnbundled;
+  on(event: "error", listener: (err: Error) => void): FlowUnbundled;
+  off(event: "file" | "finish" | "error", listener: unknown): FlowUnbundled;
+  /** Resolves on "finish", rejects on "error". */
+  readonly done: Promise<void>;
+}
+
 /**
  * Host-side flow surface, available in the MAIN isolate (`flow run ...`).
  *
@@ -218,6 +266,28 @@ declare const FlowRuntime: {
    * `next()` claims the stream and breaking out of the loop hands it back.
    */
   events: AsyncIterable<FlowWorkerEvent>;
+
+  /**
+   * Bundles an entrypoint into an eszip, returned as a byte stream (pipe it
+   * to a file, or pass the collected bytes to `userWorkers.create`'s
+   * `maybeEszip`). `entrypoint` is either a path on disk (string) or the
+   * entry module's source code (bytes/stream; imports then resolve against
+   * the current working directory). Bundling runs on a dedicated thread;
+   * failures surface as stream errors.
+   */
+  bundle(
+    entrypoint: string | Uint8Array | ArrayBuffer | ReadableStream<Uint8Array>,
+    options?: FlowBundleOptions,
+  ): ReadableStream<Uint8Array>;
+  /**
+   * Extracts an eszip (path on disk, bytes, or stream). Each contained file
+   * fires a "file" event; pass `output` to also write the tree under that
+   * directory (via Deno's filesystem APIs, so `--allow-write` applies).
+   */
+  unbundle(
+    eszip: string | Uint8Array | ArrayBuffer | ReadableStream<Uint8Array>,
+    output?: string,
+  ): FlowUnbundled;
 
   /** USER workers only: keep the worker alive until `promise` settles. */
   waitUntil?<T>(promise: Promise<T>): Promise<T>;

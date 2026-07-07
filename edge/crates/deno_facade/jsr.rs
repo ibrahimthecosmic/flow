@@ -1,8 +1,7 @@
 use deno_core::ModuleSpecifier;
+use deno_core::url::Url;
 use eszip::deno_graph;
 use once_cell::sync::Lazy;
-
-use crate::Url;
 
 pub fn jsr_url() -> &'static Url {
   static JSR_URL: Lazy<Url> = Lazy::new(|| {

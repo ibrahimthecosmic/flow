@@ -1,8 +1,11 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::Cursor;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -44,8 +47,6 @@ use fs::virtual_fs::VfsBuilder;
 use fs::virtual_fs::VfsEntry;
 use futures::AsyncReadExt;
 use futures::AsyncSeekExt;
-use futures::FutureExt;
-use futures::future::BoxFuture;
 use futures::future::OptionFuture;
 use futures::io::AllowStdIo;
 use futures::io::BufReader;
@@ -54,15 +55,12 @@ use indexmap::IndexMap;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use scopeguard::ScopeGuard;
-use tokio::fs::File;
 use tokio::fs::create_dir_all;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use vfs::build_npm_vfs;
 
 use crate::emitter::EmitterFactory;
-use crate::extract_modules;
 use crate::graph::CreateGraphArgs;
 use crate::graph::create_eszip_from_graph_raw;
 use crate::graph::create_graph;
@@ -1094,15 +1092,22 @@ fn is_schema(s: &str) -> bool {
 }
 
 fn extract_file_specifiers(eszip: &EszipV2) -> Vec<String> {
+  // Relative path with no leading/trailing/double slashes; a single component
+  // (no `/` at all) is valid too, since the eszip relative base can be the
+  // module's own directory.
   static RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[^/]+/[^/]+(?:/[^/]+)*$").unwrap());
+    Lazy::new(|| Regex::new(r"^[^/]+(?:/[^/]+)*$").unwrap());
 
   eszip
     .specifiers()
     .iter()
     .filter(|specifier| {
       specifier.starts_with("file:")
-        || (!is_schema(specifier) && RE.is_match(specifier))
+        || (!is_schema(specifier)
+          // Internal metadata keys (`---FLOW-*---`, `---EDGE-RUNTIME-*---`)
+          // are the only non-schema, non-file specifiers in an archive.
+          && !specifier.starts_with("---")
+          && RE.is_match(specifier))
     })
     .cloned()
     .collect()
@@ -1113,168 +1118,272 @@ pub struct ExtractEszipPayload {
   pub folder: PathBuf,
 }
 
-pub async fn extract_eszip(payload: ExtractEszipPayload) -> bool {
-  let output_folder = payload.folder;
-  let eszip = match payload_to_eszip(payload.data).await {
-    Ok(v) => v,
-    Err(err) => {
-      log::error!("{err:?}");
-      return false;
-    }
-  };
+/// What an [`EszipEntry`] holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EszipEntryKind {
+  /// A module of the bundled graph.
+  Module,
+  /// A `static:` asset (bundled via a static pattern).
+  StaticAsset,
+  /// A file of the byonm `node_modules` virtual filesystem.
+  VfsFile,
+}
 
-  let mut eszip = match migrate::try_migrate_if_needed(eszip, None).await {
-    Ok(v) => v,
-    Err(err) => {
-      log::error!(
-        "{:#}",
-        err.context("eszip migration failed (give up extract job)")
-      );
-      return false;
-    }
-  };
-
-  eszip.ensure_read_all().await.unwrap();
-
-  let mut metadata = match OptionFuture::<_>::from(
-    eszip
-      .ensure_module(eszip_trait::v2::METADATA_KEY)
-      .map(|it| async move { it.source().await }),
-  )
-  .await
-  .flatten()
-  .map(|it| {
-    rkyv::from_bytes::<Metadata>(it.as_ref())
-      .map_err(|_| anyhow!("failed to deserialize metadata from eszip"))
-  })
-  .transpose()
-  {
-    Ok(metadata) => metadata,
-    Err(err) => {
-      log::error!("{err}");
-      return false;
+impl EszipEntryKind {
+  pub fn as_str(&self) -> &'static str {
+    match self {
+      EszipEntryKind::Module => "module",
+      EszipEntryKind::StaticAsset => "static",
+      EszipEntryKind::VfsFile => "vfs",
     }
   }
-  .unwrap_or_default();
-  let node_modules = match metadata.node_modules() {
-    Ok(node_modules) => node_modules,
-    Err(err) => {
-      log::error!("{err}");
-      return false;
-    }
-  };
-  let use_byonm = matches!(node_modules, Some(NodeModules::Byonm { .. }));
+}
 
-  if !output_folder.exists() {
-    create_dir_all(&output_folder).await.unwrap();
-  }
-  if use_byonm {
-    fn extract_entries(
-      eszip: Arc<LazyLoadableEszip>,
-      entries: Vec<VfsEntry>,
-      base_path: PathBuf,
-    ) -> BoxFuture<'static, Result<(), AnyError>> {
-      async move {
-        for entry in entries {
-          match entry {
-            VfsEntry::Dir(virtual_directory) => {
-              let path = base_path.join(&virtual_directory.name);
-              create_dir_all(&path).await.unwrap();
-              extract_entries(eszip.clone(), virtual_directory.entries, path)
-                .await?;
-            }
-            VfsEntry::File(virtual_file) => {
-              let path = base_path.join(&virtual_file.name);
-              let module_content = eszip
-                .get_module(&virtual_file.key)
-                .unwrap()
-                .source()
-                .await
-                .unwrap();
-              let mut file = File::create(&path).await.unwrap();
-              file.write_all(module_content.as_ref()).await.unwrap();
-            }
-            VfsEntry::Symlink(virtual_symlink) => {
-              let name = virtual_symlink.name;
-              bail!("found unexpected symlink: {name}");
-            }
-          }
-        }
-        Ok(())
-      }
-      .boxed()
-    }
+/// One extractable file of an eszip archive, as yielded by
+/// [`EszipEntryReader`].
+pub struct EszipEntry {
+  pub specifier: String,
+  /// Where the entry lands relative to the extraction root.
+  pub relative_path: PathBuf,
+  pub kind: EszipEntryKind,
+  pub data: Arc<[u8]>,
+}
 
-    let eszip = Arc::new(eszip);
-    let Some(dir) = metadata.virtual_dir.take() else {
-      return true;
-    };
-    if let Err(err) = extract_entries(eszip, dir.entries, output_folder).await {
-      log::error!("{err}");
-      return false;
-    }
-    true
+struct PendingEntry {
+  specifier: String,
+  relative_path: PathBuf,
+  kind: EszipEntryKind,
+}
+
+fn ensure_unix_relative_path(path: &Path) -> &Path {
+  assert!(path.is_relative());
+  assert!(!path.to_string_lossy().starts_with('\\'));
+  path
+}
+
+fn strip_file_scheme(input: &str) -> Cow<'_, str> {
+  if input.starts_with("file://") {
+    Cow::Owned(input.strip_prefix("file://").unwrap().to_owned())
   } else {
-    let file_specifiers = extract_file_specifiers(&eszip);
-    if let Some(lowest_path) = find_lowest_path(&file_specifiers) {
+    Cow::Borrowed(input)
+  }
+}
+
+/// Computes where a module specifier lands relative to the extraction root,
+/// given the parent directory of the archive's lowest common file path.
+fn module_relative_path(
+  global_specifier: &str,
+  entry_path: &Path,
+) -> Result<PathBuf, AnyError> {
+  let cleaned_specifier = strip_file_scheme(global_specifier);
+  let cleaned_path = pathdiff::diff_paths(&*cleaned_specifier, entry_path)
+    .ok_or_else(|| {
+      anyhow!("failed to compute a relative path for {global_specifier}")
+    })?;
+  Ok(
+    cleaned_path
+      .strip_prefix("/")
+      .map(Path::to_path_buf)
+      .unwrap_or_else(|_| {
+        ensure_unix_relative_path(&cleaned_path).to_path_buf()
+      }),
+  )
+}
+
+fn collect_vfs_entries(
+  entries: Vec<VfsEntry>,
+  base: &Path,
+  out: &mut VecDeque<PendingEntry>,
+) -> Result<(), AnyError> {
+  for entry in entries {
+    match entry {
+      VfsEntry::Dir(virtual_directory) => {
+        let path = base.join(&virtual_directory.name);
+        collect_vfs_entries(virtual_directory.entries, &path, out)?;
+      }
+      VfsEntry::File(virtual_file) => out.push_back(PendingEntry {
+        relative_path: base.join(&virtual_file.name),
+        specifier: virtual_file.key,
+        kind: EszipEntryKind::VfsFile,
+      }),
+      VfsEntry::Symlink(virtual_symlink) => {
+        let name = virtual_symlink.name;
+        bail!("found unexpected symlink: {name}");
+      }
+    }
+  }
+  Ok(())
+}
+
+/// Enumerates the extractable files of an eszip archive one at a time, using
+/// the same specifier→path mapping [`extract_eszip`] uses to write them to
+/// disk (which is implemented on top of this reader).
+pub struct EszipEntryReader {
+  eszip: LazyLoadableEszip,
+  pending: VecDeque<PendingEntry>,
+}
+
+impl EszipEntryReader {
+  pub async fn open(data: EszipPayloadKind) -> Result<Self, AnyError> {
+    let eszip = payload_to_eszip(data).await?;
+    let mut eszip = migrate::try_migrate_if_needed(eszip, None)
+      .await
+      .context("eszip migration failed")?;
+
+    eszip
+      .ensure_read_all()
+      .await
+      .context("failed to read the eszip data section")?;
+
+    let mut metadata = OptionFuture::<_>::from(
+      eszip
+        .ensure_module(eszip_trait::v2::METADATA_KEY)
+        .map(|it| async move { it.source().await }),
+    )
+    .await
+    .flatten()
+    .map(|it| {
+      rkyv::from_bytes::<Metadata>(it.as_ref())
+        .map_err(|_| anyhow!("failed to deserialize metadata from eszip"))
+    })
+    .transpose()?
+    .unwrap_or_default();
+    let node_modules = metadata.node_modules()?;
+    let use_byonm = matches!(node_modules, Some(NodeModules::Byonm { .. }));
+
+    let mut pending = VecDeque::new();
+    if use_byonm {
+      if let Some(dir) = metadata.virtual_dir.take() {
+        collect_vfs_entries(dir.entries, Path::new(""), &mut pending)?;
+      }
+    } else {
+      let file_specifiers = extract_file_specifiers(&eszip);
+      let lowest_path =
+        find_lowest_path(&file_specifiers).ok_or_else(|| {
+          // Only possible when the archive contains no file modules at all
+          // (e.g. remote-only graphs).
+          anyhow!("the eszip contains no extractable file modules")
+        })?;
+
+      // Alias every `static:` asset as a `file://` redirect so the assets
+      // participate in the same path mapping as regular file modules.
       let targets = eszip
         .specifiers()
         .iter()
         .filter(|it| it.starts_with("static:"))
         .cloned()
         .collect::<Vec<_>>();
-
+      let mut alias_specifiers = HashSet::new();
       {
         let mut modules = eszip.eszip.modules.0.lock().unwrap();
         for asset in targets {
-          let url = Url::parse(&asset).unwrap();
-          modules.insert(
-            format!("file://{}", url.path()),
-            EszipV2Module::Redirect { target: asset },
-          );
+          let url = Url::parse(&asset).with_context(|| {
+            format!("invalid static asset specifier: {asset}")
+          })?;
+          let alias = format!("file://{}", url.path());
+          modules
+            .insert(alias.clone(), EszipV2Module::Redirect { target: asset });
+          alias_specifiers.insert(alias);
         }
       }
 
-      extract_modules(
-        &eszip,
-        &extract_file_specifiers(&eszip),
-        &lowest_path,
-        &output_folder,
-      )
-      .await;
-      true
-    } else {
-      // No file module shared a common directory prefix (e.g. an eszip whose
-      // only module sits at the relative-base root, so its key has no `/`).
-      // Fail gracefully rather than panicking.
-      log::error!(
-        "could not determine a common root directory for the eszip's file \
-         modules; nothing was extracted"
-      );
+      let main_path = PathBuf::from(&*strip_file_scheme(&lowest_path));
+      let entry_path = main_path
+        .parent()
+        .ok_or_else(|| {
+          anyhow!("the eszip's common root has no parent directory")
+        })?
+        .to_path_buf();
+      for specifier in extract_file_specifiers(&eszip) {
+        let relative_path = module_relative_path(&specifier, &entry_path)?;
+        let kind = if alias_specifiers.contains(&specifier) {
+          EszipEntryKind::StaticAsset
+        } else {
+          EszipEntryKind::Module
+        };
+        pending.push_back(PendingEntry {
+          specifier,
+          relative_path,
+          kind,
+        });
+      }
+    }
+
+    Ok(Self { eszip, pending })
+  }
+
+  /// Number of entries not yet yielded.
+  pub fn remaining(&self) -> usize {
+    self.pending.len()
+  }
+
+  /// Yields the next entry, or `None` once all entries have been read.
+  pub async fn next_entry(&mut self) -> Result<Option<EszipEntry>, AnyError> {
+    let Some(pending) = self.pending.pop_front() else {
+      return Ok(None);
+    };
+    let module =
+      self.eszip.get_module(&pending.specifier).ok_or_else(|| {
+        anyhow!("eszip is missing a module for {}", pending.specifier)
+      })?;
+    let data = module.source().await.ok_or_else(|| {
+      anyhow!("eszip is missing the source for {}", pending.specifier)
+    })?;
+    Ok(Some(EszipEntry {
+      specifier: pending.specifier,
+      relative_path: pending.relative_path,
+      kind: pending.kind,
+      data,
+    }))
+  }
+}
+
+pub async fn extract_eszip(payload: ExtractEszipPayload) -> bool {
+  match extract_eszip_inner(payload).await {
+    Ok(()) => true,
+    Err(err) => {
+      log::error!("{:#}", err.context("eszip extraction failed"));
       false
     }
   }
 }
 
-/// Finds the lowest common ancestor directory of the given path-like strings.
-/// Reimplements the `deno::util::path::find_lowest_path` helper removed in
-/// 2.9.0. Returns `None` when the input is empty.
-fn find_lowest_path(paths: &[String]) -> Option<String> {
-  let mut iter = paths.iter();
-  let mut common: &str = iter.next()?.as_str();
-  for p in iter {
-    let mut n = common
-      .bytes()
-      .zip(p.bytes())
-      .take_while(|(a, b)| a == b)
-      .count();
-    while n > 0 && !common.is_char_boundary(n) {
-      n -= 1;
+async fn extract_eszip_inner(
+  payload: ExtractEszipPayload,
+) -> Result<(), AnyError> {
+  let output_folder = payload.folder;
+  let mut reader = EszipEntryReader::open(payload.data).await?;
+  if !output_folder.exists() {
+    create_dir_all(&output_folder).await?;
+  }
+  while let Some(entry) = reader.next_entry().await? {
+    let dest = output_folder.join(&entry.relative_path);
+    if let Some(parent) = dest.parent() {
+      create_dir_all(parent).await?;
     }
-    common = &common[..n];
+    tokio::fs::write(&dest, entry.data.as_ref())
+      .await
+      .with_context(|| format!("failed to write {}", dest.display()))?;
   }
-  match common.rfind('/') {
-    Some(idx) => Some(common[..idx].to_string()),
-    None => Some(common.to_string()),
+  Ok(())
+}
+
+/// Returns the path with the fewest components — the module graph's
+/// entrypoint, whose parent directory becomes the extraction base.
+/// Reimplements the `deno::util::path::find_lowest_path` helper that was
+/// dropped with the vendored deno crate in the 2.9.0 port (the 2.9.0/2.9.1
+/// stand-in computed the lowest common ancestor instead, which appends the
+/// entrypoint's directory name to every extracted path). Returns `None` when
+/// the input is empty.
+fn find_lowest_path(paths: &[String]) -> Option<String> {
+  let mut lowest_path: Option<(&str, usize)> = None;
+
+  for path_str in paths {
+    let component_count = Path::new(path_str).components().count();
+    if lowest_path.is_none_or(|(_, lowest)| component_count < lowest) {
+      lowest_path = Some((path_str, component_count));
+    }
   }
+
+  lowest_path.map(|(path, _)| path.to_string())
 }

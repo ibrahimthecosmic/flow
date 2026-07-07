@@ -31,6 +31,9 @@ import { core } from "ext:core/mod.js";
 // runtime/js/99_main.js, or `removeImportedOps()` scrubs it from `core.ops`
 // during bootstrap (before this file runs).
 const {
+  op_eszip_bundle,
+  op_eszip_unbundle_next,
+  op_eszip_unbundle_open,
   op_flow_events_accept,
   op_flow_events_cancel,
   op_flow_events_claim,
@@ -45,6 +48,11 @@ const {
 // channel to the spawned worker.
 const { createMessagePort } = core.loadExtScript(
   "ext:deno_web/13_message_port.js",
+);
+// `readableStreamForRid(rid)` wraps a deno_core byte-stream resource into a
+// ReadableStream<Uint8Array> (the standard resource-backed stream helper).
+const { readableStreamForRid } = core.loadExtScript(
+  "ext:deno_web/06_streams.js",
 );
 
 function define(name, value) {
@@ -189,6 +197,182 @@ const events = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// `FlowRuntime.bundle` / `FlowRuntime.unbundle`: the programmatic twin of the
+// `flow eszip bundle/unbundle` CLI (see edge/cli/src/flow_eszip.rs).
+
+// Collects a bytes-ish input (Uint8Array, ArrayBuffer, or
+// ReadableStream<Uint8Array>) into a single Uint8Array.
+async function collectBytes(input) {
+  if (input instanceof Uint8Array) {
+    return input;
+  }
+  if (input instanceof ArrayBuffer) {
+    return new Uint8Array(input);
+  }
+  if (input instanceof ReadableStream) {
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of input) {
+      if (!(chunk instanceof Uint8Array)) {
+        throw new TypeError("expected a ReadableStream of Uint8Array chunks");
+      }
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out;
+  }
+  throw new TypeError(
+    "expected a string path, Uint8Array, ArrayBuffer, or ReadableStream",
+  );
+}
+
+// Bundles an entrypoint into an eszip, returned as a
+// ReadableStream<Uint8Array>. `entrypoint` is either a path on disk (string)
+// or the entry module's SOURCE CODE (Uint8Array/ArrayBuffer/ReadableStream —
+// imports are resolved against the current working directory). Bundling runs
+// on a dedicated thread; failures surface as stream errors.
+function bundle(entrypoint, options = {}) {
+  const opOptions = {
+    staticPatterns: options.staticPatterns ?? [],
+    checksum: options.checksum,
+    timeoutMs: options.timeoutMs,
+    noModuleCache: options.noModuleCache ?? false,
+    importMapPath: options.importMapPath,
+  };
+
+  if (typeof entrypoint === "string") {
+    const rid = op_eszip_bundle({ ...opOptions, entrypoint });
+    return readableStreamForRid(rid);
+  }
+
+  // Source-code form: collecting the input may be async, so serve the
+  // op-backed stream through a wrapper to keep bundle() synchronous.
+  let reader;
+  return new ReadableStream({
+    async start() {
+      const code = new TextDecoder().decode(await collectBytes(entrypoint));
+      const rid = op_eszip_bundle({ ...opOptions, moduleCode: code });
+      reader = readableStreamForRid(rid).getReader();
+    },
+    async pull(controller) {
+      const { value, done } = await reader.read();
+      if (done) {
+        controller.close();
+      } else {
+        controller.enqueue(value);
+      }
+    },
+    cancel(reason) {
+      return reader?.cancel(reason);
+    },
+  });
+}
+
+// Unbundles an eszip (path, bytes, or stream). Returns an emitter:
+//
+//   unbundled.on("file", (metadata, stream) => { ... })  // one per file
+//   unbundled.on("finish", () => { ... })  // all files emitted
+//   unbundled.on("error", (err) => { ... })
+//   await unbundled.done  // resolves on finish, rejects on error
+//
+// When `output` (a directory path) is given, every file is also written to
+// disk under it — through Deno's filesystem APIs, so `flow run`'s permission
+// model applies (needs `--allow-write` on the output directory).
+//
+// "finish" means every entry was emitted, not that the per-file streams were
+// consumed; each stream carries a single in-memory chunk, so piping it cannot
+// stall. A "file" listener that throws aborts the job with "error".
+function unbundle(eszip, output) {
+  const listeners = { file: [], finish: [], error: [] };
+  let resolveDone, rejectDone;
+  const done = new Promise((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+
+  const emitter = {
+    on(event, fn) {
+      if (!listeners[event]) {
+        throw new TypeError(`unknown unbundle event: ${event}`);
+      }
+      listeners[event].push(fn);
+      return emitter;
+    },
+    off(event, fn) {
+      const arr = listeners[event] ?? [];
+      const at = arr.indexOf(fn);
+      if (at >= 0) {
+        arr.splice(at, 1);
+      }
+      return emitter;
+    },
+    done,
+  };
+
+  const emit = (event, ...args) => {
+    for (const fn of [...listeners[event]]) {
+      fn(...args);
+    }
+  };
+
+  // The pump starts with an await, so listeners attached synchronously after
+  // unbundle() returns are always registered before the first event fires.
+  (async () => {
+    const rid = typeof eszip === "string"
+      ? await op_eszip_unbundle_open({ path: eszip })
+      : await op_eszip_unbundle_open({ data: await collectBytes(eszip) });
+    try {
+      for (;;) {
+        const entry = await op_eszip_unbundle_next(rid);
+        if (entry == null) {
+          break;
+        }
+        const { specifier, path, kind, data } = entry;
+        if (output !== undefined) {
+          const dest = `${output}/${path}`;
+          await Deno.mkdir(dest.slice(0, dest.lastIndexOf("/")), {
+            recursive: true,
+          });
+          await Deno.writeFile(dest, data);
+        }
+        emit(
+          "file",
+          { specifier, path, kind, size: data.byteLength },
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(data);
+              controller.close();
+            },
+          }),
+        );
+      }
+    } finally {
+      core.close(rid);
+    }
+    emit("finish");
+    resolveDone();
+  })().catch((err) => {
+    if (listeners.error.length > 0) {
+      // Handled via the event; keep `done` from also surfacing as an
+      // unhandled rejection for event-only consumers.
+      done.catch(() => {});
+      rejectDone(err);
+      emit("error", err);
+    } else {
+      rejectDone(err);
+    }
+  });
+
+  return emitter;
+}
+
 // Host surface. The user-worker pool sender is injected into op_state by the
 // post-bootstrap hook before this runs, so `create` is functional immediately.
 define("FlowRuntime", {
@@ -197,4 +381,6 @@ define("FlowRuntime", {
     tryCleanupIdleWorkers,
   },
   events,
+  bundle,
+  unbundle,
 });
