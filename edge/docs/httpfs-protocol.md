@@ -67,8 +67,8 @@ and `403` for valid credentials lacking permission for the specific operation.
   restrictions (max length, character set) and reject with `400`; the error
   message should say why.
 - Paths are passed in the `path` query parameter, percent-encoded.
-- The server maps the path root to whatever the token is scoped to (e.g. a
-  workspace). Two tokens may see entirely different trees.
+- The server maps the path root to whatever the request's credentials are scoped
+  to (e.g. a workspace). Different credentials may see entirely different trees.
 
 ## 3. Common types
 
@@ -108,8 +108,8 @@ Non-2xx responses carry:
 | `NotADirectory`    | 409  | `ENOTDIR`   | path component is a file                    |
 | `IsADirectory`     | 409  | `EISDIR`    | file op on a dir                            |
 | `NotEmpty`         | 409  | `ENOTEMPTY` | non-recursive delete of a non-empty dir     |
-| `PermissionDenied` | 403  | `EPERM`     | token lacks permission                      |
-| `Unauthenticated`  | 401  | `EPERM`     | missing/invalid token                       |
+| `PermissionDenied` | 403  | `EPERM`     | credentials lack permission                 |
+| `Unauthenticated`  | 401  | `EPERM`     | missing/invalid credentials                 |
 | `TooLarge`         | 413  | `EFBIG`     | body exceeds declared write limit           |
 | `InvalidPath`      | 400  | `EINVAL`    | malformed path or request                   |
 | `RateLimited`      | 429  | —           | client retries with backoff (see §6)        |
