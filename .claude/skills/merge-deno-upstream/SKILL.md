@@ -41,13 +41,13 @@ by merging the upgrade branch to `main`, tagging, and deleting the branch (step
    `git fetch --no-tags upstream refs/tags/v<newver>` into `FETCH_HEAD` — NO tag
    is created locally), fast-forwards `deno` to it and pushes it, then creates
    `upgrade/<newver>` off `main` and merges `deno` in. Conflicts are expected —
-   that is the port work below.
-   **NEVER fetch all upstream tags** (`git fetch upstream` without `--no-tags`,
-   or `git fetch --tags`): denoland ships hundreds, they pollute the local tag
-   namespace, a `v<x>` tag would collide with the `upgrade/<x>` branch, and they
-   later leak onto `origin` (see step 8). Only ever fetch the single target
-   commit by its `refs/tags/<tag>` refspec into `FETCH_HEAD`. If you must fetch
-   manually, mirror the script exactly.
+   that is the port work below. **NEVER fetch all upstream tags**
+   (`git fetch upstream` without `--no-tags`, or `git fetch --tags`): denoland
+   ships hundreds, they pollute the local tag namespace, a `v<x>` tag would
+   collide with the `upgrade/<x>` branch, and they later leak onto `origin` (see
+   step 8). Only ever fetch the single target commit by its `refs/tags/<tag>`
+   refspec into `FETCH_HEAD`. If you must fetch manually, mirror the script
+   exactly.
 
 2. **Bring in the new Deno core.** The merge in step 1 brings the root crates
    (`cli/ runtime/ ext/ libs/`) from the `deno` mirror; flow's own root-crate
@@ -127,8 +127,8 @@ by merging the upgrade branch to `main`, tagging, and deleting the branch (step
    tag-triggered workflows when more than 3 tags are pushed at once** — the flow
    build never even starts. Always push the single release tag by its full
    refspec, as above. If junk tags ever leak onto origin, delete them (batched
-   `git push origin :refs/tags/<t>`, keeping only the `vX.Y.Z` releases) and then
-   delete + re-push the release tag ALONE to fire the build. See
+   `git push origin :refs/tags/<t>`, keeping only the `vX.Y.Z` releases) and
+   then delete + re-push the release tag ALONE to fire the build. See
    `flow-release-and-install.md` and `flow-runtime-progress.md` (release
    gotchas).
 
