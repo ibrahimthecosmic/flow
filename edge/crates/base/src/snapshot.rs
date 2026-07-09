@@ -35,6 +35,18 @@ mod residual {
 pub use residual::RESIDUAL_LAZY_ESM;
 pub use residual::RESIDUAL_LAZY_JS;
 
+/// `(specifier, raw source)` for every worker extension file whose bytes live
+/// on disk at build time (`LoadedFromFsDuringSnapshot`). Embedded into the
+/// binary by `build.rs` so worker isolates — which always boot without a
+/// loadable snapshot (see the module comment) — get their extension sources
+/// from memory instead of reading the build machine's filesystem at runtime.
+/// `src/runtime/mod.rs` applies this via `embed_extension_sources`.
+mod embedded {
+  include!(concat!(env!("OUT_DIR"), "/EMBEDDED_EXT_SOURCES.rs"));
+}
+
+pub use embedded::EMBEDDED_EXT_SOURCES;
+
 pub fn snapshot() -> Option<&'static [u8]> {
   // See the module comment: loading this blob alongside the main isolate's
   // CLI_SNAPSHOT crashes V8 (shared read-only heap, one blob per process).

@@ -8,6 +8,7 @@ use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::task::Poll;
 use std::time::Duration;
@@ -428,6 +429,83 @@ impl RunOptionsBuilder {
       duplex_stream_rx,
       maybe_cpu_usage_metrics_tx,
     })
+  }
+}
+
+/// Process-wide map of extension specifier -> embedded source, as
+/// `FastStaticString`s built once from the binary's read-only data.
+///
+/// Each entry references the `&'static str` that `build.rs` embedded via
+/// `include_str!` — no source bytes are copied. The only allocation is one
+/// tiny `v8::OneByteConst` descriptor per source, leaked exactly once for the
+/// process (bounded by the number of extension files, ~30), never per worker.
+fn embedded_ext_source_map()
+-> &'static HashMap<&'static str, deno_core::FastStaticString> {
+  static MAP: OnceLock<HashMap<&'static str, deno_core::FastStaticString>> =
+    OnceLock::new();
+  MAP.get_or_init(|| {
+    snapshot::EMBEDDED_EXT_SOURCES
+      .iter()
+      .map(|(specifier, source)| {
+        // `build.rs` only embeds ASCII extension sources; the const ctor
+        // asserts this. Leaked once (via OnceLock), so it does not accumulate.
+        let one_byte = Box::leak(Box::new(
+          deno_core::FastStaticString::create_external_onebyte_const(
+            source.as_bytes(),
+          ),
+        ));
+        (*specifier, deno_core::FastStaticString::new(one_byte))
+      })
+      .collect()
+  })
+}
+
+/// Rewrite each extension's source files so their bytes come from the binary
+/// (`snapshot::EMBEDDED_EXT_SOURCES`) instead of the build machine's
+/// filesystem.
+///
+/// The worker startup snapshot is never loaded (see `src/snapshot.rs`), so
+/// worker isolates boot fresh and `deno_core` loads every extension source
+/// from its `ExtensionFileSource`. For files declared via the `extension!`
+/// macro that is a `LoadedFromFsDuringSnapshot` path fixed at build time
+/// (`CARGO_MANIFEST_DIR/...`) — valid only on the machine that built the
+/// binary. We replace those with `IncludedInBinary` sources that point at the
+/// embedded bytes; every other source kind (already embedded / inline) is left
+/// untouched.
+///
+/// This is zero-copy: the replacement `FastStaticString`s reference the same
+/// `&'static` bytes for every worker, so per-worker memory is unchanged
+/// relative to the old disk path (which read each file into a fresh `String`).
+/// Raw (un-transpiled) source is embedded, matching what the disk path handed
+/// `deno_core`; the runtime's extension transpiler then runs over it exactly as
+/// before, so this is behavior-preserving apart from where the bytes come from.
+fn embed_extension_sources(extensions: &mut [deno_core::Extension]) {
+  use deno_core::ExtensionFileSource;
+
+  let map = embedded_ext_source_map();
+  if map.is_empty() {
+    return;
+  }
+
+  let rewrite = |files: &mut Cow<'static, [ExtensionFileSource]>| {
+    if !files.iter().any(|f| map.contains_key(f.specifier)) {
+      return;
+    }
+    let rewritten = files
+      .iter()
+      .map(|file| match map.get(file.specifier) {
+        Some(source) => ExtensionFileSource::new(file.specifier, *source),
+        None => file.clone(),
+      })
+      .collect::<Vec<_>>();
+    *files = Cow::Owned(rewritten);
+  };
+
+  for ext in extensions.iter_mut() {
+    rewrite(&mut ext.js_files);
+    rewrite(&mut ext.esm_files);
+    rewrite(&mut ext.lazy_loaded_js_files);
+    rewrite(&mut ext.lazy_loaded_esm_files);
   }
 }
 
@@ -987,7 +1065,7 @@ where
           Arc::new(DenoCompileFileSystem::from_rc(vfs))
         })?;
 
-        let extensions = vec![
+        let mut extensions = vec![
           deno_telemetry::deno_telemetry::init(),
           deno_webidl::deno_webidl::init(),
           deno_web::deno_web::lazy_init(),
@@ -1039,6 +1117,14 @@ where
             permissions,
           ),
         ];
+
+        // Serve extension sources from the binary instead of the build
+        // machine's filesystem. Without this, worker creation reads each
+        // extension's `.ts`/`.js` from a path baked at build time
+        // (`CARGO_MANIFEST_DIR`), which panics on any binary run on a
+        // different machine than it was built on. See `embed_extension_sources`
+        // and `snapshot::EMBEDDED_EXT_SOURCES`.
+        embed_extension_sources(&mut extensions);
 
         let mut create_params = None;
         let mut mem_check = MemCheck {
