@@ -3982,8 +3982,9 @@ mod test {
       }
     }
 
-    // the fixture throws if Flow.context is missing values, leaks
-    // runtime-owned keys, or is not deep-frozen/memoized
+    // the fixture throws if FlowRuntime.context is missing values, leaks
+    // runtime-owned keys, is not deep-frozen/memoized, or is missing
+    // scheduleTermination
     let mut main_rt = RuntimeBuilder::new()
       .set_std_env()
       .set_path("./test_cases/flow_context")
@@ -4004,7 +4005,11 @@ mod test {
       )
       .await;
 
-    assert!(result.is_ok(), "Flow.context test failed: {:?}", result);
+    assert!(
+      result.is_ok(),
+      "FlowRuntime.context test failed: {:?}",
+      result
+    );
   }
 
   #[tokio::test]

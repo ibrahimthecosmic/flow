@@ -57,7 +57,6 @@ import { FLOW_ENV } from "ext:env/env.js";
 import { FlowEventListener } from "ext:user_event_worker/event_worker.js";
 import {
   installEdgeRuntimeNamespace,
-  installFlowNamespace,
   installTrexNamespace,
 } from "ext:runtime/namespaces.js";
 
@@ -609,9 +608,8 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
   });
 
   installPromiseHook(kind);
-  installEdgeRuntimeNamespace(kind, ctx.terminationRequestToken);
+  installEdgeRuntimeNamespace(kind, ctx);
   installTrexNamespace(kind, ctx.terminationRequestToken);
-  installFlowNamespace(kind, ctx);
 
   ObjectDefineProperty(
     globalThis,

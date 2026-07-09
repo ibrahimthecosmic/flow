@@ -22,7 +22,7 @@ const {
 } = primordials;
 
 // Bootstrap-context keys owned by the runtime, not the embedder; they never
-// show up in `Flow.context`.
+// show up in `FlowRuntime.context`.
 const RUNTIME_CONTEXT_KEYS = ["terminationRequestToken"];
 
 function deepFreeze(value) {
@@ -131,9 +131,13 @@ function installTrexNamespace(kind, terminationRequestTokenRid) {
 
 /*
  * @param {"user" | "main" | "event"} kind
- * @param {number} terminationRequestTokenRid
+ * @param {object | undefined} ctx the merged bootstrap context (embedder extra
+ *   context + the `context` passed to `userWorkers.create`, plus runtime-owned
+ *   keys, which are stripped from the public `context` getter installed below)
  */
-function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
+function installEdgeRuntimeNamespace(kind, ctx) {
+  const terminationRequestTokenRid = ctx?.terminationRequestToken;
+
   let props = {
     scheduleTermination: () =>
       ops.op_cancel_drop_token(terminationRequestTokenRid),
@@ -164,13 +168,33 @@ function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
     case "user":
       props = {
         waitUntil,
+        // Spread the base props so user workers keep `scheduleTermination` —
+        // their sole graceful self-exit (Deno.exit is a no-op in the sandbox).
+        ...props,
       };
       break;
   }
 
-  if (props === void 0) {
-    return;
-  }
+  // The JSON `context` this worker/isolate was created with — deep-frozen and
+  // memoized, runtime-owned keys stripped. Formerly the separate `Flow`
+  // namespace; folded in so `FlowRuntime` is the single flow surface.
+  let frozenContext;
+  ObjectDefineProperty(props, "context", {
+    get() {
+      if (frozenContext === undefined) {
+        // JSON round-trip: the context is JSON-derived by construction, and
+        // this detaches the public context from the internal bootstrap object.
+        const clone = JSONParse(JSONStringify(ctx ?? {}));
+        for (const key of RUNTIME_CONTEXT_KEYS) {
+          delete clone[key];
+        }
+        frozenContext = deepFreeze(clone);
+      }
+      return frozenContext;
+    },
+    enumerable: true,
+    configurable: true,
+  });
 
   ObjectDefineProperty(globalThis, "FlowRuntime", {
     get() {
@@ -180,39 +204,4 @@ function installEdgeRuntimeNamespace(kind, terminationRequestTokenRid) {
   });
 }
 
-/**
- * @param {"user" | "main" | "event"} _kind
- * @param {object | undefined} bootstrapContext the merged bootstrap context
- *   (embedder extra context + the `context` object passed to
- *   `userWorkers.create`, plus runtime-owned keys, which are stripped)
- */
-function installFlowNamespace(_kind, bootstrapContext) {
-  let frozenContext;
-  const props = {
-    get context() {
-      if (frozenContext === undefined) {
-        // JSON round-trip: the context is JSON-derived by construction, and
-        // this detaches Flow.context from the internal bootstrap object.
-        const clone = JSONParse(JSONStringify(bootstrapContext ?? {}));
-        for (const key of RUNTIME_CONTEXT_KEYS) {
-          delete clone[key];
-        }
-        frozenContext = deepFreeze(clone);
-      }
-      return frozenContext;
-    },
-  };
-
-  ObjectDefineProperty(globalThis, "Flow", {
-    get() {
-      return props;
-    },
-    configurable: true,
-  });
-}
-
-export {
-  installEdgeRuntimeNamespace,
-  installFlowNamespace,
-  installTrexNamespace,
-};
+export { installEdgeRuntimeNamespace, installTrexNamespace };

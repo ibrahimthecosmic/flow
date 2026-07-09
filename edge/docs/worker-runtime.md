@@ -8,12 +8,18 @@ globals. This page documents what differs from plain Deno.
 
 ### `FlowRuntime`
 
-| Member                           | Meaning                                                                                                                                                                    |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `FlowRuntime.parentPort`         | `MessagePort` to the host handle that created this worker                                                                                                                  |
-| `FlowRuntime.parentPorts`        | Array of every parent port delivered so far (first one included)                                                                                                           |
-| `FlowRuntime.onparentport`       | Assignable callback `(port: MessagePort) => void`, invoked when a reused `create()` delivers an additional channel (see [user-workers.md](./user-workers.md#worker-reuse)) |
-| `FlowRuntime.waitUntil(promise)` | Keep the worker alive until the promise settles (useful for background work after replying)                                                                                |
+| Member                              | Meaning                                                                                                                                                                     |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FlowRuntime.parentPort`            | `MessagePort` to the host handle that created this worker                                                                                                                   |
+| `FlowRuntime.parentPorts`           | Array of every parent port delivered so far (first one included)                                                                                                            |
+| `FlowRuntime.onparentport`          | Assignable callback `(port: MessagePort) => void`, invoked when a reused `create()` delivers an additional channel (see [user-workers.md](./user-workers.md#worker-reuse))  |
+| `FlowRuntime.waitUntil(promise)`    | Keep the worker alive until the promise settles (useful for background work after replying)                                                                                 |
+| `FlowRuntime.scheduleTermination()` | Ask the supervisor to terminate this worker gracefully — a worker's only self-exit, since `Deno.exit` is a no-op (see [Lifecycle](#lifecycle-limits-and-events))            |
+| `FlowRuntime.context`               | The deep-frozen JSON `context` this worker was created with, with runtime-owned keys stripped (empty `{}` if none). Read back what the host passed as `create({ context })` |
+
+> `FlowRuntime` is the single flow global — the same name in the host isolate
+> and in workers, with context-appropriate members. (There is no separate `Flow`
+> global; `Flow.context` is now `FlowRuntime.context`.)
 
 ```ts
 FlowRuntime.parentPort.onmessage = (e) => {
@@ -50,7 +56,8 @@ User workers are designed to run untrusted code. Compared to plain Deno:
   works normally (it goes through the module loader, not these APIs).
 - **Process control**: `Deno.exit`, `Deno.kill`, `Deno.addSignalListener`,
   `Deno.removeSignalListener` are mocked (no-ops) — a worker cannot take down or
-  signal the host process.
+  signal the host process. To end itself, a worker calls
+  `FlowRuntime.scheduleTermination()` (graceful), not `Deno.exit`.
 - **Environment**: `Deno.env` (and Node's `process.env`) contain exactly the
   `envVars` passed to `create()` — nothing is inherited from the host.
 - **Host info hiding**: `Deno.args` is `[]`, `Deno.pid`/`process.pid` are
@@ -115,6 +122,19 @@ supervisor enforcing the limits from `create()`:
 
 A terminated worker never harms the host: the main isolate and all other workers
 keep running; the dead worker's ports go silent.
+
+**How a worker ends.** A worker stops when any of these happens:
+
+- its event loop empties — no pending timers/IO, nothing keeping it alive via
+  `FlowRuntime.waitUntil`, and no message handler expecting more input;
+- it calls `FlowRuntime.scheduleTermination()` to bow out gracefully;
+- the supervisor enforces a limit above (CPU/memory/wall-clock);
+- the host retires it — an idle worker reclaimed by
+  `FlowRuntime.userWorkers.tryCleanupIdleWorkers(timeoutMs)`, or the process
+  shutting down.
+
+`Deno.exit` does **not** end a worker (it is a no-op); use
+`scheduleTermination()`.
 
 ### Lifecycle events
 

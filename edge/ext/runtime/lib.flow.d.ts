@@ -9,7 +9,7 @@
 //   - edge/ext/workers/lib.rs            (UserWorkerCreateOptions)
 //   - edge/docs/httpfs-protocol.md       (HttpFS mount config, §7)
 
-/** JSON-serializable value: what `context` and `Flow.context` may carry. */
+/** JSON-serializable value: what `context` and `FlowRuntime.context` may carry. */
 declare type FlowJsonValue =
   | string
   | number
@@ -161,7 +161,7 @@ declare interface FlowUserWorkerCreateOptions {
 
   /**
    * Arbitrary JSON handed to the worker; the worker reads it back via the
-   * deep-frozen `Flow.context` global. Runtime-owned keys (e.g.
+   * deep-frozen `FlowRuntime.context` global. Runtime-owned keys (e.g.
    * `terminationRequestToken`) are stripped from what the worker sees.
    */
   context?: { [key: string]: FlowJsonValue };
@@ -256,10 +256,11 @@ declare interface FlowUnbundled {
 }
 
 /**
- * Host-side flow surface, available in the MAIN isolate (`flow run ...`).
- *
- * In USER workers, `FlowRuntime` instead exposes the worker-side helpers
- * (`waitUntil`, `scheduleTermination`).
+ * The flow runtime surface. `FlowRuntime` is the single flow global in both the
+ * MAIN isolate (`flow run ...`) and USER workers, but the members differ by
+ * context: the host exposes the pool/tooling below (`userWorkers`, `events`,
+ * `bundle`, …), while a worker exposes the worker-side helpers (`parentPort`,
+ * `waitUntil`, `scheduleTermination`). `context` is available in both.
  */
 declare const FlowRuntime: {
   userWorkers: {
@@ -297,22 +298,27 @@ declare const FlowRuntime: {
     output?: string,
   ): FlowUnbundled;
 
-  /** USER workers only: keep the worker alive until `promise` settles. */
-  waitUntil?<T>(promise: Promise<T>): Promise<T>;
-  /** USER workers only: request supervisor-driven termination. */
-  scheduleTermination?(): void;
-};
-
-/**
- * Worker-side flow surface (available in all worker kinds; primarily useful
- * inside USER workers).
- */
-declare const Flow: {
   /**
-   * The JSON `context` this worker was created with (deep-frozen, memoized).
-   * Runtime-owned bootstrap keys are stripped.
+   * The JSON `context` this worker/isolate was created with (deep-frozen,
+   * memoized); runtime-owned bootstrap keys are stripped. Empty `{}` when none
+   * was provided. (Formerly the separate `Flow.context` global.)
    */
   readonly context: Readonly<{ [key: string]: FlowJsonValue }>;
+
+  /** USER workers: duplex `MessagePort` to the host handle that created this
+   * worker. */
+  parentPort?: MessagePort;
+  /** USER workers: every parent port delivered so far (pool reuse delivers
+   * additional channels, SharedWorker-style — the first is included). */
+  parentPorts?: MessagePort[];
+  /** USER workers: assignable callback invoked with each additional parent port
+   * delivered by a reused `create()`. */
+  onparentport?: (port: MessagePort) => void;
+  /** USER workers: keep the worker alive until `promise` settles. */
+  waitUntil?<T>(promise: Promise<T>): Promise<T>;
+  /** USER workers: request graceful self-termination. This is a worker's only
+   * self-exit — `Deno.exit` is a no-op in the sandbox. */
+  scheduleTermination?(): void;
 };
 
 /** flow runtime version string. */
