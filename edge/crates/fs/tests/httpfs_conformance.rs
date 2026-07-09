@@ -287,7 +287,7 @@ fn saw_any_credential(
 
 async fn handle(
   state: SharedState,
-  addr: SocketAddr,
+  origin: String,
   req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
   let method = req.method().clone();
@@ -363,13 +363,15 @@ async fn handle(
   let body = req.into_body().collect().await?.to_bytes();
 
   let mut state = state.lock().unwrap();
-  let resp = route(&mut state, addr, &method, &endpoint, &params, range, body);
+  let resp = route(
+    &mut state, &origin, &method, &endpoint, &params, range, body,
+  );
   Ok(resp)
 }
 
 fn route(
   state: &mut State,
-  addr: SocketAddr,
+  origin: &str,
   method: &Method,
   endpoint: &str,
   params: &HashMap<String, String>,
@@ -459,7 +461,7 @@ fn route(
         ReadMode::Direct => range_response(&data, range.as_deref()),
         ReadMode::RedirectSameOrigin => Response::builder()
           .status(StatusCode::TEMPORARY_REDIRECT)
-          .header("location", format!("http://{addr}/fs/v1/authed-blob{path}"))
+          .header("location", format!("{origin}/fs/v1/authed-blob{path}"))
           .body(Full::new(Bytes::new()))
           .unwrap(),
         ReadMode::RedirectCrossOrigin => Response::builder()
@@ -619,7 +621,7 @@ fn route(
         StatusCode::OK,
         json!({
           "url": format!(
-            "http://{addr}/fs/v1/upload/put?uploadId={upload_id}&partNumber={part_number}"
+            "{origin}/fs/v1/upload/put?uploadId={upload_id}&partNumber={part_number}"
           ),
           "expiresAtMs": 1_900_000_000_000u64,
         }),
@@ -680,6 +682,35 @@ fn route(
 async fn spawn_server(state: SharedState) -> SocketAddr {
   let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
   let addr = listener.local_addr().unwrap();
+  let origin = format!("http://{addr}");
+
+  tokio::spawn(async move {
+    loop {
+      let Ok((stream, _)) = listener.accept().await else {
+        break;
+      };
+      let state = state.clone();
+      let origin = origin.clone();
+
+      tokio::spawn(async move {
+        let _ = hyper::server::conn::http1::Builder::new()
+          .serve_connection(
+            TokioIo::new(stream),
+            service_fn(move |req| handle(state.clone(), origin.clone(), req)),
+          )
+          .await;
+      });
+    }
+  });
+
+  addr
+}
+
+/// Serves the same mock over an AF_UNIX socket. The generated redirect /
+/// part URLs use `http://localhost` so the client — whose `baseUrl` host is
+/// `localhost` — treats them as same-origin and keeps them on the socket.
+async fn spawn_unix_server(state: SharedState, socket: PathBuf) {
+  let listener = tokio::net::UnixListener::bind(&socket).unwrap();
 
   tokio::spawn(async move {
     loop {
@@ -692,14 +723,14 @@ async fn spawn_server(state: SharedState) -> SocketAddr {
         let _ = hyper::server::conn::http1::Builder::new()
           .serve_connection(
             TokioIo::new(stream),
-            service_fn(move |req| handle(state.clone(), addr, req)),
+            service_fn(move |req| {
+              handle(state.clone(), "http://localhost".to_string(), req)
+            }),
           )
           .await;
       });
     }
   });
-
-  addr
 }
 
 fn http_fs_config(addr: SocketAddr) -> HttpFsConfig {
@@ -726,6 +757,35 @@ async fn setup(state: State) -> (HttpFs, SharedState, SocketAddr) {
   let fs = HttpFs::new(http_fs_config(addr)).unwrap();
 
   (fs, state, addr)
+}
+
+fn http_fs_config_unix(socket: &std::path::Path) -> HttpFsConfig {
+  let headers: serde_json::Map<String, serde_json::Value> = CRED_HEADERS
+    .iter()
+    .map(|(name, value)| (name.to_string(), json!(value)))
+    .collect();
+  let query: serde_json::Map<String, serde_json::Value> = CRED_QUERY
+    .iter()
+    .map(|(name, value)| (name.to_string(), json!(value)))
+    .collect();
+  serde_json::from_value(json!({
+    "mountPoint": "/objects",
+    "baseUrl": "http://localhost/fs/v1",
+    "socketPath": socket.to_str().unwrap(),
+    "headers": headers,
+    "query": query,
+  }))
+  .unwrap()
+}
+
+async fn setup_unix(state: State) -> (HttpFs, SharedState, tempfile::TempDir) {
+  let state = Arc::new(Mutex::new(state));
+  let dir = tempfile::tempdir().unwrap();
+  let socket = dir.path().join("fs.sock");
+  spawn_unix_server(state.clone(), socket.clone()).await;
+  let fs = HttpFs::new(http_fs_config_unix(&socket)).unwrap();
+
+  (fs, state, dir)
 }
 
 fn checked(path: &str) -> CheckedPathBuf {
@@ -1140,6 +1200,93 @@ async fn sync_surface_works() {
       .unwrap();
     assert_eq!(&*data, b"sync bytes");
     assert!(fs_clone.stat_sync(&path.as_checked_path()).unwrap().is_file);
+  })
+  .await
+  .unwrap();
+}
+
+// The unix-socket transport swaps only how bytes reach the server; the whole
+// protocol layer is shared with the TCP path. These tests prove the shim
+// end-to-end, including same-origin redirect routing over the socket and the
+// sync surface.
+
+#[tokio::test]
+async fn unix_socket_roundtrip() {
+  let (fs, _state, _dir) = setup_unix(State::new()).await;
+
+  fs.mkdir_async(checked("reports"), true, None)
+    .await
+    .unwrap();
+  write(&fs, "reports/q1.txt", b"over a socket").await;
+
+  let stat = fs.stat_async(checked("reports/q1.txt")).await.unwrap();
+  assert!(stat.is_file);
+  assert_eq!(stat.size, 13);
+
+  assert_eq!(read(&fs, "reports/q1.txt").await, b"over a socket");
+
+  let rd = fs.read_dir_async(checked("reports")).await.unwrap();
+  let mut names = Vec::new();
+  while let Some(entry) = deno_fs::FsReadDir::next(&*rd).await.unwrap() {
+    names.push((entry.name, entry.is_file));
+  }
+  assert_eq!(names, vec![("q1.txt".to_string(), true)]);
+
+  fs.remove_async(checked("reports/q1.txt"), false)
+    .await
+    .unwrap();
+  let err = fs
+    .stat_async(checked("reports/q1.txt"))
+    .await
+    .err()
+    .unwrap();
+  assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn unix_socket_read_redirect_same_origin() {
+  let mut state = State::new();
+  state.read_mode = ReadMode::RedirectSameOrigin;
+  let (fs, _state, _dir) = setup_unix(state).await;
+
+  write(&fs, "a.txt", b"redirected over socket").await;
+
+  // The redirect target (`http://localhost/...authed-blob`) is same-origin, so
+  // it must stay on the socket AND keep the credential — the authed-blob route
+  // 401s without it.
+  assert_eq!(read(&fs, "a.txt").await, b"redirected over socket");
+}
+
+#[tokio::test]
+async fn unix_socket_multipart_upload() {
+  let mut state = State::new();
+  state.direct_write_max_bytes = 8;
+  state.multipart = true;
+  let (fs, state, _dir) = setup_unix(state).await;
+
+  let data = b"twenty bytes of data".to_vec();
+  write(&fs, "big.bin", &data).await;
+
+  assert_eq!(read(&fs, "big.bin").await, data);
+  let state = state.lock().unwrap();
+  assert!(state.log.iter().any(|it| it == "POST /upload/commit"));
+  assert!(!state.log.iter().any(|it| it == "PUT /write"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unix_socket_sync_surface() {
+  let (fs, _state, _dir) = setup_unix(State::new()).await;
+
+  let fs_clone = fs.clone();
+  tokio::task::spawn_blocking(move || {
+    let path = checked("sync.txt");
+    fs_clone
+      .write_file_sync(&path.as_checked_path(), OPEN_WRITE, b"sync bytes")
+      .unwrap();
+    let data = fs_clone
+      .read_file_sync(&path.as_checked_path(), OPEN_READ)
+      .unwrap();
+    assert_eq!(&*data, b"sync bytes");
   })
   .await
   .unwrap();

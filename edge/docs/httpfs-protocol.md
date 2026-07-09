@@ -26,7 +26,7 @@ Design goals, in priority order:
 
 ## 1. Transport
 
-- HTTPS (HTTP permitted for local development).
+- HTTPS (HTTP permitted for local development), over TCP or an AF_UNIX socket.
 - All endpoints are relative to a configured `baseUrl`, which may include any
   path prefix (e.g. `https://api.example.com/fs/v1`). The protocol does not
   reserve a version segment; versioning is negotiated via `GET /capabilities`.
@@ -55,6 +55,22 @@ keys are appended alongside protocol params — avoid the reserved names in §5
 (`path`, `cursor`, `uploadId`, `partNumber`, `contentType`, `overwrite`,
 `parents`, `recursive`). Servers respond `401` for missing/invalid credentials
 and `403` for valid credentials lacking permission for the specific operation.
+
+### 1.2 Unix-socket transport
+
+For a server that shares the worker's host (a sidecar), the mount may be
+configured with a `socketPath` (§7): protocol requests are then made over that
+AF_UNIX socket instead of TCP. `baseUrl` stays an http(s) URL, but its host is a
+placeholder — it supplies only the path prefix, the `Host` header, and the
+origin used to scope credentials across redirects (use e.g.
+`http://localhost/fs/v1`). The wire protocol is otherwise identical; a
+conformant server needs no changes to be reachable over a socket.
+
+A cross-origin redirect or presigned-upload target (§5.3/§5.5) names a real host
+and is always fetched over TCP, even for a unix-socket mount — so a local API
+can still hand off large transfers to object storage. The client opens a fresh
+socket connection per request (no pooling) and buffers each response body in
+full rather than streaming it.
 
 ## 2. Paths
 
@@ -280,7 +296,13 @@ FlowRuntime.userWorkers.create({
       baseUrl: "https://api.example.com/fs/v1",
       headers: { Authorization: "Bearer <opaque>" },
       query: { wsId: "<id>" }, // optional; both maps are optional
-    }
+    },
+    {
+      // A server on the same host, reached over a unix socket (§1.2).
+      mountPoint: "/local",
+      baseUrl: "http://localhost/fs/v1", // placeholder host; path prefix + origin
+      socketPath: "/run/flow/fs.sock",
+    },
   ],
 })
 ```
@@ -290,6 +312,9 @@ collide with `/tmp` or any configured S3 mount. Sync fs APIs work on HttpFS
 mounts (each sync call blocks the calling worker thread for at least one network
 round trip — worker wall-clock timeouts keep running).
 
+`socketPath` (optional) routes the mount over an AF_UNIX socket instead of TCP;
+see §1.2 for how `baseUrl` is interpreted in that case.
+
 ## 8. Conformance
 
 The conformance suite (`edge/crates/fs/tests/httpfs_conformance.rs`) runs the
@@ -298,7 +323,9 @@ implementation of this protocol. It exercises every endpoint, the error/errno
 mappings, custom headers and query params (including same-origin attachment and
 cross-origin stripping), redirect handling, pagination, ranged reads, overwrite
 flags, capability gating (version refusal, copy fallback, multipart vs.
-`EFBIG`), and the sync fs surface. Run it with:
+`EFBIG`), and the sync fs surface. It also serves the same mock over an AF_UNIX
+socket (§1.2) to cover the unix-socket transport end-to-end, including
+same-origin redirect routing. Run it with:
 
 ```
 cargo test -p fs --test httpfs_conformance

@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::ensure;
+use bytes::Bytes;
 use deno_core::AsyncRefCell;
 use deno_core::BufMutView;
 use deno_core::BufView;
@@ -43,6 +44,9 @@ use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use futures::future::LocalBoxFuture;
 use futures::future::Shared;
+use http_body_util::BodyExt;
+use http_body_util::Full;
+use hyper_util::rt::TokioIo;
 use indexmap::IndexMap;
 use reqwest::Method;
 use reqwest::StatusCode;
@@ -55,6 +59,7 @@ use tracing::error;
 use tracing::instrument;
 use tracing::trace;
 use tracing::warn;
+use url::Position;
 use url::Url;
 
 use crate::rt;
@@ -88,6 +93,13 @@ pub struct HttpFsConfig {
   /// Custom query params appended to every request (protocol §1.1).
   #[serde(default)]
   query: IndexMap<String, String>,
+  /// When set, requests are made over this AF_UNIX socket instead of TCP.
+  /// `baseUrl` still supplies the URL path prefix, the `Host` header, and the
+  /// origin that scopes credentials across redirects — use a placeholder host
+  /// (e.g. `http://localhost/fs/v1`). Cross-origin redirect/presigned targets
+  /// are still fetched over TCP.
+  #[serde(default)]
+  socket_path: Option<String>,
 }
 
 /// One or many HttpFS mounts (the `httpFs` worker create option).
@@ -251,6 +263,11 @@ pub struct HttpFs {
 struct HttpFsInner {
   client: reqwest::Client,
   base_url: Url,
+  /// When `Some`, protocol requests to `base_url`'s origin are driven over this
+  /// AF_UNIX socket instead of TCP (see [`HttpFsConfig::socket_path`]). The
+  /// `client` is still used to *build* every request and to reach cross-origin
+  /// (presigned) targets over TCP.
+  socket_path: Option<PathBuf>,
   /// Custom headers attached to every same-origin request. Pre-parsed so an
   /// invalid name/value fails at mount creation, not on the first fs op.
   headers: header::HeaderMap,
@@ -278,6 +295,11 @@ impl HttpFs {
       format!("invalid HttpFS baseUrl: {}", config.base_url)
     })?;
 
+    // `baseUrl` stays an http(s) URL even for unix-socket mounts: it supplies
+    // the path prefix, the `Host` header, and the origin used to scope
+    // credentials across redirects (use a placeholder host like
+    // `http://localhost/fs/v1`). The socket path, when set, only replaces the
+    // TCP transport for same-origin requests.
     ensure!(
       matches!(base_url.scheme(), "http" | "https"),
       "HttpFS baseUrl must be http(s): {}",
@@ -321,6 +343,7 @@ impl HttpFs {
       inner: Arc::new(HttpFsInner {
         client,
         base_url,
+        socket_path: config.socket_path.map(PathBuf::from),
         headers,
         query: config.query.into_iter().collect(),
         capabilities: tokio::sync::OnceCell::new(),
@@ -464,14 +487,42 @@ impl HttpFsInner {
     req.headers(self.headers.clone())
   }
 
+  /// Whether a request to `base_url`'s own origin should go over the unix
+  /// socket (as opposed to TCP). Cross-origin targets always take TCP, so
+  /// callers touching redirect/presigned URLs pass an explicit flag to the
+  /// `*_dispatch` variants instead.
+  fn over_socket_default(&self) -> bool {
+    self.socket_path.is_some()
+  }
+
   async fn send(
     &self,
     req: reqwest::RequestBuilder,
   ) -> FsResult<reqwest::Response> {
-    req
-      .send()
-      .await
-      .map_err(|err| FsError::Io(io::Error::other(err)))
+    self.send_dispatch(req, self.over_socket_default()).await
+  }
+
+  /// Sends over the unix socket when `over_socket`, else over TCP via reqwest.
+  async fn send_dispatch(
+    &self,
+    req: reqwest::RequestBuilder,
+    over_socket: bool,
+  ) -> FsResult<reqwest::Response> {
+    if over_socket {
+      let socket = self
+        .socket_path
+        .as_deref()
+        .expect("over_socket implies a configured socket_path");
+      let req = req
+        .build()
+        .map_err(|err| FsError::Io(io::Error::other(err)))?;
+      unix_send(socket, req).await
+    } else {
+      req
+        .send()
+        .await
+        .map_err(|err| FsError::Io(io::Error::other(err)))
+    }
   }
 
   /// Sends a request that is safe to repeat, retrying once on 5xx/429
@@ -480,8 +531,18 @@ impl HttpFsInner {
     &self,
     req: reqwest::RequestBuilder,
   ) -> FsResult<reqwest::Response> {
+    self
+      .send_idempotent_dispatch(req, self.over_socket_default())
+      .await
+  }
+
+  async fn send_idempotent_dispatch(
+    &self,
+    req: reqwest::RequestBuilder,
+    over_socket: bool,
+  ) -> FsResult<reqwest::Response> {
     let retry = req.try_clone();
-    let resp = self.send(req).await?;
+    let resp = self.send_dispatch(req, over_socket).await?;
 
     let should_retry = resp.status().is_server_error()
       || resp.status() == StatusCode::TOO_MANY_REQUESTS;
@@ -490,7 +551,7 @@ impl HttpFsInner {
       (true, Some(retry)) => {
         debug!(status = %resp.status(), "retrying idempotent HttpFS request");
         tokio::time::sleep(RETRY_DELAY).await;
-        self.send(retry).await
+        self.send_dispatch(retry, over_socket).await
       }
 
       _ => Ok(resp),
@@ -583,7 +644,12 @@ impl HttpFsInner {
       req = self.apply_headers(req);
     }
 
-    self.send_idempotent(apply_range(req, range)).await
+    // Same-origin targets ride the same transport as the base request; a
+    // cross-origin presigned URL is a real host, so it always takes TCP.
+    let over_socket = self.socket_path.is_some() && same_origin;
+    self
+      .send_idempotent_dispatch(apply_range(req, range), over_socket)
+      .await
   }
 
   async fn stat_entry(&self, path: &str) -> FsResult<Entry> {
@@ -821,8 +887,13 @@ impl HttpFsInner {
         req = self.apply_headers(req);
       }
 
-      let resp =
-        ensure_success(self.send(req.body(chunk.to_vec())).await?).await?;
+      let over_socket = self.socket_path.is_some() && same_origin;
+      let resp = ensure_success(
+        self
+          .send_dispatch(req.body(chunk.to_vec()), over_socket)
+          .await?,
+      )
+      .await?;
       let etag = resp
         .headers()
         .get(header::ETAG)
@@ -1006,6 +1077,111 @@ async fn ensure_success(
     .unwrap_or_else(|| format!("HttpFS server answered {status}"));
 
   Err(FsError::Io(io::Error::new(kind, message)))
+}
+
+/// Drives one request over an AF_UNIX socket and adapts the answer back into a
+/// [`reqwest::Response`], so the whole protocol layer stays transport-agnostic.
+///
+/// A fresh connection is opened per request (no pooling) — this mirrors the TCP
+/// client's `pool_max_idle_per_host(0)` and side-steps the cross-runtime
+/// connection-ownership hazard documented in [`HttpFs::new`]. The response body
+/// is buffered in full rather than streamed: unix mounts target a local
+/// sidecar, and the write path already buffers whole objects, so trading
+/// streaming for a much smaller transport shim is the right call here.
+async fn unix_send(
+  socket: &Path,
+  req: reqwest::Request,
+) -> FsResult<reqwest::Response> {
+  let stream =
+    tokio::net::UnixStream::connect(socket)
+      .await
+      .map_err(|err| {
+        FsError::Io(io::Error::new(
+          err.kind(),
+          format!(
+            "HttpFS failed to connect to unix socket {}: {err}",
+            socket.display()
+          ),
+        ))
+      })?;
+
+  let (mut sender, conn) = hyper::client::conn::http1::handshake::<
+    _,
+    Full<Bytes>,
+  >(TokioIo::new(stream))
+  .await
+  .map_err(|err| FsError::Io(io::Error::other(err)))?;
+
+  // The connection future must be polled for the exchange to progress; it
+  // resolves on its own once the (unpooled) connection closes.
+  let conn = tokio::spawn(async move {
+    let _ = conn.await;
+  });
+
+  let http_req = build_http_request(req)?;
+  let resp = sender
+    .send_request(http_req)
+    .await
+    .map_err(|err| FsError::Io(io::Error::other(err)))?;
+  drop(sender);
+
+  let (parts, incoming) = resp.into_parts();
+  let body = incoming
+    .collect()
+    .await
+    .map_err(|err| FsError::Io(io::Error::other(err)))?
+    .to_bytes();
+  conn.abort();
+
+  Ok(reqwest::Response::from(http::Response::from_parts(
+    parts,
+    reqwest::Body::from(body),
+  )))
+}
+
+/// Rebuilds a built [`reqwest::Request`] as an origin-form `http::Request` for
+/// hyper's client connection. Bodies here are always in memory (buffered
+/// writes / JSON), so [`reqwest::Body::as_bytes`] is sufficient.
+fn build_http_request(
+  req: reqwest::Request,
+) -> FsResult<http::Request<Full<Bytes>>> {
+  let url = req.url();
+  let host = url.host_str().unwrap_or("localhost");
+  let authority = match url.port() {
+    Some(port) => format!("{host}:{port}"),
+    None => host.to_string(),
+  };
+  let target = &url[Position::BeforePath..];
+
+  let mut builder = http::Request::builder()
+    .method(req.method().clone())
+    .uri(target);
+
+  {
+    let headers = builder
+      .headers_mut()
+      .expect("a freshly built request has valid parts");
+    *headers = req.headers().clone();
+    // reqwest only sets `Host` when it drives the request itself; we bypass
+    // that, so set it from the URL's authority.
+    if !headers.contains_key(http::header::HOST) {
+      headers.insert(
+        http::header::HOST,
+        http::HeaderValue::from_str(&authority)
+          .map_err(|err| FsError::Io(io::Error::other(err)))?,
+      );
+    }
+  }
+
+  let body = req
+    .body()
+    .and_then(reqwest::Body::as_bytes)
+    .map(Bytes::copy_from_slice)
+    .unwrap_or_default();
+
+  builder
+    .body(Full::new(body))
+    .map_err(|err| FsError::Io(io::Error::other(err)))
 }
 
 /// Converts a mount-relative [`Path`] (as handed over by the `PrefixFs`
@@ -2316,6 +2492,18 @@ mod test {
     assert_eq!(one[0].take_mount_point(), "/objects");
     assert!(one[0].headers.is_empty());
     assert!(one[0].query.is_empty());
+    assert!(one[0].socket_path.is_none());
+
+    // `socketPath` opts the mount onto a unix socket; `baseUrl` stays an
+    // http(s) URL supplying the path prefix / Host / origin.
+    let unix: HttpFsConfigs = serde_json::from_value(serde_json::json!({
+      "mountPoint": "/objects",
+      "baseUrl": "http://localhost/fs/v1",
+      "socketPath": "/run/flow/fs.sock",
+    }))
+    .unwrap();
+    let unix = unix.into_vec();
+    assert_eq!(unix[0].socket_path.as_deref(), Some("/run/flow/fs.sock"));
 
     let many: HttpFsConfigs = serde_json::from_value(serde_json::json!([
       {

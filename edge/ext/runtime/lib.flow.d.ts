@@ -77,7 +77,10 @@ declare interface FlowHttpFsConfig {
    * Same collision rules as S3 mount points. */
   mountPoint: string;
   /** Protocol base URL, including any path prefix
-   * (e.g. `https://api.example.com/fs/v1`). */
+   * (e.g. `https://api.example.com/fs/v1`). With `socketPath` set, this stays an
+   * http(s) URL but the host is a placeholder (e.g. `http://localhost/fs/v1`):
+   * it only supplies the path prefix, the `Host` header, and the origin used to
+   * scope credentials across redirects. */
   baseUrl: string;
   /** Custom headers attached to every request (e.g. `Authorization`,
    * `X-CSRF-Token`). Auth/scoping/revocation are the server's concern; the
@@ -87,6 +90,11 @@ declare interface FlowHttpFsConfig {
   /** Custom query params appended to every request (same cross-origin rule as
    * `headers`). Avoid protocol-reserved keys (`path`, `cursor`, `uploadId`, …). */
   query?: Record<string, string>;
+  /** Connect over this AF_UNIX socket instead of TCP — for a server sharing the
+   * host (e.g. a sidecar). `baseUrl` still supplies the path prefix / `Host` /
+   * origin. Cross-origin redirect (presigned) targets are still fetched over
+   * TCP. */
+  socketPath?: string;
 }
 
 /** Deno-style permission set for a user worker (keys are snake_case). */
