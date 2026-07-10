@@ -1,6 +1,6 @@
 // Requires static pattern "./test_cases/**/*.md"
 
-const content = Deno.readTextFileSync('./test_cases/main/content.md');
+const content = Deno.readTextFileSync('./test_cases/staticFs/content.md');
 const expected = 'Some test file\n';
 
 if (content !== expected) {

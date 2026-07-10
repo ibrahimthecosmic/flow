@@ -4,7 +4,7 @@ let mem = new WebAssembly.Memory({
 });
 
 // NOTE: Just defined to prevent the JsRuntime leave from the event loop
-Deno.serve(() => {/* do nothing */});
+setInterval(() => {/* do nothing */}, 1000);
 
 // NOTE(Nyannyacha): Unlike built-in instruction, this expects to detect memory
 // overcommit in the next poll (optimized).

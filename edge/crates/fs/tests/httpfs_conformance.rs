@@ -709,7 +709,7 @@ async fn spawn_server(state: SharedState) -> SocketAddr {
 /// Serves the same mock over an AF_UNIX socket. The generated redirect /
 /// part URLs use `http://localhost` so the client — whose `baseUrl` host is
 /// `localhost` — treats them as same-origin and keeps them on the socket.
-async fn spawn_unix_server(state: SharedState, socket: PathBuf) {
+fn spawn_unix_server(state: SharedState, socket: PathBuf) {
   let listener = tokio::net::UnixListener::bind(&socket).unwrap();
 
   tokio::spawn(async move {
@@ -778,11 +778,11 @@ fn http_fs_config_unix(socket: &std::path::Path) -> HttpFsConfig {
   .unwrap()
 }
 
-async fn setup_unix(state: State) -> (HttpFs, SharedState, tempfile::TempDir) {
+fn setup_unix(state: State) -> (HttpFs, SharedState, tempfile::TempDir) {
   let state = Arc::new(Mutex::new(state));
   let dir = tempfile::tempdir().unwrap();
   let socket = dir.path().join("fs.sock");
-  spawn_unix_server(state.clone(), socket.clone()).await;
+  spawn_unix_server(state.clone(), socket.clone());
   let fs = HttpFs::new(http_fs_config_unix(&socket)).unwrap();
 
   (fs, state, dir)
@@ -1212,7 +1212,7 @@ async fn sync_surface_works() {
 
 #[tokio::test]
 async fn unix_socket_roundtrip() {
-  let (fs, _state, _dir) = setup_unix(State::new()).await;
+  let (fs, _state, _dir) = setup_unix(State::new());
 
   fs.mkdir_async(checked("reports"), true, None)
     .await
@@ -1247,7 +1247,7 @@ async fn unix_socket_roundtrip() {
 async fn unix_socket_read_redirect_same_origin() {
   let mut state = State::new();
   state.read_mode = ReadMode::RedirectSameOrigin;
-  let (fs, _state, _dir) = setup_unix(state).await;
+  let (fs, _state, _dir) = setup_unix(state);
 
   write(&fs, "a.txt", b"redirected over socket").await;
 
@@ -1262,7 +1262,7 @@ async fn unix_socket_multipart_upload() {
   let mut state = State::new();
   state.direct_write_max_bytes = 8;
   state.multipart = true;
-  let (fs, state, _dir) = setup_unix(state).await;
+  let (fs, state, _dir) = setup_unix(state);
 
   let data = b"twenty bytes of data".to_vec();
   write(&fs, "big.bin", &data).await;
@@ -1275,7 +1275,7 @@ async fn unix_socket_multipart_upload() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unix_socket_sync_surface() {
-  let (fs, _state, _dir) = setup_unix(State::new()).await;
+  let (fs, _state, _dir) = setup_unix(State::new());
 
   let fs_clone = fs.clone();
   tokio::task::spawn_blocking(move || {

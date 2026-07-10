@@ -1,0 +1,7 @@
+// Not dead: anchors Deno workspace discovery for every fixture under
+// test_cases/. Without it the discovered workspace root (= the eszip relative
+// base, see deno_facade::generate_binary_eszip) collapses to each fixture's
+// own directory, so cross-fixture imports like `../shared/index.ts` fall
+// outside the eszip base and fail at runtime with "Module not found".
+{
+}

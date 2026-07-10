@@ -27,7 +27,7 @@ function grow(param: number): number {
 }
 
 // NOTE: Just defined to prevent the JsRuntime leave from the event loop
-Deno.serve(() => {/* do nothing */});
+setInterval(() => {/* do nothing */}, 1000);
 
 // NOTE(Nyannyacha): This memory overcommit uses the built-in instruction so in
 // edge-runtime side cannot install a trap for this allocation directly without
