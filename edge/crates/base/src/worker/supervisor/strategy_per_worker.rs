@@ -133,6 +133,7 @@ pub async fn supervise(args: Arguments) -> (ShutdownReason, i64) {
     tokens:
       Tokens {
         termination,
+        termination_request,
         supervise,
         runtime_drop,
         isolate_lifecycle,
@@ -287,9 +288,16 @@ pub async fn supervise(args: Arguments) -> (ShutdownReason, i64) {
       }
 
       _ = async {
-        match termination.as_ref() {
-          Some(token) => token.inbound.cancelled().await,
-          None => pending().await,
+        tokio::select! {
+          // host-side terminate request
+          _ = async {
+            match termination.as_ref() {
+              Some(token) => token.inbound.cancelled().await,
+              None => pending().await,
+            }
+          } => {}
+          // worker-side graceful self-exit (FlowRuntime.scheduleTermination)
+          _ = termination_request.cancelled() => {}
         }
       }, if !state.is_waiting_for_termination => {
         state.is_waiting_for_termination = true;

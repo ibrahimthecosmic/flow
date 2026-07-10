@@ -55,6 +55,11 @@ pub struct IsolateMemoryStats {
 
 pub struct Tokens {
   pub termination: Option<TerminationToken>,
+  /// Cancelled by the worker itself (`FlowRuntime.scheduleTermination` ->
+  /// `op_cancel_drop_token`) — the graceful self-exit request. Without a
+  /// supervisor listener the worker's event loop exits but the shutdown
+  /// event never fires until the wall clock does.
+  pub termination_request: CancellationToken,
   pub supervise: CancellationToken,
   /// Token that is cancelled when the runtime is being dropped.
   /// Supervisors should check this before calling thread_safe_handle methods.
@@ -160,6 +165,7 @@ pub fn create_supervisor(
   let supervise_cancel_token = CancellationToken::new();
   let tokens = Tokens {
     termination: termination_token.clone(),
+    termination_request: termination_request_token.clone(),
     supervise: supervise_cancel_token.clone(),
     runtime_drop: runtime_drop_token.clone(),
     isolate_lifecycle: runtime.mem_check_lifecycle(),
@@ -419,6 +425,22 @@ pub fn create_supervisor(
       });
 
       let _ = termination_event_tx.send(termination_event);
+
+      // Acknowledge a host-side TerminationToken once the runtime is disposed
+      // (bounded, in case teardown wedges). The pool acks pooled workers when
+      // it processes the Shutdown message, but a worker booted directly on a
+      // WorkerSurface (tests, embedders) otherwise leaves
+      // `TerminationToken::cancel_and_wait()` hanging forever. The old
+      // managed driver carried this ack; it was lost when that driver was
+      // removed.
+      if let Some(token) = termination_token {
+        let _ = tokio::time::timeout(
+          Duration::from_secs(10),
+          runtime_drop_token.cancelled(),
+        )
+        .await;
+        token.outbound.cancel();
+      }
     })
   });
 

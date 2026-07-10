@@ -39,6 +39,9 @@ pub async fn supervise(
     tokens:
       Tokens {
         termination,
+        // Per-request workers end with their request; the worker-side
+        // scheduleTermination fast path is only wired for per-worker.
+        termination_request: _,
         supervise,
         runtime_drop,
         isolate_lifecycle,
