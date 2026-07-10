@@ -3,10 +3,10 @@ use deno_core::op2;
 use deno_error::JsErrorBox;
 use tokio::sync::mpsc;
 
-use crate::WorkerEventWithMetadata;
 use crate::events::EventMetadata;
 use crate::events::LogEvent;
 use crate::events::LogLevel;
+use crate::events::WorkerEventWithMetadata;
 use crate::events::WorkerEvents;
 
 #[op2(fast)]

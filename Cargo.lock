@@ -433,19 +433,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-tungstenite"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cca750b12e02c389c1694d35c16539f88b8bbaa5945934fdc1b41a776688589"
-dependencies = [
- "futures-io",
- "futures-util",
- "log",
- "pin-project-lite",
- "tungstenite",
-]
-
-[[package]]
 name = "asynchronous-codec"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -958,7 +945,7 @@ dependencies = [
  "pin-project-lite",
  "rustversion",
  "serde",
- "sync_wrapper 1.0.1",
+ "sync_wrapper",
  "tower 0.4.13",
  "tower-layer",
  "tower-service",
@@ -979,7 +966,7 @@ dependencies = [
  "mime",
  "pin-project-lite",
  "rustversion",
- "sync_wrapper 1.0.1",
+ "sync_wrapper",
  "tower-layer",
  "tower-service",
 ]
@@ -1028,8 +1015,6 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-scoped",
- "async-trait",
- "async-tungstenite",
  "base_mem_check",
  "base_rt",
  "bytes",
@@ -1037,11 +1022,8 @@ dependencies = [
  "cpu_timer",
  "ctor",
  "deno",
- "deno_broadcast_channel",
  "deno_cache",
  "deno_canvas",
- "deno_config",
- "deno_console",
  "deno_core",
  "deno_crypto",
  "deno_error",
@@ -1059,7 +1041,6 @@ dependencies = [
  "deno_resolver",
  "deno_telemetry",
  "deno_tls",
- "deno_url",
  "deno_web",
  "deno_webgpu",
  "deno_webidl",
@@ -1078,26 +1059,18 @@ dependencies = [
  "flume",
  "fs",
  "futures-util",
- "http 0.2.12",
  "http 1.4.0",
  "http-body-util",
- "http_utils",
- "httparse",
- "hyper 0.14.32",
  "hyper 1.6.0",
  "hyper-util",
- "import_map",
  "libc",
  "log",
- "monch",
- "notify",
  "num-traits",
  "once_cell",
  "pin-project",
  "regex",
- "reqwest 0.11.27",
+ "reqwest",
  "rustls 0.23.40",
- "rustls-pemfile 2.1.2",
  "scopeguard",
  "serde",
  "serial_test",
@@ -1105,15 +1078,11 @@ dependencies = [
  "sys_traits",
  "tempfile",
  "thiserror 2.0.12",
- "tls-listener",
  "tokio",
- "tokio-rustls 0.25.0",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "tungstenite",
  "url",
- "urlencoding",
  "uuid",
  "winapi",
 ]
@@ -2938,10 +2907,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deno_broadcast_channel"
-version = "0.216.0"
-
-[[package]]
 name = "deno_bundle_runtime"
 version = "0.40.0"
 dependencies = [
@@ -3060,10 +3025,6 @@ dependencies = [
  "thiserror 2.0.12",
  "url",
 ]
-
-[[package]]
-name = "deno_console"
-version = "0.222.0"
 
 [[package]]
 name = "deno_core"
@@ -3886,7 +3847,7 @@ dependencies = [
  "log",
  "monch",
  "pretty_assertions",
- "reqwest 0.12.5",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -4377,7 +4338,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.12",
  "tokio",
- "webpki-roots 0.26.1",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5485,7 +5446,7 @@ dependencies = [
  "insta",
  "jsonc-parser",
  "pretty_assertions",
- "reqwest 0.12.5",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -5516,7 +5477,6 @@ dependencies = [
 name = "ext_event_worker"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base_mem_check",
  "deno_core",
  "deno_error",
@@ -5546,33 +5506,14 @@ name = "ext_runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base_mem_check",
  "base_rt",
- "bytes",
  "deno_core",
  "deno_error",
- "deno_fetch",
- "deno_fs",
- "deno_http",
- "deno_net",
  "deno_permissions",
  "deno_tls",
- "deno_websocket",
- "enum-as-inner",
- "ext_os",
  "futures",
- "http 1.4.0",
- "httparse",
- "hyper 0.14.32",
- "hyper 1.6.0",
- "log",
- "memmem",
- "once_cell",
- "scopeguard",
  "serde",
  "thiserror 2.0.12",
- "tokio",
- "tokio-util",
  "tracing",
 ]
 
@@ -5581,25 +5522,16 @@ name = "ext_workers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
  "deno",
- "deno_config",
  "deno_core",
  "deno_error",
  "deno_facade",
  "deno_telemetry",
  "enum-as-inner",
  "ext_event_worker",
- "ext_runtime",
  "fs",
- "futures-util",
- "http_utils",
- "hyper 0.14.32",
- "log",
  "once_cell",
- "scopeguard",
  "serde",
- "thiserror 2.0.12",
  "tokio",
  "tokio-util",
  "uuid",
@@ -5976,6 +5908,7 @@ dependencies = [
  "eszip",
  "eszip_trait",
  "ext_event_worker",
+ "ext_workers",
  "faster-hex",
  "futures",
  "headers",
@@ -5994,7 +5927,7 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "rand 0.8.5",
- "reqwest 0.12.5",
+ "reqwest",
  "rkyv",
  "rustls 0.21.12",
  "serde",
@@ -6006,6 +5939,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -6799,18 +6733,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "http_utils"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures-util",
- "http 0.2.12",
- "hyper 0.14.32",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "httparse"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6952,7 +6874,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.0",
  "tower-service",
- "webpki-roots 0.26.1",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -7417,7 +7339,7 @@ dependencies = [
  "os_pipe",
  "pretty_assertions",
  "regex",
- "reqwest 0.12.5",
+ "reqwest",
  "rustls 0.23.40",
  "rustls-pemfile 2.1.2",
  "rustls-tokio-stream",
@@ -8138,12 +8060,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "memmem"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a64a92489e2744ce060c349162be1c5f33c6969234104dbd99ddb5feb08b8c15"
-
-[[package]]
 name = "memoffset"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8166,16 +8082,6 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
-
-[[package]]
-name = "mime_guess"
-version = "2.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
-dependencies = [
- "mime",
- "unicase",
-]
 
 [[package]]
 name = "minimal-lexical"
@@ -9983,50 +9889,6 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.11.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd67538700a17451e7cba03ac727fb961abb7607553461627b97de0b89cf4a62"
-dependencies = [
- "base64 0.21.7",
- "bytes",
- "encoding_rs",
- "futures-core",
- "futures-util",
- "h2 0.3.27",
- "http 0.2.12",
- "http-body 0.4.6",
- "hyper 0.14.32",
- "hyper-rustls 0.24.2",
- "ipnet",
- "js-sys",
- "log",
- "mime",
- "mime_guess",
- "once_cell",
- "percent-encoding",
- "pin-project-lite",
- "rustls 0.21.12",
- "rustls-pemfile 1.0.4",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sync_wrapper 0.1.2",
- "system-configuration",
- "tokio",
- "tokio-rustls 0.24.1",
- "tokio-util",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-streams",
- "web-sys",
- "webpki-roots 0.25.4",
- "winreg 0.50.0",
-]
-
-[[package]]
-name = "reqwest"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7d6d2a27d57148378eb5e111173f4276ad26340ecc5c49a4a2152167a2d6a37"
@@ -10057,7 +9919,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "sync_wrapper 1.0.1",
+ "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.0",
  "tokio-socks",
@@ -10068,7 +9930,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots 0.26.1",
+ "webpki-roots",
  "winreg 0.52.0",
 ]
 
@@ -10446,20 +10308,6 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.22.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf4ef73721ac7bcd79b2b315da7779d8fc09718c6b3d2d1b2d94850eb8c18432"
-dependencies = [
- "log",
- "ring 0.17.14",
- "rustls-pki-types",
- "rustls-webpki 0.102.8",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "rustls"
 version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
@@ -10572,17 +10420,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
 dependencies = [
  "ring 0.17.14",
- "untrusted 0.9.0",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.102.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
-dependencies = [
- "ring 0.17.14",
- "rustls-pki-types",
  "untrusted 0.9.0",
 ]
 
@@ -11937,12 +11774,6 @@ dependencies = [
 
 [[package]]
 name = "sync_wrapper"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2047c6ded9c721764247e62cd3b03c09ffc529b2ba5b10ec482ae507a4a70160"
-
-[[package]]
-name = "sync_wrapper"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7065abeca94b6a8a577f9bd45aa0867a2238b74e8eb67cf10d492bc39351394"
@@ -11998,27 +11829,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "system-configuration"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba3a3adc5c275d719af8cb4272ea1c4a6d668a777f37e115f6d11ddbc1c8e0e7"
-dependencies = [
- "bitflags 1.3.2",
- "core-foundation 0.9.4",
- "system-configuration-sys",
-]
-
-[[package]]
-name = "system-configuration-sys"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a75fb188eb626b924683e3b95e3a48e63551fcfb51949de2f06a9d91dbee93c9"
-dependencies = [
- "core-foundation-sys",
- "libc",
 ]
 
 [[package]]
@@ -12167,7 +11977,7 @@ dependencies = [
  "percent-encoding",
  "pretty_assertions",
  "prost 0.14.4",
- "reqwest 0.12.5",
+ "reqwest",
  "rustls 0.23.40",
  "rustls-pemfile 2.1.2",
  "rustls-tokio-stream",
@@ -12409,19 +12219,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
-name = "tls-listener"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d4511e6fec190f1b99c16d4b53982bcb449295e7ce165d361a673f7ad09339e"
-dependencies = [
- "futures-util",
- "pin-project-lite",
- "thiserror 2.0.12",
- "tokio",
- "tokio-rustls 0.26.0",
-]
-
-[[package]]
 name = "tokio"
 version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12489,17 +12286,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
 dependencies = [
  "rustls 0.21.12",
- "tokio",
-]
-
-[[package]]
-name = "tokio-rustls"
-version = "0.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "775e0c0f0adb3a2f22a00c4745d728b479985fc15ee7ca6a2608388c5569860f"
-dependencies = [
- "rustls 0.22.4",
- "rustls-pki-types",
  "tokio",
 ]
 
@@ -12686,7 +12472,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "pin-project-lite",
- "sync_wrapper 1.0.1",
+ "sync_wrapper",
  "tokio",
  "tower-layer",
  "tower-service",
@@ -12798,10 +12584,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trex_core"
-version = "0.1.0"
-
-[[package]]
 name = "triomphe"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12830,25 +12612,6 @@ dependencies = [
  "target-triple",
  "termcolor",
  "toml 0.9.6",
-]
-
-[[package]]
-name = "tungstenite"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ef1a641ea34f399a848dea702823bbecfb4c486f911735368f1f137cb8257e1"
-dependencies = [
- "byteorder",
- "bytes",
- "data-encoding",
- "http 1.4.0",
- "httparse",
- "log",
- "rand 0.8.5",
- "sha1",
- "thiserror 1.0.69",
- "url",
- "utf-8",
 ]
 
 [[package]]
@@ -13416,12 +13179,6 @@ checksum = "e8c6dfa3ac045bc517de14c7b1384298de1dbd229d38e08e169d9ae8c170937c"
 dependencies = [
  "rustls-pki-types",
 ]
-
-[[package]]
-name = "webpki-roots"
-version = "0.25.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
 
 [[package]]
 name = "webpki-roots"

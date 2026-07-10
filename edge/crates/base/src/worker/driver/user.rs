@@ -16,7 +16,6 @@ use super::BaseCx;
 use super::WorkerDriver;
 use crate::runtime::DenoRuntime;
 use crate::runtime::RunOptionsBuilder;
-use crate::worker::DuplexStreamEntry;
 use crate::worker::WorkerCx;
 use crate::worker::supervisor::CPUUsageMetrics;
 use crate::worker::supervisor::create_supervisor;
@@ -74,7 +73,6 @@ impl WorkerDriver for User {
 
     async move {
       let mut cx = cx.lock().await;
-      let network_receiver = cx.take_network_receiver()?;
       let cpu_usage_metrics_receiver = cx.cpu_usage_metrics_tx.take();
       let termination_event_receiver = cx.take_termination_event_receiver()?;
 
@@ -83,7 +81,6 @@ impl WorkerDriver for User {
       match runtime
         .run(
           RunOptionsBuilder::new()
-            .stream_rx(network_receiver)
             .cpu_usage_metrics_tx(cpu_usage_metrics_receiver)
             .wait_termination_request_token(true)
             .build()
@@ -185,11 +182,4 @@ impl WorkerDriver for User {
     .into()
   }
 
-  fn runtime_handle(&self) -> &'static tokio_util::task::LocalPoolHandle {
-    &base_rt::USER_WORKER_RT
-  }
-
-  async fn network_sender(&self) -> mpsc::UnboundedSender<DuplexStreamEntry> {
-    self.cx.lock().await.get_network_sender()
-  }
 }

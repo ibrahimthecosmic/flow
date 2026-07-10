@@ -31,7 +31,7 @@ use uuid::Uuid;
 use super::pool::SupervisorPolicy;
 use super::termination_token::TerminationToken;
 use crate::runtime::DenoRuntime;
-use crate::server::ServerFlags;
+use crate::flags::WorkerFlags;
 use crate::utils::units::percentage_value;
 
 pub mod strategy_per_request;
@@ -78,7 +78,7 @@ pub struct Arguments {
   pub thread_safe_handle: v8::IsolateHandle,
   pub waker: Arc<AtomicWaker>,
   pub tokens: Tokens,
-  pub flags: Arc<ServerFlags>,
+  pub flags: Arc<WorkerFlags>,
 }
 
 pub struct CPUUsage {
@@ -143,7 +143,7 @@ pub fn create_supervisor(
   cancel: Option<CancellationToken>,
   timing: Option<Timing>,
   termination_token: Option<TerminationToken>,
-  flags: Arc<ServerFlags>,
+  flags: Arc<WorkerFlags>,
 ) -> Result<CancellationToken, anyhow::Error> {
   let (memory_limit_tx, memory_limit_rx) = mpsc::unbounded_channel();
   let (waker, thread_safe_handle) = (
@@ -151,8 +151,7 @@ pub fn create_supervisor(
     runtime.js_runtime.v8_isolate().thread_safe_handle(),
   );
 
-  // we assert supervisor is only run for user workers
-  let conf = runtime.conf.as_user_worker().unwrap().clone();
+  let conf = runtime.conf.as_ref().clone();
   let mem_check_state = runtime.mem_check_state();
   let termination_request_token = runtime.termination_request_token.clone();
   let runtime_drop_token = runtime.drop_token.clone();
@@ -220,7 +219,7 @@ pub fn create_supervisor(
 
       let args = Arguments {
         key,
-        runtime_opts: (*conf).clone(),
+        runtime_opts: conf.clone(),
         cpu_usage_metrics_rx,
         supervisor_policy: policy,
         runtime_state,

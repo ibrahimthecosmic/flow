@@ -118,11 +118,3 @@ pub enum RawEvent {
   Event(Box<WorkerEventWithMetadata>),
   Done,
 }
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct IncomingEvent {
-  event_type: Option<String>,
-  data: Option<Vec<u8>>,
-  done: bool,
-}

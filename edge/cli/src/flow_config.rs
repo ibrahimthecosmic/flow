@@ -20,7 +20,7 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
-use base::server::ServerFlags;
+use base::flags::WorkerFlags;
 use base::worker::pool::SupervisorPolicy;
 use base::worker::pool::WorkerPoolPolicy;
 
@@ -57,9 +57,9 @@ impl FlowConfig {
 
   /// Build the pool policy + the (worker-lifecycle) server flags the pool and
   /// user-worker supervisor consume. `request_wait_timeout_ms` is threaded via
-  /// `ServerFlags` because `WorkerPoolPolicy::new` reads it from there.
-  pub(crate) fn to_pool_config(&self) -> (WorkerPoolPolicy, ServerFlags) {
-    let server_flags = ServerFlags {
+  /// `WorkerFlags` because `WorkerPoolPolicy::new` reads it from there.
+  pub(crate) fn to_pool_config(&self) -> (WorkerPoolPolicy, WorkerFlags) {
+    let server_flags = WorkerFlags {
       request_wait_timeout_ms: self.request_wait_timeout_ms,
       beforeunload_wall_clock_pct: self.beforeunload_wall_clock_pct,
       beforeunload_cpu_pct: self.beforeunload_cpu_pct,

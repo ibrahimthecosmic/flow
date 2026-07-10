@@ -1,17 +1,16 @@
 extern crate core;
 
 mod inspector_server;
-mod timeout;
 
-pub mod macros;
+pub mod flags;
 pub mod runtime;
-pub mod server;
 pub mod snapshot;
 pub mod utils;
 pub mod worker;
 
 pub use deno::args::CacheSetting;
 pub use ext_workers::context::WorkerKind;
+pub use flags::WorkerFlags;
 pub use inspector_server::Inspector;
 pub use inspector_server::InspectorOption;
 pub use inspector_server::InspectorServer;

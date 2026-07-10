@@ -924,7 +924,7 @@ mod tests {
     let _ = server._test_register(info);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let body = reqwest_v011::get(format!("http://{addr}/json"))
+    let body = reqwest::get(format!("http://{addr}/json"))
       .await
       .expect("GET /json")
       .text()

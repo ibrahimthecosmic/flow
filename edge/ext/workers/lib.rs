@@ -3,35 +3,16 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::Context;
-use std::task::Poll;
 
 use anyhow::Error;
-use context::SendRequestResult;
-use deno::deno_http::HttpRequestReader;
-use deno::deno_http::HttpStreamReadResource;
 use deno::deno_permissions::PermissionsOptions;
-use deno_core::AsyncRefCell;
-use deno_core::AsyncResult;
-use deno_core::BufView;
-use deno_core::ByteString;
-use deno_core::CancelFuture;
-use deno_core::CancelHandle;
-use deno_core::CancelTryFuture;
 use deno_core::JsBuffer;
 use deno_core::OpState;
-use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceId;
 use deno_core::SharedArrayBufferStore;
-use deno_core::WriteOutcome;
 use deno_core::error::AnyError;
-use deno_core::futures::FutureExt;
-use deno_core::futures::Stream;
-use deno_core::futures::StreamExt;
-use deno_core::futures::stream::Peekable;
 use deno_core::op2;
 use deno_core::serde_json;
 use deno_error::JsErrorBox;
@@ -39,38 +20,23 @@ use deno_facade::EszipPayloadKind;
 use deno_telemetry::OtelConfig;
 use deno_telemetry::OtelConsoleConfig;
 use deno_telemetry::OtelPropagators;
-use errors::WorkerError;
-use ext_runtime::conn_sync::ConnWatcher;
 use fs::http_fs::HttpFsConfigs;
 use fs::s3_fs::S3FsConfigs;
 use fs::tmp_fs::TmpFsConfig;
-use http_utils::utils::get_upgrade_type;
-use hyper_v014::Body;
-use hyper_v014::Method;
-use hyper_v014::Request;
-use hyper_v014::body::HttpBody;
-use hyper_v014::header::CONTENT_LENGTH;
-use hyper_v014::header::HeaderName;
-use hyper_v014::header::HeaderValue;
-use hyper_v014::upgrade::OnUpgrade;
-use log::error;
 use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::context::CreateUserWorkerResult;
 use crate::context::UserWorkerMsgs;
 use crate::context::UserWorkerRuntimeOpts;
 use crate::context::WorkerContextInitOpts;
-use crate::context::WorkerRuntimeOpts;
 
 pub mod context;
-pub mod errors;
 
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -239,29 +205,22 @@ pub async fn op_flow_recv_parent_port(state: Rc<RefCell<OpState>>) -> i32 {
 }
 
 deno_core::extension!(
+  // flow: the WORKER-side extension, registered into every user-worker
+  // runtime. Ops-only: it carries the parent-`MessagePort` plumbing the worker
+  // bootstrap consumes (bootstrap.js wires `FlowRuntime.parentPort[s]`).
+  // Workers cannot create workers, so the create/cleanup/inspect ops are
+  // host-only (below).
   user_workers,
-  ops = [
-    op_user_worker_create,
-    op_user_worker_fetch_build,
-    op_user_worker_fetch_send,
-    op_user_worker_cleanup_idle_workers,
-    op_flow_parent_port_rid,
-    op_flow_recv_parent_port,
-  ],
-  esm_entry_point = "ext:user_workers/user_workers.js",
-  esm = ["user_workers.js",]
+  ops = [op_flow_parent_port_rid, op_flow_recv_parent_port,],
 );
 
 deno_core::extension!(
-  // flow: an OPS-ONLY variant of `user_workers`, for embedding into the flow
-  // main isolate on top of Deno's CLI snapshot. It carries no ESM, because a
-  // freshly-added ESM-bearing extension can't link against the snapshotted
-  // `ext:` modules (deno_webidl/deno_web/...) and panics at init. The
+  // flow: the HOST-side extension, embedded into the flow main isolate on top
+  // of Deno's CLI snapshot. It carries no ESM, because a freshly-added
+  // ESM-bearing extension can't link against the snapshotted `ext:` modules
+  // (deno_webidl/deno_web/...) and panics at init. The
   // `FlowRuntime.userWorkers` host surface is installed post-bootstrap by
   // calling these ops directly (see edge/cli/src/flow_main.js).
-  //
-  // The HTTP request-passing fetch ops are intentionally omitted: that was the
-  // old one-way comms, being replaced by the MessagePort transport.
   user_workers_ops,
   ops = [
     op_user_worker_create,
@@ -269,14 +228,6 @@ deno_core::extension!(
     op_user_worker_inspect,
   ],
 );
-
-#[derive(Deserialize, Serialize, Default, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct JsxImportBaseConfig {
-  default_specifier: Option<String>,
-  module: String,
-  base_url: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsOtelConfig {
@@ -442,7 +393,7 @@ pub async fn op_user_worker_create(
       no_npm,
 
       env_vars: env_vars.into_iter().collect(),
-      conf: WorkerRuntimeOpts::UserWorker(Box::new({
+      conf: Box::new({
         static DEFAULT: Lazy<UserWorkerRuntimeOpts> =
           Lazy::new(Default::default);
 
@@ -476,7 +427,7 @@ pub async fn op_user_worker_create(
 
           ..Default::default()
         }
-      })),
+      }),
 
       static_patterns,
       timing: None,
@@ -577,400 +528,6 @@ pub fn op_user_worker_inspect(#[string] key: String) -> String {
   inspector_ws_url(host, &key)
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct UserWorkerRequest {
-  method: ByteString,
-  url: String,
-  headers: Vec<(String, String)>,
-  has_body: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserWorkerBuiltRequest {
-  request_rid: ResourceId,
-  request_body_rid: Option<ResourceId>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserWorkerResponse {
-  status: u16,
-  status_text: String,
-  headers: Vec<(ByteString, ByteString)>,
-  body_rid: ResourceId,
-  size: Option<u64>,
-}
-
-struct UserWorkerRequestResource(Request<Body>);
-
-impl Resource for UserWorkerRequestResource {
-  fn name(&self) -> std::borrow::Cow<'_, str> {
-    "userWorkerRequest".into()
-  }
-}
-
-struct UserWorkerRequestBodyResource {
-  body: AsyncRefCell<Option<mpsc::Sender<Result<bytes::Bytes, Error>>>>,
-  cancel: CancelHandle,
-}
-
-impl Resource for UserWorkerRequestBodyResource {
-  fn name(&self) -> std::borrow::Cow<'_, str> {
-    "userWorkerRequestBody".into()
-  }
-
-  fn write(self: Rc<Self>, buf: BufView) -> AsyncResult<WriteOutcome> {
-    Box::pin(async move {
-      let bytes: bytes::Bytes = buf.to_vec().into();
-      let nwritten = bytes.len();
-      let body = RcRef::map(&self, |r| &r.body).borrow_mut().await;
-      let body = (*body).as_ref();
-      let cancel = RcRef::map(self, |r| &r.cancel);
-      let body = body.ok_or(JsErrorBox::type_error(
-        "request body receiver not connected (request closed)",
-      ))?;
-
-      body.send(Ok(bytes)).or_cancel(cancel).await?.map_err(|e| {
-        JsErrorBox::type_error(format!(
-          "request body receiver not connected ({})",
-          e
-        ))
-      })?;
-
-      Ok(WriteOutcome::Full { nwritten })
-    })
-  }
-
-  fn write_error(
-    self: Rc<Self>,
-    error: &dyn deno_error::JsErrorClass,
-  ) -> AsyncResult<()> {
-    // Convert error to string before async block to avoid lifetime issues
-    let error_string = format!("{}", error);
-    async move {
-      let body = RcRef::map(&self, |r| &r.body).borrow_mut().await;
-      let body = (*body).as_ref();
-      let cancel = RcRef::map(self, |r| &r.cancel);
-      let body = body.ok_or(JsErrorBox::type_error(
-        "request body receiver not connected (request closed)",
-      ))?;
-      // Convert to anyhow::Error
-      let anyhow_error: Error = anyhow::anyhow!(error_string);
-      body
-        .send(Err(anyhow_error))
-        .or_cancel(cancel)
-        .await?
-        .map_err(|e| JsErrorBox::generic(format!("{:#}", e)))?;
-      Ok(())
-    }
-    .boxed_local()
-  }
-
-  fn shutdown(self: Rc<Self>) -> AsyncResult<()> {
-    async move {
-      let mut body = RcRef::map(&self, |r| &r.body).borrow_mut().await;
-      body.take();
-      Ok(())
-    }
-    .boxed_local()
-  }
-
-  fn close(self: Rc<Self>) {
-    self.cancel.cancel();
-  }
-}
-
-type BytesStream =
-  Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin>>;
-
-struct UserWorkerResponseBodyResource {
-  reader: AsyncRefCell<Peekable<BytesStream>>,
-  size: Option<u64>,
-  req_end_tx: mpsc::UnboundedSender<()>,
-  cancel: CancelHandle,
-  conn_token: Option<CancellationToken>,
-}
-
-impl Resource for UserWorkerResponseBodyResource {
-  fn name(&self) -> std::borrow::Cow<'_, str> {
-    "userWorkerResponseBody".into()
-  }
-
-  fn read(self: Rc<Self>, limit: usize) -> AsyncResult<BufView> {
-    Box::pin(async move {
-      let reader = RcRef::map(&self, |r| &r.reader).borrow_mut().await;
-
-      let fut = async move {
-        let mut reader = Pin::new(reader);
-        loop {
-          match reader.as_mut().peek_mut().await {
-            Some(Ok(chunk)) if !chunk.is_empty() => {
-              let len = std::cmp::min(limit, chunk.len());
-              let chunk = chunk.split_to(len);
-              break Ok(chunk.into());
-            }
-            // This unwrap is safe because `peek_mut()` returned `Some`, and thus
-            // currently has a peeked value that can be synchronously returned
-            // from `next()`.
-            //
-            // The future returned from `next()` is always ready, so we can
-            // safely call `await` on it without creating a race condition.
-            Some(_) => match reader.as_mut().next().await.unwrap() {
-              Ok(chunk) => assert!(chunk.is_empty()),
-              Err(err) => break Err(JsErrorBox::type_error(err.to_string())),
-            },
-            None => break Ok(BufView::empty()),
-          }
-        }
-      };
-
-      let cancel_handle = RcRef::map(self, |r| &r.cancel);
-      fut.try_or_cancel(cancel_handle).await
-    })
-  }
-
-  fn close(self: Rc<Self>) {
-    self.cancel.cancel();
-
-    let _ = self.req_end_tx.send(());
-    let Ok(this) = Rc::try_unwrap(self) else {
-      return;
-    };
-
-    tokio::spawn(async move {
-      if let Some(token) = this.conn_token {
-        token.cancelled_owned().await;
-      }
-    });
-  }
-
-  fn size_hint(&self) -> (u64, Option<u64>) {
-    (self.size.unwrap_or(0), self.size)
-  }
-}
-
-#[op2]
-#[serde]
-pub fn op_user_worker_fetch_build(
-  state: &mut OpState,
-  #[serde] req: UserWorkerRequest,
-) -> Result<UserWorkerBuiltRequest, JsErrorBox> {
-  let method = Method::from_bytes(&req.method)
-    .map_err(|e| JsErrorBox::generic(format!("{:#}", e)))?;
-
-  let mut builder = Request::builder().uri(req.url).method(&method);
-  let mut body = Body::empty();
-  let mut request_body_rid = None;
-
-  if req.has_body {
-    let (tx, stream) = mpsc::channel(1);
-
-    body = Body::wrap_stream(BodyStream(stream));
-    request_body_rid =
-      Some(state.resource_table.add(UserWorkerRequestBodyResource {
-        body: AsyncRefCell::new(Some(tx)),
-        cancel: CancelHandle::default(),
-      }));
-  }
-
-  // set the request headers
-  for (key, value) in req.headers {
-    if !key.is_empty() {
-      let header_name = HeaderName::try_from(key).unwrap();
-      let mut header_value =
-        HeaderValue::try_from(value).unwrap_or(HeaderValue::from_static(""));
-
-      // if request has no body explicitly set the content-length to 0
-      if !req.has_body
-        && header_name == CONTENT_LENGTH
-        && matches!(method, Method::POST | Method::PUT)
-      {
-        header_value = HeaderValue::from(0);
-      }
-
-      builder = builder.header(header_name, header_value);
-    }
-  }
-
-  let req = builder
-    .body(body)
-    .map_err(|e| JsErrorBox::generic(format!("{:#}", e)))?;
-  let request_rid = state.resource_table.add(UserWorkerRequestResource(req));
-
-  Ok(UserWorkerBuiltRequest {
-    request_rid,
-    request_body_rid,
-  })
-}
-
-#[op2]
-#[serde]
-pub async fn op_user_worker_fetch_send(
-  state: Rc<RefCell<OpState>>,
-  #[string] key: String,
-  #[smi] rid: ResourceId,
-  #[smi] request_body_rid: Option<ResourceId>,
-  #[smi] stream_rid: ResourceId,
-  #[smi] watcher_rid: Option<ResourceId>,
-) -> Result<UserWorkerResponse, JsErrorBox> {
-  let (tx, req) = {
-    let (tx, mut req) = {
-      let mut op_state = state.borrow_mut();
-      let tx = op_state
-        .borrow::<mpsc::UnboundedSender<UserWorkerMsgs>>()
-        .clone();
-
-      let req = Rc::try_unwrap(
-        op_state
-          .resource_table
-          .take::<UserWorkerRequestResource>(rid)
-          .map_err(|e| JsErrorBox::generic(format!("{:#}", e)))?,
-      )
-      .ok()
-      .expect("multiple op_user_worker_fetch_send ongoing");
-
-      (tx, req)
-    };
-
-    if get_upgrade_type(req.0.headers()).is_some() {
-      let req_stream = state
-        .borrow_mut()
-        .resource_table
-        .get::<HttpStreamReadResource>(stream_rid)
-        .map_err(|e| JsErrorBox::generic(format!("{:#}", e)))?;
-
-      let mut req_reader_mut =
-        RcRef::map(&req_stream, |r| &r.rd).borrow_mut().await;
-
-      if let HttpRequestReader::Headers(orig_req) = &mut *req_reader_mut
-        && let Some(upgrade) = orig_req.extensions_mut().remove::<OnUpgrade>()
-      {
-        let _ = req.0.extensions_mut().insert(upgrade);
-      }
-    }
-
-    (tx, req)
-  };
-
-  let (result_tx, result_rx) =
-    oneshot::channel::<Result<SendRequestResult, Error>>();
-  let key_parsed = Uuid::try_parse(key.as_str())
-    .map_err(|e| JsErrorBox::generic(format!("{:#}", e)))?;
-
-  let conn_token = watcher_rid
-    .and_then(|it| {
-      state
-        .borrow_mut()
-        .resource_table
-        .take::<ConnWatcher>(it)
-        .ok()
-    })
-    .map(Rc::try_unwrap);
-
-  let conn_token = match conn_token {
-    Some(Ok(it)) => it.get(),
-    Some(Err(_)) => {
-      error!("failed to unwrap connection watcher");
-      None
-    }
-
-    None => None,
-  };
-
-  tx.send(UserWorkerMsgs::SendRequest(
-    key_parsed,
-    req.0,
-    result_tx,
-    conn_token.clone(),
-  ))
-  .map_err(|e| JsErrorBox::generic(format!("{:#}", e)))?;
-
-  let request_body_guard = scopeguard::guard(request_body_rid, |rid| {
-    if let Some(rid) = rid {
-      match state
-        .borrow()
-        .resource_table
-        .get::<UserWorkerRequestBodyResource>(rid)
-      {
-        Err(_) => {}
-        Ok(res) => {
-          res.cancel.cancel();
-        }
-      }
-    }
-  });
-
-  let res = result_rx
-    .await
-    .map_err(|e| JsErrorBox::generic(format!("{:#}", e)))?;
-  let (res, req_end_tx) = match res {
-    Ok((res, req_end_tx)) => (res, req_end_tx),
-    Err(err) => {
-      error!("user worker failed to respond: {}", err);
-
-      match err.downcast_ref() {
-        Some(err @ WorkerError::RequestCancelledBySupervisor) => {
-          // Use "WorkerRequestCancelled" error class to match the registered JS error class
-          return Err(JsErrorBox::new(
-            "WorkerRequestCancelled",
-            err.to_string(),
-          ));
-        }
-        Some(err @ WorkerError::WorkerAlreadyRetired) => {
-          return Err(JsErrorBox::generic(err.to_string()));
-        }
-
-        None => {
-          return Err(JsErrorBox::generic(err.to_string()));
-        }
-      }
-    }
-  };
-
-  drop(request_body_guard);
-
-  let mut headers = vec![];
-  for (key, value) in res.headers().iter() {
-    headers.push((
-      ByteString::from(key.as_str()),
-      ByteString::from(value.to_str().unwrap_or_default()),
-    ));
-  }
-
-  let status = res.status().as_u16();
-  let status_text = res
-    .status()
-    .canonical_reason()
-    .unwrap_or("<unknown status code>")
-    .to_string();
-
-  let size = HttpBody::size_hint(res.body()).exact();
-  let stream: BytesStream =
-    Box::pin(res.into_body().map(|r| r.map_err(std::io::Error::other)));
-
-  let mut op_state = state.borrow_mut();
-
-  let body_rid = op_state.resource_table.add(UserWorkerResponseBodyResource {
-    reader: AsyncRefCell::new(stream.peekable()),
-    cancel: CancelHandle::default(),
-    size,
-    req_end_tx,
-    conn_token,
-  });
-
-  let response = UserWorkerResponse {
-    status,
-    status_text,
-    headers,
-    body_rid,
-    size,
-  };
-
-  Ok(response)
-}
-
 #[op2]
 #[number]
 pub async fn op_user_worker_cleanup_idle_workers(
@@ -993,18 +550,4 @@ pub async fn op_user_worker_cleanup_idle_workers(
   }
 
   (rx.await).unwrap_or_default()
-}
-
-/// Wraps a [`mpsc::Receiver`] in a [`Stream`] that can be used as a Hyper [`Body`].
-pub struct BodyStream(pub mpsc::Receiver<Result<bytes::Bytes, Error>>);
-
-impl Stream for BodyStream {
-  type Item = Result<bytes::Bytes, Error>;
-
-  fn poll_next(
-    mut self: Pin<&mut Self>,
-    cx: &mut Context<'_>,
-  ) -> Poll<Option<Self::Item>> {
-    self.0.poll_recv(cx)
-  }
 }

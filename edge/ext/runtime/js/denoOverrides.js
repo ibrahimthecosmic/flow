@@ -10,7 +10,19 @@ import { osCalls } from "ext:os/os.js";
 const io = core.loadExtScript("ext:deno_io/12_io.js");
 import * as permissions from "ext:runtime/permissions.js";
 import { errors } from "ext:runtime/errors.js";
-import { serve, serveHttp, upgradeWebSocket } from "ext:runtime/http.js";
+
+// flow: user workers have no HTTP ingress — the host<->worker comms run over
+// MessagePorts (`FlowRuntime.parentPort`). The edge-runtime serve stack was
+// removed, so the server-side HTTP APIs are explicit denials.
+function serverApiUnsupported() {
+  throw new errors.NotSupported(
+    "Serving HTTP is not supported in flow user workers; " +
+      "communicate with the host over FlowRuntime.parentPort instead",
+  );
+}
+const serve = serverApiUnsupported;
+const serveHttp = serverApiUnsupported;
+const upgradeWebSocket = serverApiUnsupported;
 
 const osCallsVars = {
   gid: osCalls.gid,

@@ -1,0 +1,9 @@
+{
+  "tempDir": true,
+  "tests": {
+    "message_port_comms": {
+      "args": "run -A main.js",
+      "output": "main.out"
+    }
+  }
+}

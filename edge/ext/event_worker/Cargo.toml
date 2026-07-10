@@ -14,7 +14,6 @@ deno_error.workspace = true
 
 base_mem_check.workspace = true
 
-anyhow.workspace = true
 enum-as-inner.workspace = true
 log.workspace = true
 serde.workspace = true

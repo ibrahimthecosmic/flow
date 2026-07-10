@@ -12,7 +12,6 @@ const lazyNodeTimersMod = core.createLazyLoader("node:timers");
 
 core.loadExtScript("ext:deno_process/40_process.js");
 import "ext:runtime/98_global_scope_shared.js";
-core.loadExtScript("ext:deno_http/00_serve.ts");
 
 const abortSignal = core.loadExtScript("ext:deno_web/03_abort_signal.js");
 const base64 = core.loadExtScript("ext:deno_web/05_base64.js");
@@ -54,7 +53,6 @@ import {
 
 import { FLOW_ENV } from "ext:env/env.js";
 
-import { FlowEventListener } from "ext:user_event_worker/event_worker.js";
 import {
   installEdgeRuntimeNamespace,
   installTrexNamespace,
@@ -64,8 +62,6 @@ import "ext:runtime/promises.js";
 import { installPromiseHook } from "ext:runtime/async_hook.js";
 import { registerErrors } from "ext:runtime/errors.js";
 import { denoOverrides, fsVars } from "ext:runtime/denoOverrides.js";
-import { installTrexasUpgradeHttpRaw } from "ext:runtime/http.js";
-import { registerDeclarativeServer } from "ext:runtime/00_serve.js";
 const { bootstrap: bootstrapOtel } = core.loadExtScript(
   "ext:deno_telemetry/telemetry.ts",
 );
@@ -106,7 +102,6 @@ const {
   ObjectDefineProperty,
   ObjectDefineProperties,
   ObjectSetPrototypeOf,
-  ObjectHasOwn,
   SafeSet,
   StringPrototypeIncludes,
   StringPrototypeSplit,
@@ -533,12 +528,6 @@ function processRejectionHandled(promise, reason) {
 globalThis.bootstrapSBEdge = (opts, ctx) => {
   let bootstrapMockFnThrowError = false;
 
-  // Replace upstream upgradeHttpRaw with trexas's fence-based variant.
-  // Must run here (not at http.js module-load time) because deno_http's
-  // 00_serve.ts loads non-deterministically relative to runtime/http.js,
-  // and 00_serve.ts unconditionally writes internals.upgradeHttpRaw on load.
-  installTrexasUpgradeHttpRaw();
-
   globalThis_ = globalThis;
 
   // We should delete this after initialization,
@@ -569,7 +558,6 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
   /**
    * @type {{
    * target: string,
-   * kind: 'user' | 'main' | 'event',
    * inspector: boolean,
    * migrated: boolean,
    * debug: boolean,
@@ -587,7 +575,6 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
   const {
     migrated,
     target,
-    kind,
     version,
     inspector,
     flags,
@@ -603,13 +590,12 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
 
   ObjectAssign(internals, {
     bootstrapArgs: { opts },
-    worker: { kind },
     __ctx: ctx,
   });
 
-  installPromiseHook(kind);
-  installEdgeRuntimeNamespace(kind, ctx);
-  installTrexNamespace(kind, ctx.terminationRequestToken);
+  installPromiseHook();
+  installEdgeRuntimeNamespace(ctx);
+  installTrexNamespace(ctx.terminationRequestToken);
 
   ObjectDefineProperty(
     globalThis,
@@ -634,7 +620,7 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
     })),
   });
 
-  if (kind === "user") {
+  {
     ObjectDefineProperties(globalThis, {
       console: nonEnumerable(
         new console.Console((msg, level) => {
@@ -700,10 +686,6 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
         }
       })();
     }
-  } else if (inspector) {
-    ObjectDefineProperties(globalThis, {
-      console: nonEnumerable(v8Console),
-    });
   }
 
   bootstrapOtel(otel);
@@ -723,11 +705,6 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
         "It appears this function was deployed using an older version of Flow CLI.\n",
         "For best performance and compatibility we recommend re-deploying the function using the latest version of the CLI.",
       );
-    }
-
-    // Find declarative fetch handler
-    if (ObjectHasOwn(main, "default")) {
-      registerDeclarativeServer(main.default);
     }
   });
 
@@ -772,7 +749,7 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
 
   /// DISABLE SHARED MEMORY INSTALL MEM CHECK TIMING
 
-  if (kind === "user") {
+  {
     const apisToBeOverridden = ctx?.allowHostFsAccess ? {} : {
       ...DENIED_DENO_FS_API_LIST,
 
@@ -877,12 +854,6 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
         }
       }
     }
-  }
-
-  if (kind === "event") {
-    ObjectDefineProperties(globalThis, {
-      EventManager: getterOnly(() => FlowEventListener),
-    });
   }
 
   // flow(2.9.0 node-compat): node:module (01_require.js) is lazy_loaded_esm,

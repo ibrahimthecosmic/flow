@@ -197,12 +197,9 @@ mod flow_startup_snapshot {
       ext_env::env::lazy_init(),
       deno_process::deno_process::lazy_init(),
       ext_workers::user_workers::lazy_init(),
-      ext_event_worker::user_event_worker::lazy_init(),
       ext_event_worker::js_interceptors::js_interceptors::lazy_init(),
       ext_runtime::runtime_bootstrap::lazy_init(),
       ext_runtime::runtime_net::lazy_init(),
-      ext_runtime::runtime_http::lazy_init(),
-      ext_runtime::runtime_http_start::lazy_init(),
       ext_node::deno_node::lazy_init::<
         deno_resolver::npm::DenoInNpmPackageChecker,
         deno_resolver::npm::NpmResolver<sys_traits::impls::RealSys>,

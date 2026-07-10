@@ -70,6 +70,8 @@ sys_traits.workspace = true
 base.workspace = true
 
 ext_event_worker.workspace = true
+ext_workers.workspace = true
+uuid.workspace = true
 
 ctor.workspace = true
 dotenvy.workspace = true

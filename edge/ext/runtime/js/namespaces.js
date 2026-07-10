@@ -1,15 +1,6 @@
 import { core, primordials } from "ext:core/mod.js";
 
-import { FLOW_USER_WORKERS } from "ext:user_workers/user_workers.js";
-import { applyFlowTag } from "ext:runtime/http.js";
 import { waitUntil } from "ext:runtime/async_hook.js";
-const {
-  builtinTracer,
-  enterSpan,
-  METRICS_ENABLED,
-  TRACING_ENABLED,
-} = core.loadExtScript("ext:deno_telemetry/telemetry.ts");
-import { exit as osExit } from "ext:os/exit.js";
 
 const ops = core.ops;
 const {
@@ -36,90 +27,16 @@ function deepFreeze(value) {
   return value;
 }
 
-let trexMod;
-function loadTrex() {
-  if (trexMod === undefined) {
-    try {
-      trexMod = ops.op_lazy_load_esm("ext:trex/trex_lib.js");
-    } catch {
-      trexMod = null;
-    }
-  }
-  return trexMod;
-}
-
 /**
- * @param {"user" | "main" | "event"} kind
+ * Legacy compatibility alias (trex-runtime lineage). Prefer `FlowRuntime`.
  * @param {number} terminationRequestTokenRid
  */
-function installTrexNamespace(kind, terminationRequestTokenRid) {
-  /** TREX */
-
-  const mod = loadTrex();
-
-  let propsTrex = {
+function installTrexNamespace(terminationRequestTokenRid) {
+  const propsTrex = {
+    waitUntil,
     scheduleTermination: () =>
       ops.op_cancel_drop_token(terminationRequestTokenRid),
   };
-
-  switch (kind) {
-    case "main":
-      propsTrex = {
-        userWorkers: FLOW_USER_WORKERS,
-        getRuntimeMetrics: () => /* async */ ops.op_runtime_metrics(),
-        applyFlowTag: (src, dest) => applyFlowTag(src, dest),
-        systemMemoryInfo: () => ops.op_system_memory_info(),
-        raiseSegfault: () => ops.op_raise_segfault(),
-        ...(mod
-          ? {
-            PluginManager: mod.PluginManager,
-            DatabaseManager: mod.DatabaseManager,
-            userDatabaseManager: () => {
-              return new mod.UserDatabaseManager(FLOW_USER_WORKERS);
-            },
-            TrexDB: mod.TrexDB,
-            req: mod.req,
-            createRequestListener: mod.createRequestListener,
-            httpClient: (service) => {
-              return new mod.TrexHttpClient(service);
-            },
-          }
-          : {}),
-        exit: (c) => osExit(c),
-        ...propsTrex,
-      };
-      break;
-
-    case "event":
-      propsTrex = {
-        ...propsTrex,
-      };
-      break;
-
-    case "user":
-      propsTrex = {
-        waitUntil,
-        ...(mod
-          ? {
-            req: mod.req,
-            httpClient: (service) => {
-              return new mod.TrexHttpClient(service);
-            },
-            tokioChannel: (service) => {
-              return new mod.TrexHttpClient(service);
-            },
-            databaseManager: () => {
-              return new mod.UserDatabaseManager(FLOW_USER_WORKERS);
-            },
-          }
-          : {}),
-      };
-      break;
-  }
-
-  if (propsTrex === void 0) {
-    return;
-  }
 
   ObjectDefineProperty(globalThis, "Trex", {
     get() {
@@ -130,54 +47,25 @@ function installTrexNamespace(kind, terminationRequestTokenRid) {
 }
 
 /*
- * @param {"user" | "main" | "event"} kind
+ * The worker-side `FlowRuntime` surface. (The host-side counterpart is
+ * installed by edge/cli/src/flow_main.js in the flow main isolate.)
+ *
  * @param {object | undefined} ctx the merged bootstrap context (embedder extra
  *   context + the `context` passed to `userWorkers.create`, plus runtime-owned
  *   keys, which are stripped from the public `context` getter installed below)
  */
-function installEdgeRuntimeNamespace(kind, ctx) {
+function installEdgeRuntimeNamespace(ctx) {
   const terminationRequestTokenRid = ctx?.terminationRequestToken;
 
-  let props = {
+  const props = {
+    waitUntil,
+    // A worker's sole graceful self-exit (Deno.exit is a no-op in the sandbox).
     scheduleTermination: () =>
       ops.op_cancel_drop_token(terminationRequestTokenRid),
   };
 
-  switch (kind) {
-    case "main":
-      props = {
-        userWorkers: FLOW_USER_WORKERS,
-        getRuntimeMetrics: () => /* async */ ops.op_runtime_metrics(),
-        applyFlowTag: (src, dest) => applyFlowTag(src, dest),
-        systemMemoryInfo: () => ops.op_system_memory_info(),
-        raiseSegfault: () => ops.op_raise_segfault(),
-        ...props,
-      };
-      break;
-
-    case "event":
-      props = {
-        builtinTracer,
-        enterSpan,
-        METRICS_ENABLED,
-        TRACING_ENABLED,
-        ...props,
-      };
-      break;
-
-    case "user":
-      props = {
-        waitUntil,
-        // Spread the base props so user workers keep `scheduleTermination` —
-        // their sole graceful self-exit (Deno.exit is a no-op in the sandbox).
-        ...props,
-      };
-      break;
-  }
-
-  // The JSON `context` this worker/isolate was created with — deep-frozen and
-  // memoized, runtime-owned keys stripped. Formerly the separate `Flow`
-  // namespace; folded in so `FlowRuntime` is the single flow surface.
+  // The JSON `context` this worker was created with — deep-frozen and
+  // memoized, runtime-owned keys stripped.
   let frozenContext;
   ObjectDefineProperty(props, "context", {
     get() {

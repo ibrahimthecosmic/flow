@@ -17,8 +17,6 @@ members = [
   "edge/crates/deno_facade",
   "edge/crates/eszip_trait",
   "edge/crates/fs",
-  "edge/crates/http_utils",
-  "edge/crates/trex_core_stub",
   "edge/ext/env",
   "edge/ext/event_worker",
   "edge/ext/os",
@@ -174,9 +172,6 @@ cpu_timer = { version = "0.1.0", path = "./edge/crates/cpu_timer" }
 # edge third-party deps (versions from trex-runtime)
 ctor = "0.2.6"
 deno = { path = "./cli" }
-# flow-local ext crates the edge layer needs but flow's root didn't declare
-deno_broadcast_channel = { path = "./ext/broadcast_channel" }
-deno_console = { path = "./ext/console" }
 deno_facade = { version = "0.1.0", path = "./edge/crates/deno_facade" }
 deno_url = { path = "./ext/url" }
 dotenvy = "0.15.7"
@@ -192,15 +187,9 @@ ext_runtime = { version = "0.1.0", path = "./edge/ext/runtime" }
 ext_workers = { version = "0.1.0", path = "./edge/ext/workers" }
 fs = { version = "0.1.0", path = "./edge/crates/fs" }
 futures-util = "0.3.30"
-http_utils = { version = "0.1.0", path = "./edge/crates/http_utils" }
-http_v02 = { package = "http", version = "0.2.9" }
 hyper_v014 = { package = "hyper", version = "0.14.26", features = ["runtime", "http1"] }
-# default-features = false drops native-tls (openssl-sys), which can't build
-# against the CI sysroot and isn't wanted anyway -- rustls everywhere.
-reqwest_v011 = { package = "reqwest", version = "0.11", default-features = false, features = ["rustls-tls", "stream", "json", "multipart"] }
 rkyv = "0.7"
 serial_test = "3.0.0"
-urlencoding = "2.1.2"
 winapi = "=0.3.9"
 xxhash-rust = "0.8"
 
@@ -693,9 +682,6 @@ opt-level = 3
 opt-level = 3
 
 [patch.crates-io]
-# trex_core lives in the parent OHDSI/trexsql monorepo; standalone builds use the
-# local stub (the `trex` feature is off by default, so this is never compiled).
-trex_core = { path = "edge/crates/trex_core_stub" }
 # Use the flow rusty_v8 fork (branch locker-v149.4.0) which adds the V8 Locker
 # binding for multi-isolate support. Build consumes prebuilt static lib +
 # src_binding from RUSTY_V8_MIRROR (the konnecthub-build release assets) to skip

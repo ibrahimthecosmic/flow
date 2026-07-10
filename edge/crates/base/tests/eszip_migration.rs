@@ -28,7 +28,6 @@ use ext_event_worker::events::WorkerEvents;
 use ext_workers::context::UserWorkerMsgs;
 use ext_workers::context::UserWorkerRuntimeOpts;
 use ext_workers::context::WorkerContextInitOpts;
-use ext_workers::context::WorkerRuntimeOpts;
 use tokio::fs::read;
 use tokio::fs::write;
 use tokio::sync::mpsc;
@@ -134,7 +133,7 @@ where
       // XXX: This seems insufficient as it may rely on the env contained in
       // Edge Functions' metadata.
       env_vars: std::env::vars().collect(),
-      conf: WorkerRuntimeOpts::UserWorker(Box::new(UserWorkerRuntimeOpts {
+      conf: Box::new(UserWorkerRuntimeOpts {
         service_path: Some(String::from("meow")),
         key: Some(Uuid::new_v4()),
         pool_msg_tx: Some(pool_msg_tx),
@@ -146,7 +145,7 @@ where
         .as_object()
         .cloned(),
         ..Default::default()
-      })),
+      }),
       static_patterns: vec![],
       timing: None,
       maybe_eszip: Some(eszip),

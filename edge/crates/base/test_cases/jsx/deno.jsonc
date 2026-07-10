@@ -1,7 +1,0 @@
-{
-  "workspace": [],
-  "compilerOptions": {
-    "jsx": "react-jsx",
-    "jsxImportSource": "https://esm.sh/preact"
-  }
-}

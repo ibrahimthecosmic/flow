@@ -77,10 +77,9 @@ use ext_runtime::MemCheckWaker;
 use ext_runtime::PromiseMetrics;
 use ext_runtime::WasmMemoryTracker;
 use ext_runtime::external_memory::CustomAllocator;
-use ext_workers::context::UserWorkerMsgs;
+use ext_workers::context::UserWorkerRuntimeOpts;
 use ext_workers::context::WorkerContextInitOpts;
 use ext_workers::context::WorkerKind;
-use ext_workers::context::WorkerRuntimeOpts;
 use fs::VfsSys;
 use fs::deno_compile_fs::DenoCompileFileSystem;
 use fs::http_fs::HttpFs;
@@ -151,7 +150,6 @@ fn log_locker_event(isolate_key: usize, stage: &'static str, depth: u32) {
     depth,
   );
 }
-use crate::worker::DuplexStreamEntry;
 use crate::worker::Worker;
 use crate::worker::supervisor::CPUUsage;
 use crate::worker::supervisor::CPUUsageMetrics;
@@ -180,11 +178,6 @@ pub static SHOULD_USE_VERBOSE_DEPRECATED_API_WARNING: OnceCell<bool> =
   OnceCell::new();
 pub static SHOULD_INCLUDE_MALLOCED_MEMORY_ON_MEMCHECK: OnceCell<bool> =
   OnceCell::new();
-
-pub static MAIN_WORKER_INITIAL_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
-pub static MAIN_WORKER_MAX_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
-pub static EVENT_WORKER_INITIAL_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
-pub static EVENT_WORKER_MAX_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
 
 // NOTE: This used to be a `#[ctor]` that initialized the V8 platform before
 // `main`. In flow, the binary delegates to `deno::main()`, which performs its
@@ -285,14 +278,12 @@ impl MemCheck {
 
 pub trait GetRuntimeContext {
   fn get_runtime_context(
-    conf: &WorkerRuntimeOpts,
     use_inspector: bool,
     migrated: bool,
     otel_config: Option<OtelConfig>,
   ) -> impl Serialize {
     serde_json::json!({
       "target": env!("TARGET"),
-      "kind": conf.to_worker_kind().to_string(),
       "debug": cfg!(debug_assertions),
       "inspector": use_inspector,
       "migrated": migrated,
@@ -366,13 +357,11 @@ pub enum WillTerminateReason {
 #[derive(Debug)]
 pub struct RunOptions {
   wait_termination_request_token: bool,
-  duplex_stream_rx: mpsc::UnboundedReceiver<DuplexStreamEntry>,
   maybe_cpu_usage_metrics_tx: Option<mpsc::UnboundedSender<CPUUsageMetrics>>,
 }
 
 pub struct RunOptionsBuilder {
   wait_termination_request_token: bool,
-  duplex_stream_rx: Option<mpsc::UnboundedReceiver<DuplexStreamEntry>>,
   maybe_cpu_usage_metrics_tx: Option<mpsc::UnboundedSender<CPUUsageMetrics>>,
 }
 
@@ -380,7 +369,6 @@ impl Default for RunOptionsBuilder {
   fn default() -> Self {
     Self {
       wait_termination_request_token: true,
-      duplex_stream_rx: None,
       maybe_cpu_usage_metrics_tx: None,
     }
   }
@@ -396,14 +384,6 @@ impl RunOptionsBuilder {
     self
   }
 
-  pub fn stream_rx(
-    mut self,
-    val: mpsc::UnboundedReceiver<DuplexStreamEntry>,
-  ) -> Self {
-    self.duplex_stream_rx = Some(val);
-    self
-  }
-
   pub fn cpu_usage_metrics_tx(
     mut self,
     val: Option<mpsc::UnboundedSender<CPUUsageMetrics>>,
@@ -415,18 +395,11 @@ impl RunOptionsBuilder {
   pub fn build(self) -> Result<RunOptions, AnyError> {
     let Self {
       wait_termination_request_token,
-      duplex_stream_rx,
       maybe_cpu_usage_metrics_tx,
     } = self;
 
-    // TODO(Nyannyacha): Make this as optional.
-    let Some(duplex_stream_rx) = duplex_stream_rx else {
-      return Err(anyhow!("stream_rx can't be empty"));
-    };
-
     Ok(RunOptions {
       wait_termination_request_token,
-      duplex_stream_rx,
       maybe_cpu_usage_metrics_tx,
     })
   }
@@ -529,7 +502,7 @@ pub struct DenoRuntime<RuntimeContext = DefaultRuntimeContext> {
   pub disposed_token: CancellationToken,
   pub(crate) termination_request_token: CancellationToken,
 
-  pub conf: WorkerRuntimeOpts,
+  pub conf: Box<UserWorkerRuntimeOpts>,
   pub s3_fses: Vec<S3Fs>,
 
   entrypoint: Option<Entrypoint>,
@@ -553,12 +526,10 @@ impl<RuntimeContext> Drop for DenoRuntime<RuntimeContext> {
     self.drop_token.cancel();
     self.mem_check.lifecycle.begin_drop();
 
-    if self.conf.is_user_worker() {
-      self.js_runtime.v8_isolate().remove_gc_prologue_callback(
-        mem_check_gc_prologue_callback_fn as _,
-        Arc::as_ptr(&self.mem_check) as *mut _,
-      );
-    }
+    self.js_runtime.v8_isolate().remove_gc_prologue_callback(
+      mem_check_gc_prologue_callback_fn as _,
+      Arc::as_ptr(&self.mem_check) as *mut _,
+    );
 
     cleanup_js_runtime(&mut self.js_runtime);
 
@@ -649,7 +620,7 @@ where
     debug_assert!(init_opts.is_some(), "init_opts must not be None");
 
     let WorkerContextInitOpts {
-      mut conf,
+      conf,
       service_path,
       no_module_cache,
       no_npm,
@@ -668,21 +639,20 @@ where
     let waker = Arc::<AtomicWaker>::default();
     let drop_token = CancellationToken::default();
     let disposed_token = CancellationToken::default();
-    let is_user_worker = conf.is_user_worker();
     let is_some_entry_point = maybe_entrypoint.is_some();
     let termination_request_token = CancellationToken::default();
     let promise_metrics = PromiseMetrics::default();
     let runtime_state = Arc::<RuntimeState>::default();
 
-    let maybe_user_conf = conf.as_user_worker();
     // flow: the worker's unique pool key, used to give this worker a distinct
     // inspector target (see the `register_inspector` call below).
-    let user_worker_key = maybe_user_conf.and_then(|c| c.key);
-    let context = conf.context().cloned().unwrap_or_default();
+    let user_worker_key = conf.key;
+    let context = conf.context.clone().unwrap_or_default();
 
-    let permissions_options = maybe_user_conf
-      .and_then(|it| it.permissions.clone())
-      .unwrap_or_else(|| get_default_permissions(conf.to_worker_kind()));
+    let permissions_options = conf
+      .permissions
+      .clone()
+      .unwrap_or_else(|| get_default_permissions(WorkerKind::UserWorker));
 
     struct Bootstrap {
       migrated: bool,
@@ -774,11 +744,8 @@ where
           emitter_factory
             .set_permissions_options(Some(permissions_options.clone()));
 
-          emitter_factory.set_file_fetcher_allow_remote(
-            maybe_user_conf
-              .map(|it| it.allow_remote_modules)
-              .unwrap_or(true),
-          );
+          emitter_factory
+            .set_file_fetcher_allow_remote(conf.allow_remote_modules);
           emitter_factory.set_cache_strategy(Some(cache_strategy));
 
           let maybe_code = if only_module_code {
@@ -799,7 +766,7 @@ where
             builder.set_entrypoint(Some(module_url.to_file_path().unwrap()));
           }
           builder
-            .set_type_check_mode(is_user_worker.then_some(TypeCheckMode::Local))
+            .set_type_check_mode(Some(TypeCheckMode::Local))
             .set_no_npm(no_npm)
             .set_import_map_path(maybe_import_map_path.clone());
 
@@ -831,7 +798,7 @@ where
         };
 
         let _root_cert_store_provider = get_root_cert_store_provider()?;
-        let stdio = if is_user_worker {
+        let stdio = {
           let stdio_pipe = deno_io::StdioPipe::file(
             tokio::fs::File::create("/dev/null").await?.into_std().await,
           );
@@ -841,8 +808,6 @@ where
             stdout: stdio_pipe.clone(),
             stderr: stdio_pipe,
           }
-        } else {
-          Default::default()
         };
 
         let has_inspector = worker.inspector.is_some();
@@ -851,16 +816,12 @@ where
           .and_then(serde_json::Value::as_bool)
           .unwrap_or_default();
 
-        let should_block_fs = if is_user_worker {
-          let allow_fs_access = maybe_user_conf
-            .and_then(|conf| conf.allow_host_fs_access)
-            .unwrap_or(false);
+        let should_block_fs = {
+          let allow_fs_access = conf.allow_host_fs_access.unwrap_or(false);
           if allow_fs_access && flags.restrict_host_fs {
             bail!("allowHostFsAccess cannot be enabled when restrict_host_fs is set");
           }
           !allow_fs_access
-        } else {
-          false
         };
 
         let rt_provider = create_module_loader_for_standalone_from_eszip_kind(
@@ -952,7 +913,7 @@ where
               let mut chain = fs.add_fs(first_mount_point, first_s3_fs);
 
               // subsequent layers inherit this flag through add_fs
-              chain.set_check_sync_api(is_user_worker);
+              chain.set_check_sync_api(true);
 
               let chain = s3_mounts.fold(chain, |chain, (mount_point, s3_fs)| {
                 chain.add_fs(mount_point, s3_fs)
@@ -976,7 +937,7 @@ where
                 let mut chain = fs.add_fs(first_mount_point, first_http_fs);
 
                 // subsequent layers inherit this flag through add_fs
-                chain.set_check_sync_api(is_user_worker);
+                chain.set_check_sync_api(true);
 
                 Arc::new(http_mounts.fold(
                   chain,
@@ -1010,7 +971,7 @@ where
           static_files
         };
 
-        let (fs, s3_fses, has_virtual_mounts) = build_file_system_fn(if is_user_worker && should_block_fs {
+        let (fs, s3_fses, has_virtual_mounts) = build_file_system_fn(if should_block_fs {
           let compile_base_dir = if matches!(entrypoint, Some(Entrypoint::ModuleCode(_)) | None)
               && is_some_entry_point
             {
@@ -1089,14 +1050,11 @@ where
           ext_env::env::init(),
           deno_process::deno_process::init(None),
           ext_workers::user_workers::init(),
-          ext_event_worker::user_event_worker::init(),
           ext_event_worker::js_interceptors::js_interceptors::init(),
           ext_runtime::runtime_bootstrap::init(
             Some(main_module_url.clone()),
           ),
           ext_runtime::runtime_net::init(),
-          ext_runtime::runtime_http::init(),
-          ext_runtime::runtime_http_start::init(),
           // NOTE(AndresP): Order is matters. Otherwise, it will lead to hard
           // errors such as SIGBUS depending on the platform.
           ext_node::deno_node::lazy_init::<
@@ -1126,7 +1084,7 @@ where
         // and `snapshot::EMBEDDED_EXT_SOURCES`.
         embed_extension_sources(&mut extensions);
 
-        let mut create_params = None;
+        let create_params;
         let mut mem_check = MemCheck {
           lifecycle: Arc::new(base_rt::IsolateLifecycle::new(drop_token.clone())),
           ..Default::default()
@@ -1137,64 +1095,37 @@ where
         let beforeunload_mem_threshold =
           ArcSwapOption::<u64>::from_pointee(None);
 
-        match conf.to_worker_kind() {
-          WorkerKind::UserWorker => {
-            let conf = maybe_user_conf.unwrap();
-            let memory_limit_bytes = mib_to_bytes(conf.memory_limit_mb) as usize;
+        {
+          let memory_limit_bytes = mib_to_bytes(conf.memory_limit_mb) as usize;
 
-            beforeunload_mem_threshold.store(
+          beforeunload_mem_threshold.store(
+            flags
+              .beforeunload_memory_pct
+              .and_then(|it| percentage_value(memory_limit_bytes as u64, it))
+              .map(Arc::new),
+          );
+
+          if conf.cpu_time_hard_limit_ms > 0 {
+            beforeunload_cpu_threshold.store(
               flags
-                .beforeunload_memory_pct
-                .and_then(|it| percentage_value(memory_limit_bytes as u64, it))
+                .beforeunload_cpu_pct
+                .and_then(|it| {
+                  percentage_value(conf.cpu_time_hard_limit_ms, it)
+                })
                 .map(Arc::new),
             );
-
-            if conf.cpu_time_hard_limit_ms > 0 {
-              beforeunload_cpu_threshold.store(
-                flags
-                  .beforeunload_cpu_pct
-                  .and_then(|it| {
-                    percentage_value(conf.cpu_time_hard_limit_ms, it)
-                  })
-                  .map(Arc::new),
-              );
-            }
-
-            let allocator = CustomAllocator::new(memory_limit_bytes);
-
-            allocator.set_waker(mem_check.waker.clone());
-
-            mem_check.limit = Some(memory_limit_bytes);
-            create_params = Some(
-              v8::CreateParams::default()
-                .heap_limits(mib_to_bytes(0) as usize, memory_limit_bytes)
-                .array_buffer_allocator(allocator.into_v8_allocator()),
-            )
           }
 
-          kind => {
-            assert_ne!(kind, WorkerKind::UserWorker);
-            let initial_heap_size = match kind {
-              WorkerKind::MainWorker => &MAIN_WORKER_INITIAL_HEAP_SIZE_MIB,
-              WorkerKind::EventsWorker => &EVENT_WORKER_INITIAL_HEAP_SIZE_MIB,
-              _ => unreachable!(),
-            };
-            let max_heap_size = match kind {
-              WorkerKind::MainWorker => &MAIN_WORKER_MAX_HEAP_SIZE_MIB,
-              WorkerKind::EventsWorker => &EVENT_WORKER_MAX_HEAP_SIZE_MIB,
-              _ => unreachable!(),
-            };
+          let allocator = CustomAllocator::new(memory_limit_bytes);
 
-            let initial_heap_size = initial_heap_size.get().cloned().unwrap_or_default();
-            let max_heap_size = max_heap_size.get().cloned().unwrap_or_default();
+          allocator.set_waker(mem_check.waker.clone());
 
-            if max_heap_size > 0 {
-              create_params = Some(v8::CreateParams::default().heap_limits(
-                mib_to_bytes(initial_heap_size) as usize,
-                mib_to_bytes(max_heap_size) as usize,
-              ));
-            }
-          }
+          mem_check.limit = Some(memory_limit_bytes);
+          create_params = Some(
+            v8::CreateParams::default()
+              .heap_limits(mib_to_bytes(0) as usize, memory_limit_bytes)
+              .array_buffer_allocator(allocator.into_v8_allocator()),
+          );
         }
 
         let mem_check = Arc::new(mem_check);
@@ -1355,19 +1286,17 @@ where
           inspector.set_generation(generation);
         }
 
-        if is_user_worker {
-          js_runtime.v8_isolate().add_gc_prologue_callback(
-            mem_check_gc_prologue_callback_fn as _,
-            Arc::as_ptr(&mem_check) as *mut _,
-            GCType::kGCTypeAll,
-          );
+        js_runtime.v8_isolate().add_gc_prologue_callback(
+          mem_check_gc_prologue_callback_fn as _,
+          Arc::as_ptr(&mem_check) as *mut _,
+          GCType::kGCTypeAll,
+        );
 
-          {
-            let op_state = js_runtime.op_state();
-            let mut op_state = op_state.borrow_mut();
-            op_state.put(MemCheckWaker::from(mem_check.waker.clone()));
-            op_state.put(mem_check.wasm_tracker.clone());
-          }
+        {
+          let op_state = js_runtime.op_state();
+          let mut op_state = op_state.borrow_mut();
+          op_state.put(MemCheckWaker::from(mem_check.waker.clone()));
+          op_state.put(mem_check.wasm_tracker.clone());
         }
 
         // V8 isolate stays entered on this thread.
@@ -1412,7 +1341,6 @@ where
         // Prepare data that doesn't need V8 scope
         let runtime_context =
           serde_json::json!(RuntimeContext::get_runtime_context(
-            &conf,
             has_inspector,
             migrated,
             maybe_otel_config,
@@ -1426,10 +1354,7 @@ where
           // op_user_worker_create, handed over via the global registry) BEFORE
           // `bootstrapSBEdge` runs below, so `op_flow_parent_port_rid` can give
           // the bootstrap the rid to expose as `FlowRuntime.parentPort`.
-          if let Some(token) = conf
-            .as_user_worker()
-            .and_then(|c| c.maybe_parent_port_token)
-          {
+          if let Some(token) = conf.maybe_parent_port_token {
             if let Some(port) = ext_workers::take_parent_port(token) {
               let rid = ext_workers::add_message_port(&mut op_state, port);
               op_state.put(ext_workers::FlowParentPortRid(rid));
@@ -1439,7 +1364,7 @@ where
             // handed over when the pool answers a later create() with this
             // already-running worker (reuse). Unregisters itself when this
             // op_state is dropped.
-            if let Some(key) = conf.as_user_worker().and_then(|c| c.key) {
+            if let Some(key) = conf.key {
               op_state.put(ext_workers::FlowPortDelivery::register(key));
             }
           }
@@ -1570,18 +1495,7 @@ where
 
       let mut env_vars = env_vars.clone();
 
-      if let Some(opts) = conf.as_events_worker_mut() {
-        op_state.put::<mpsc::UnboundedReceiver<WorkerEventWithMetadata>>(
-          opts.events_msg_rx.take().unwrap(),
-        );
-      }
-
-      if conf.is_main_worker() || conf.is_user_worker() {
-        op_state.put::<HashMap<usize, CancellationToken>>(HashMap::new());
-      }
-
-      if conf.is_user_worker() {
-        let conf = conf.as_user_worker().unwrap();
+      {
         let key = conf.key.map_or("".to_string(), |k| k.to_string());
 
         // set execution id for user workers
@@ -1593,10 +1507,6 @@ where
           );
           op_state.put(event_metadata);
         }
-
-        // flow: claim this worker's MessagePort half (created by
-        // op_user_worker_create) and register it so `op_flow_parent_port_rid`
-        // can hand the rid to the worker bootstrap for main<->worker comms.
       }
 
       op_state.put(ext_env::EnvVars(env_vars));
@@ -1615,7 +1525,7 @@ where
       ));
     }
 
-    if is_user_worker {
+    {
       drop(base_rt::SUPERVISOR_RT.spawn({
         let drop_token = drop_token.clone();
         let waker = mem_check.waker.clone();
@@ -1719,23 +1629,8 @@ where
 
     let RunOptions {
       wait_termination_request_token,
-      duplex_stream_rx,
       maybe_cpu_usage_metrics_tx,
     } = options;
-
-    {
-      let op_state_rc = self.js_runtime.op_state();
-      let mut op_state = op_state_rc.borrow_mut();
-
-      op_state
-        .put::<mpsc::UnboundedReceiver<DuplexStreamEntry>>(duplex_stream_rx);
-
-      if self.conf.is_main_worker() {
-        op_state.put::<mpsc::UnboundedSender<UserWorkerMsgs>>(
-          self.conf.as_main_worker().unwrap().worker_pool_tx.clone(),
-        );
-      }
-    }
 
     let _terminate_guard =
       scopeguard::guard(self.runtime_state.terminated.clone(), |v| {
@@ -1865,8 +1760,7 @@ where
       if let Err(err) = mod_result {
         return (Err(err), get_accumulated_cpu_time_ms!());
       }
-      if self.conf.is_user_worker()
-        && self.runtime_state.is_event_loop_completed()
+      if self.runtime_state.is_event_loop_completed()
         && self.promise_metrics.have_all_promises_been_resolved()
       {
         return (Ok(()), get_accumulated_cpu_time_ms!());
@@ -1904,23 +1798,6 @@ where
       );
     }
 
-    if !self.conf.is_user_worker() {
-      let mut guard = self.get_v8_termination_guard();
-
-      if let Err(err) = with_cpu_metrics_guard(
-        "unload_event",
-        guard.js_runtime.op_state(),
-        &maybe_cpu_usage_metrics_tx,
-        &mut accumulated_cpu_time_ns,
-        || MaybeDenoRuntime::DenoRuntime(&mut guard).dispatch_unload_event(),
-      ) {
-        return (Err(err), get_accumulated_cpu_time_ms!());
-      }
-
-      // TODO(Nyannyacha): Here we also need to trigger the event for node
-      // platform (i.e; exit)
-    }
-
     (Ok(()), get_accumulated_cpu_time_ms!())
   }
 
@@ -1933,7 +1810,6 @@ where
     accumulated_cpu_time_ns: &'l mut i64,
   ) -> impl Future<Output = Result<(), AnyError>> + 'l {
     let has_inspector = self.inspector().is_some();
-    let is_user_worker = self.conf.is_user_worker();
     let global_waker = self.waker.clone();
 
     let mut termination_request_fut = self
@@ -1946,7 +1822,7 @@ where
     let beforeunload_mem_threshold = self.beforeunload_mem_threshold.clone();
 
     let state = self.runtime_state.clone();
-    let mem_check_state = is_user_worker.then(|| self.mem_check.clone());
+    let mem_check_state = self.mem_check.clone();
 
     poll_fn(move |cx| {
       let waker = cx.waker();
@@ -2009,7 +1885,7 @@ where
           false
         };
 
-      let need_pool_event_loop = !is_user_worker || woked;
+      let need_pool_event_loop = woked;
       let poll_result = if need_pool_event_loop {
         struct JsRuntimeWaker(Arc<AtomicWaker>);
 
@@ -2019,13 +1895,9 @@ where
           }
         }
 
-        let waker = if is_user_worker {
-          Cow::Owned(
-            Arc::new(JsRuntimeWaker(global_waker.clone())).into_waker(),
-          )
-        } else {
-          Cow::Borrowed(waker)
-        };
+        let waker: Cow<std::task::Waker> = Cow::Owned(
+          Arc::new(JsRuntimeWaker(global_waker.clone())).into_waker(),
+        );
 
         let isolate_ptr = {
           let isolate_ref: &mut v8::Isolate = this.js_runtime.v8_isolate();
@@ -2053,8 +1925,8 @@ where
 
       drop(cpu_metrics_guard);
 
-      if is_user_worker {
-        let mem_state = mem_check_state.as_ref().unwrap();
+      {
+        let mem_state = &mem_check_state;
         let total_malloced_bytes =
           mem_state.check(this.js_runtime.v8_isolate().as_mut());
 
@@ -2257,32 +2129,6 @@ where
       self.js_runtime.v8_isolate(),
       self.termination_request_token.clone(),
     )
-  }
-
-  fn get_v8_termination_guard<'l>(
-    &'l mut self,
-  ) -> scopeguard::ScopeGuard<
-    &'l mut DenoRuntime<RuntimeContext>,
-    impl FnOnce(&'l mut DenoRuntime<RuntimeContext>) + 'l,
-  > {
-    let was_terminating_execution =
-      self.js_runtime.v8_isolate().is_execution_terminating();
-    let mut guard = scopeguard::guard(self, move |v| {
-      if was_terminating_execution {
-        v.js_runtime.v8_isolate().terminate_execution();
-      }
-
-      v.js_runtime
-        .v8_isolate()
-        .set_microtasks_policy(v8::MicrotasksPolicy::Auto);
-    });
-
-    guard.js_runtime.v8_isolate().cancel_terminate_execution();
-    guard
-      .js_runtime
-      .v8_isolate()
-      .set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
-    guard
   }
 }
 
@@ -2992,11 +2838,9 @@ mod test {
   use deno_facade::EszipPayloadKind;
   use deno_facade::Metadata;
   use deno_facade::generate_binary_eszip;
-  use ext_workers::context::MainWorkerRuntimeOpts;
   use ext_workers::context::UserWorkerMsgs;
   use ext_workers::context::UserWorkerRuntimeOpts;
   use ext_workers::context::WorkerContextInitOpts;
-  use ext_workers::context::WorkerRuntimeOpts;
   use fs::s3_fs::S3FsConfig;
   use fs::tmp_fs::TmpFsConfig;
   use serde::Serialize;
@@ -3010,9 +2854,8 @@ mod test {
   use super::GetRuntimeContext;
   use super::RunOptionsBuilder;
   use super::validate_mount_point;
+  use crate::flags::WorkerFlags;
   use crate::runtime::DenoRuntime;
-  use crate::server::ServerFlags;
-  use crate::worker::DuplexStreamEntry;
   use crate::worker::WorkerBuilder;
 
   #[test]
@@ -3058,7 +2901,7 @@ mod test {
     path: Option<String>,
     eszip: Option<EszipPayloadKind>,
     env_vars: Option<HashMap<String, String>>,
-    worker_runtime_conf: Option<WorkerRuntimeOpts>,
+    worker_runtime_conf: Option<Box<UserWorkerRuntimeOpts>>,
     static_patterns: Vec<String>,
     s3_fs_config: Option<S3FsConfig>,
     tmp_fs_config: Option<TmpFsConfig>,
@@ -3105,28 +2948,15 @@ mod test {
         _phantom_context,
       } = self;
 
-      let (worker_pool_tx, _) = mpsc::unbounded_channel::<UserWorkerMsgs>();
-
       DenoRuntime::new(
         WorkerBuilder::new(
           WorkerContextInitOpts {
             maybe_eszip: eszip,
             service_path: path
               .map(PathBuf::from)
-              .unwrap_or(PathBuf::from("./test_cases/main")),
+              .unwrap_or(PathBuf::from("./test_cases/userRuntimeCreation")),
 
-            conf: {
-              if let Some(conf) = worker_runtime_conf {
-                conf
-              } else {
-                WorkerRuntimeOpts::MainWorker(MainWorkerRuntimeOpts {
-                  worker_pool_tx,
-                  shared_metric_src: None,
-                  event_worker_metric_src: None,
-                  context: None,
-                })
-              }
-            },
+            conf: worker_runtime_conf.unwrap_or_default(),
 
             maybe_entrypoint: None,
             maybe_module_code: None,
@@ -3196,7 +3026,10 @@ mod test {
       self.set_env_vars(std::env::vars().collect())
     }
 
-    fn set_worker_runtime_conf(mut self, conf: WorkerRuntimeOpts) -> Self {
+    fn set_worker_runtime_conf(
+      mut self,
+      conf: Box<UserWorkerRuntimeOpts>,
+    ) -> Self {
       let _ = self.worker_runtime_conf.insert(conf);
       self
     }
@@ -3234,8 +3067,6 @@ mod test {
   #[tokio::test]
   #[serial]
   async fn test_module_code_no_eszip() {
-    let (worker_pool_tx, _) = mpsc::unbounded_channel::<UserWorkerMsgs>();
-
     DenoRuntime::<()>::new(
       WorkerBuilder::new(
         WorkerContextInitOpts {
@@ -3247,16 +3078,9 @@ mod test {
           maybe_eszip: None,
           maybe_entrypoint: None,
           maybe_module_code: Some(FastString::from(String::from(
-            "Deno.serve((req) => new Response('Hello World'));",
+            "console.log('module code, no eszip');",
           ))),
-          conf: {
-            WorkerRuntimeOpts::MainWorker(MainWorkerRuntimeOpts {
-              worker_pool_tx,
-              shared_metric_src: None,
-              event_worker_metric_src: None,
-              context: None,
-            })
-          },
+          conf: Box::default(),
           static_patterns: vec![],
 
           maybe_s3_fs_config: None,
@@ -3280,9 +3104,7 @@ mod test {
     reason = "single-threaded test; the Arc-wrapped value never crosses threads"
   )]
   async fn test_eszip_with_source_file() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let (worker_pool_tx, _) = mpsc::unbounded_channel::<UserWorkerMsgs>();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut temp_file = Builder::new()
       .prefix("eszip-source-test")
       .suffix(".ts")
@@ -3336,14 +3158,7 @@ mod test {
           maybe_eszip: Some(EszipPayloadKind::VecKind(eszip_code)),
           maybe_entrypoint: None,
           maybe_module_code: None,
-          conf: {
-            WorkerRuntimeOpts::MainWorker(MainWorkerRuntimeOpts {
-              worker_pool_tx,
-              shared_metric_src: None,
-              event_worker_metric_src: None,
-              context: None,
-            })
-          },
+          conf: Box::default(),
           static_patterns: vec![],
           maybe_s3_fs_config: None,
           maybe_tmp_fs_config: None,
@@ -3358,14 +3173,11 @@ mod test {
     .await
     .unwrap();
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = runtime
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3385,9 +3197,7 @@ mod test {
     reason = "single-threaded test; the Arc-wrapped value never crosses threads"
   )]
   async fn test_create_eszip_from_graph() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let (worker_pool_tx, _) = mpsc::unbounded_channel::<UserWorkerMsgs>();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let file = PathBuf::from("./test_cases/eszip-silly-test/index.ts");
     let service_path = PathBuf::from("./test_cases/eszip-silly-test");
     let mut emitter_factory = EmitterFactory::new();
@@ -3423,14 +3233,7 @@ mod test {
           maybe_eszip: Some(EszipPayloadKind::VecKind(eszip_code)),
           maybe_entrypoint: None,
           maybe_module_code: None,
-          conf: {
-            WorkerRuntimeOpts::MainWorker(MainWorkerRuntimeOpts {
-              worker_pool_tx,
-              shared_metric_src: None,
-              event_worker_metric_src: None,
-              context: None,
-            })
-          },
+          conf: Box::default(),
           static_patterns: vec![],
           maybe_s3_fs_config: None,
           maybe_tmp_fs_config: None,
@@ -3445,14 +3248,11 @@ mod test {
     .await
     .unwrap();
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = runtime
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3463,49 +3263,18 @@ mod test {
 
   #[tokio::test]
   #[serial]
-  async fn test_main_runtime_creation() {
-    let mut runtime = RuntimeBuilder::new()
-      .set_path("./test_cases/mainRuntimeCreation")
-      .build()
-      .await;
-
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
-
-    let (result, _) = runtime
-      .run(
-        RunOptionsBuilder::new()
-          .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
-          .build()
-          .unwrap(),
-      )
-      .await;
-
-    assert!(
-      result.is_ok(),
-      "mainRuntimeCreation test failed: {:?}",
-      result
-    );
-  }
-
-  #[tokio::test]
-  #[serial]
   async fn test_user_runtime_creation() {
     let mut runtime = RuntimeBuilder::new()
       .set_path("./test_cases/userRuntimeCreation")
-      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .set_worker_runtime_conf(Box::default())
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = runtime
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3520,22 +3289,23 @@ mod test {
 
   #[tokio::test]
   #[serial]
-  async fn test_main_rt_fs() {
+  async fn test_host_fs_read() {
     let mut main_rt = RuntimeBuilder::new()
       .set_std_env()
       .set_path("./test_cases/readFile")
+      .set_worker_runtime_conf(Box::new(UserWorkerRuntimeOpts {
+        allow_host_fs_access: Some(true),
+        ..Default::default()
+      }))
       .set_context::<WithSyncFileAPI>()
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = main_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3547,21 +3317,18 @@ mod test {
   #[tokio::test]
   #[serial]
   async fn test_jsx_import_source() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut main_rt = RuntimeBuilder::new()
       .set_std_env()
       .set_path("./test_cases/jsx-preact")
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = main_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3579,14 +3346,11 @@ mod test {
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = main_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3600,20 +3364,17 @@ mod test {
   async fn test_static_fs() {
     let mut user_rt = RuntimeBuilder::new()
       .set_path("./test_cases/staticFs")
-      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .set_worker_runtime_conf(Box::default())
       .add_static_pattern("./test_cases/**/*.md")
       .set_context::<WithSyncFileAPI>()
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = user_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3627,18 +3388,15 @@ mod test {
   async fn test_os_ops() {
     let mut user_rt = RuntimeBuilder::new()
       .set_path("./test_cases/osOps")
-      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .set_worker_runtime_conf(Box::default())
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = user_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3649,23 +3407,20 @@ mod test {
 
   #[tokio::test]
   #[serial]
-  async fn test_os_env_vars_main() {
+  async fn test_os_env_vars_passed() {
     std::env::set_var("TREX_TEST_ENV_VAR", "test_value_123");
 
     let mut main_rt = RuntimeBuilder::new()
       .set_std_env()
-      .set_path("./test_cases/envVarsMain")
+      .set_path("./test_cases/envVarsPassed")
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = main_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3673,7 +3428,7 @@ mod test {
 
     std::env::remove_var("TREX_TEST_ENV_VAR");
 
-    assert!(result.is_ok(), "envVarsMain test failed: {:?}", result);
+    assert!(result.is_ok(), "envVarsPassed test failed: {:?}", result);
   }
 
   #[tokio::test]
@@ -3683,18 +3438,15 @@ mod test {
 
     let mut user_rt = RuntimeBuilder::new()
       .set_path("./test_cases/envVarsUser")
-      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .set_worker_runtime_conf(Box::default())
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = user_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3725,16 +3477,14 @@ mod test {
 
     RuntimeBuilder::new()
       .set_path(path)
-      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::new(
-        UserWorkerRuntimeOpts {
-          memory_limit_mb,
-          worker_timeout_ms,
-          cpu_time_soft_limit_ms: 100,
-          cpu_time_hard_limit_ms: 200,
-          force_create: true,
-          ..default_opt
-        },
-      )))
+      .set_worker_runtime_conf(Box::new(UserWorkerRuntimeOpts {
+        memory_limit_mb,
+        worker_timeout_ms,
+        cpu_time_soft_limit_ms: 100,
+        cpu_time_hard_limit_ms: 200,
+        force_create: true,
+        ..default_opt
+      }))
       .extend_static_patterns(
         static_patterns.iter().map(|it| String::from(*it)),
       )
@@ -3752,13 +3502,10 @@ mod test {
     .build()
     .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
     let (result, _) = user_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3782,13 +3529,10 @@ mod test {
     .build()
     .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
     let (result, _) = user_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3812,8 +3556,6 @@ mod test {
     memory_limit_mb: u64,
     worker_timeout_ms: u64,
   ) {
-    let (_duplex_stream_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
     let (callback_tx, mut callback_rx) = mpsc::unbounded_channel::<()>();
     let mut user_rt = create_basic_user_runtime_builder(
       path,
@@ -3839,7 +3581,6 @@ mod test {
         .run(
           RunOptionsBuilder::new()
             .wait_termination_request_token(false)
-            .stream_rx(duplex_stream_rx)
             .build()
             .unwrap(),
         )
@@ -3953,13 +3694,11 @@ mod test {
     .build()
     .await;
 
-    let (_tx, duplex_stream_rx) = mpsc::unbounded_channel();
 
     user_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -3992,14 +3731,11 @@ mod test {
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) =
-      mpsc::unbounded_channel::<DuplexStreamEntry>();
 
     let (result, _) = main_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -4021,17 +3757,15 @@ mod test {
       .set_eszip("./test_cases/eszip-migration/npm-flow-js/v1_corrupted.eszip")
       .await
       .unwrap()
-      .set_worker_runtime_conf(WorkerRuntimeOpts::UserWorker(Box::default()))
+      .set_worker_runtime_conf(Box::default())
       .build()
       .await;
 
-    let (_tx, duplex_stream_rx) = mpsc::unbounded_channel();
 
     user_rt
       .run(
         RunOptionsBuilder::new()
           .wait_termination_request_token(false)
-          .stream_rx(duplex_stream_rx)
           .build()
           .unwrap(),
       )
@@ -4085,14 +3819,12 @@ mod test {
             maybe_tmp_fs_config: None,
             maybe_http_fs_config: None,
             maybe_otel_config: None,
-            conf: WorkerRuntimeOpts::UserWorker(Box::new(
-              UserWorkerRuntimeOpts {
-                pool_msg_tx: Some(worker_pool_tx.clone()),
-                ..Default::default()
-              },
-            )),
+            conf: Box::new(UserWorkerRuntimeOpts {
+              pool_msg_tx: Some(worker_pool_tx.clone()),
+              ..Default::default()
+            }),
           },
-          Arc::new(ServerFlags::default()),
+          Arc::new(WorkerFlags::default()),
         )
         .build()
         .unwrap(),
@@ -4128,14 +3860,12 @@ mod test {
             maybe_tmp_fs_config: None,
             maybe_http_fs_config: None,
             maybe_otel_config: None,
-            conf: WorkerRuntimeOpts::UserWorker(Box::new(
-              UserWorkerRuntimeOpts {
-                pool_msg_tx: Some(worker_pool_tx.clone()),
-                ..Default::default()
-              },
-            )),
+            conf: Box::new(UserWorkerRuntimeOpts {
+              pool_msg_tx: Some(worker_pool_tx.clone()),
+              ..Default::default()
+            }),
           },
-          Arc::new(ServerFlags::default()),
+          Arc::new(WorkerFlags::default()),
         )
         .build()
         .unwrap(),
@@ -4167,14 +3897,12 @@ mod test {
             maybe_tmp_fs_config: None,
             maybe_http_fs_config: None,
             maybe_otel_config: None,
-            conf: WorkerRuntimeOpts::UserWorker(Box::new(
-              UserWorkerRuntimeOpts {
-                pool_msg_tx: Some(worker_pool_tx.clone()),
-                ..Default::default()
-              },
-            )),
+            conf: Box::new(UserWorkerRuntimeOpts {
+              pool_msg_tx: Some(worker_pool_tx.clone()),
+              ..Default::default()
+            }),
           },
-          Arc::new(ServerFlags::default()),
+          Arc::new(WorkerFlags::default()),
         )
         .build()
         .unwrap(),

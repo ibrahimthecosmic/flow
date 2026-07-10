@@ -3,7 +3,7 @@ use ext_workers::context::WorkerKind;
 
 pub fn get_default_permissions(kind: WorkerKind) -> PermissionsOptions {
   match kind {
-    WorkerKind::MainWorker | WorkerKind::EventsWorker => PermissionsOptions {
+    WorkerKind::MainWorker => PermissionsOptions {
       allow_env: Some(vec![]),
       allow_net: Some(vec![]),
       allow_ffi: Some(vec![]),

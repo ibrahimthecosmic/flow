@@ -10,13 +10,10 @@ use std::future::pending;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::Context;
 use anyhow::Error;
 use anyhow::anyhow;
-use anyhow::bail;
 use deno::util::sync::AtomicFlag;
 use either::Either::Left;
 use enum_as_inner::EnumAsInner;
@@ -26,17 +23,12 @@ use ext_event_worker::events::WorkerEventWithMetadata;
 use ext_event_worker::events::WorkerEvents;
 use ext_runtime::SharedMetricSource;
 use ext_workers::context::CreateUserWorkerResult;
-use ext_workers::context::SendRequestResult;
 use ext_workers::context::Timing;
 use ext_workers::context::TimingStatus;
 use ext_workers::context::UserWorkerMsgs;
 use ext_workers::context::UserWorkerProfile;
 use ext_workers::context::WorkerContextInitOpts;
-use ext_workers::context::WorkerRuntimeOpts;
-use ext_workers::errors::WorkerError;
 use futures_util::future::join_all;
-use http_v02::Request;
-use hyper_v014::Body;
 use log::error;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -50,9 +42,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::termination_token::TerminationToken;
-use super::utils::send_user_worker_request;
 use crate::inspector_server::Inspector;
-use crate::server::ServerFlags;
+use crate::flags::WorkerFlags;
 use crate::worker::WorkerSurfaceBuilder;
 
 #[derive(Debug, Clone, Copy, Default, EnumAsInner)]
@@ -112,7 +103,7 @@ impl WorkerPoolPolicy {
   pub fn new(
     supervisor: impl Into<Option<SupervisorPolicy>>,
     max_parallelism: impl Into<Option<usize>>,
-    server_flags: ServerFlags,
+    server_flags: WorkerFlags,
   ) -> Self {
     let default = Self::default();
 
@@ -239,7 +230,7 @@ impl ActiveWorkerRegistry {
 // retires current one adds new one)
 // send_request is called with UUID
 pub struct WorkerPool {
-  pub flags: Arc<ServerFlags>,
+  pub flags: Arc<WorkerFlags>,
   pub policy: WorkerPoolPolicy,
   pub metric_src: SharedMetricSource,
   pub user_workers: HashMap<Uuid, UserWorkerProfile>,
@@ -258,7 +249,7 @@ pub struct WorkerPool {
 
 impl WorkerPool {
   pub(crate) fn new(
-    flags: Arc<ServerFlags>,
+    flags: Arc<WorkerFlags>,
     policy: WorkerPoolPolicy,
     metric_src: SharedMetricSource,
     worker_event_sender: Option<UnboundedSender<WorkerEventWithMetadata>>,
@@ -297,10 +288,7 @@ impl WorkerPool {
 
     let is_oneshot_policy = self.policy.supervisor_policy.is_oneshot();
     let inspector = self.maybe_inspector.clone();
-    let force_create = worker_options
-      .conf
-      .as_user_worker()
-      .is_some_and(|it| !is_oneshot_policy && it.force_create);
+    let force_create = !is_oneshot_policy && worker_options.conf.force_create;
 
     if let Some(ref active_worker_uuid) =
       self.maybe_active_worker(&service_path, force_create)
@@ -487,10 +475,7 @@ impl WorkerPool {
         }
       };
 
-      let Ok(mut user_worker_rt_opts) = worker_options.conf.into_user_worker()
-      else {
-        return;
-      };
+      let mut user_worker_rt_opts = worker_options.conf;
 
       let uuid = uuid::Uuid::new_v4();
       let cancel = CancellationToken::new();
@@ -519,12 +504,12 @@ impl WorkerPool {
         req: (req_start_timing_rx, req_end_timing_rx),
       });
 
-      worker_options.conf = WorkerRuntimeOpts::UserWorker(user_worker_rt_opts);
+      worker_options.conf = user_worker_rt_opts;
 
       let mut builder = WorkerSurfaceBuilder::new()
         .init_opts(worker_options)
         .policy(supervisor_policy)
-        .sever_flags(Left(flags));
+        .worker_flags(Left(flags));
 
       builder
         .set_termination_token(termination_token.clone())
@@ -546,7 +531,6 @@ impl WorkerPool {
             };
 
           let profile = UserWorkerProfile {
-            worker_request_msg_tx: surface.msg_tx,
             early_drop_tx,
             timing_tx_pair: (req_start_timing_tx, req_end_timing_tx),
             service_path,
@@ -614,122 +598,6 @@ impl WorkerPool {
 
     self.user_workers.insert(key, profile);
     self.metric_src.incl_active_user_workers();
-  }
-
-  pub fn send_request(
-    &self,
-    key: &Uuid,
-    req: Request<Body>,
-    res_tx: Sender<Result<SendRequestResult, Error>>,
-    conn_token: Option<CancellationToken>,
-  ) {
-    let _: Result<(), Error> = match self.user_workers.get(key) {
-      Some(worker) => {
-        let policy = self.policy.supervisor_policy;
-        // Clone only the fields we need to move into the async task
-        let worker_request_msg_tx = worker.worker_request_msg_tx.clone();
-        let is_retired = worker.status.is_retired.clone();
-        let demand = worker.status.demand.clone();
-        let exit = worker.exit.clone();
-        let cancel = worker.cancel.clone();
-        let (req_start_tx, req_end_tx) = worker.timing_tx_pair.clone();
-
-        if is_retired.is_raised() {
-          tokio::task::spawn(async move {
-            let err = exit
-              .error()
-              .await
-              .unwrap_or(anyhow!(WorkerError::WorkerAlreadyRetired));
-            if res_tx.send(Err(err)).is_err() {
-              error!("main worker receiver dropped");
-            }
-          });
-        } else {
-          demand.fetch_add(1, Ordering::Release);
-
-          // Create a closure to handle the request and send the response
-          let request_handler = async move {
-            if !policy.is_per_worker() {
-              if cancel.is_cancelled() {
-                bail!(exit.error().await.unwrap_or(anyhow!(
-                  WorkerError::RequestCancelledBySupervisor
-                )))
-              }
-
-              let fence = Arc::new(Notify::const_new());
-
-              if let Err(ex) = req_start_tx.send(fence.clone()) {
-                // NOTE(Nyannyacha): The only way to be trapped in this branch
-                // is if the supervisor associated with the isolate has been
-                // terminated for some reason, such as a wall-clock timeout.
-                //
-                // It can be expected enough if many isolates are created at
-                // once due to requests rapidly increasing.
-                //
-                // To prevent this, we must give a wall-clock time limit enough
-                // to each supervisor.
-                error!("failed to notify the fence to the supervisor");
-                return Err(ex).with_context(
-                  || "failed to notify the fence to the supervisor",
-                );
-              }
-
-              tokio::select! {
-                _ = fence.notified() => {}
-                _ = cancel.cancelled() => {
-                  bail!(
-                    exit
-                      .error()
-                      .await
-                      .unwrap_or(
-                        anyhow!(WorkerError::RequestCancelledBySupervisor)
-                      )
-                  )
-                }
-              }
-            }
-
-            let result = send_user_worker_request(
-              worker_request_msg_tx,
-              req,
-              cancel,
-              exit,
-              conn_token,
-            )
-            .await;
-
-            match result {
-              Ok(req) => Ok((req, req_end_tx)),
-              Err(err) => {
-                let _ = req_end_tx.send(());
-                error!("failed to send request to user worker: {err}");
-                Err(err)
-              }
-            }
-          };
-
-          // Spawn the closure as an async task
-          tokio::task::spawn(async move {
-            if res_tx.send(request_handler.await).is_err() {
-              error!("main worker receiver dropped")
-            }
-          });
-        }
-
-        Ok(())
-      }
-
-      None => {
-        if res_tx
-          .send(Err(anyhow!("user worker not available")))
-          .is_err()
-        {
-          error!("main worker receiver dropped")
-        }
-
-        Err(anyhow!("user worker not available"))
-      }
-    };
   }
 
   pub fn idle(&mut self, key: &Uuid) {
@@ -859,7 +727,7 @@ impl WorkerPool {
 }
 
 pub async fn create_user_worker_pool(
-  flags: Arc<ServerFlags>,
+  flags: Arc<WorkerFlags>,
   policy: WorkerPoolPolicy,
   worker_event_sender: Option<mpsc::UnboundedSender<WorkerEventWithMetadata>>,
   termination_token: Option<TerminationToken>,
@@ -921,10 +789,6 @@ pub async fn create_user_worker_pool(
 
               Some(UserWorkerMsgs::Created(key, profile)) => {
                 worker_pool.add_user_worker(key, profile);
-              }
-
-              Some(UserWorkerMsgs::SendRequest(key, req, res_tx, conn_token)) => {
-                worker_pool.send_request(&key, req, res_tx, conn_token);
               }
 
               Some(UserWorkerMsgs::Idle(key)) => {

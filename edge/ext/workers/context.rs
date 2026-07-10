@@ -13,14 +13,9 @@ use deno_telemetry::OtelConfig;
 use enum_as_inner::EnumAsInner;
 use ext_event_worker::events::UncaughtExceptionEvent;
 use ext_event_worker::events::WorkerEventWithMetadata;
-use ext_runtime::MetricSource;
-use ext_runtime::SharedMetricSource;
 use fs::http_fs::HttpFsConfigs;
 use fs::s3_fs::S3FsConfigs;
 use fs::tmp_fs::TmpFsConfig;
-use hyper_v014::Body;
-use hyper_v014::Request;
-use hyper_v014::Response;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -154,8 +149,11 @@ impl Default for UserWorkerRuntimeOpts {
 
 #[derive(Debug)]
 pub struct UserWorkerProfile {
-  pub worker_request_msg_tx: mpsc::UnboundedSender<WorkerRequestMsg>,
   pub early_drop_tx: mpsc::UnboundedSender<oneshot::Sender<bool>>,
+  /// Senders for the worker's `Timing::req` scope channels. The pool holds
+  /// them so the supervisor-side receivers stay open for the worker's
+  /// lifetime (a closed channel would read as "work scope over" to the
+  /// supervisor); tests also drive them to simulate active-work scopes.
   pub timing_tx_pair: (
     mpsc::UnboundedSender<Arc<Notify>>,
     mpsc::UnboundedSender<()>,
@@ -174,57 +172,14 @@ pub struct UserWorkerProfile {
   pub isolate_handle: Option<deno_core::v8::IsolateHandle>,
 }
 
-#[derive(Debug, Clone)]
-pub struct MainWorkerRuntimeOpts {
-  pub worker_pool_tx: mpsc::UnboundedSender<UserWorkerMsgs>,
-  pub shared_metric_src: Option<SharedMetricSource>,
-  pub event_worker_metric_src: Option<MetricSource>,
-  pub context: Option<crate::JsonMap>,
-}
-
-#[derive(Debug)]
-pub struct EventWorkerRuntimeOpts {
-  pub events_msg_rx: Option<mpsc::UnboundedReceiver<WorkerEventWithMetadata>>,
-  pub event_worker_exit_deadline_sec: Option<u64>,
-  pub context: Option<crate::JsonMap>,
-}
-
-#[derive(Debug, EnumAsInner)]
-pub enum WorkerRuntimeOpts {
-  UserWorker(Box<UserWorkerRuntimeOpts>),
-  MainWorker(MainWorkerRuntimeOpts),
-  EventsWorker(EventWorkerRuntimeOpts),
-}
-
-impl WorkerRuntimeOpts {
-  pub fn to_worker_kind(&self) -> WorkerKind {
-    match self {
-      Self::UserWorker(_) => WorkerKind::UserWorker,
-      Self::MainWorker(_) => WorkerKind::MainWorker,
-      Self::EventsWorker(_) => WorkerKind::EventsWorker,
-    }
-  }
-
-  pub fn context(&self) -> Option<&crate::JsonMap> {
-    match self {
-      Self::UserWorker(user_worker_runtime_opts) => {
-        user_worker_runtime_opts.context.as_ref()
-      }
-      Self::MainWorker(main_worker_runtime_opts) => {
-        main_worker_runtime_opts.context.as_ref()
-      }
-      Self::EventsWorker(event_worker_runtime_opts) => {
-        event_worker_runtime_opts.context.as_ref()
-      }
-    }
-  }
-}
-
+/// Which trust level a runtime acts at. Flow only ever BOOTS user workers
+/// (the main isolate is plain Deno), but `MainWorker` survives as the
+/// permission-defaults selector for trusted host-side work such as eszip
+/// graph building (see `get_default_permissions`).
 #[derive(Debug, Clone, Copy, EnumAsInner, PartialEq, Eq)]
 pub enum WorkerKind {
   UserWorker,
   MainWorker,
-  EventsWorker,
 }
 
 impl std::fmt::Display for WorkerKind {
@@ -232,14 +187,7 @@ impl std::fmt::Display for WorkerKind {
     match self {
       WorkerKind::UserWorker => write!(f, "user"),
       WorkerKind::MainWorker => write!(f, "main"),
-      WorkerKind::EventsWorker => write!(f, "event"),
     }
-  }
-}
-
-impl From<&WorkerRuntimeOpts> for WorkerKind {
-  fn from(value: &WorkerRuntimeOpts) -> Self {
-    value.to_worker_kind()
   }
 }
 
@@ -281,7 +229,7 @@ pub struct WorkerContextInitOpts {
   pub no_module_cache: bool,
   pub no_npm: Option<bool>,
   pub env_vars: HashMap<String, String>,
-  pub conf: WorkerRuntimeOpts,
+  pub conf: Box<UserWorkerRuntimeOpts>,
   pub static_patterns: Vec<String>,
   pub timing: Option<Timing>,
   pub maybe_eszip: Option<EszipPayloadKind>,
@@ -300,28 +248,13 @@ pub enum UserWorkerMsgs {
     oneshot::Sender<Result<CreateUserWorkerResult, Error>>,
   ),
   Created(Uuid, UserWorkerProfile),
-  SendRequest(
-    Uuid,
-    Request<Body>,
-    oneshot::Sender<Result<SendRequestResult, Error>>,
-    Option<CancellationToken>,
-  ),
   Idle(Uuid),
   Shutdown(Uuid),
   TryCleanupIdleWorkers(usize, oneshot::Sender<usize>),
 }
 
-pub type SendRequestResult = (Response<Body>, mpsc::UnboundedSender<()>);
-
 #[derive(Debug)]
 pub struct CreateUserWorkerResult {
   pub key: Uuid,
   pub reused: bool,
-}
-
-#[derive(Debug)]
-pub struct WorkerRequestMsg {
-  pub req: Request<Body>,
-  pub res_tx: oneshot::Sender<Result<Response<Body>, hyper_v014::Error>>,
-  pub conn_token: Option<CancellationToken>,
 }

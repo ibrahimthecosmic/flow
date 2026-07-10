@@ -11,4 +11,4 @@ function mySlowFunction(baseNumber) {
 
 mySlowFunction(19);
 
-Deno.serve((_req) => new Response("meow"));
+console.log("cpu-sync finished");
