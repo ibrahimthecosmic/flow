@@ -72,9 +72,8 @@ User workers are designed to run untrusted code. Compared to plain Deno:
   `Deno.serveHttp`, and `Deno.upgradeWebSocket` throw
   `Deno.errors.NotSupported`, and every listen op (`Deno.listen`,
   `Deno.listenTls`, `Deno.listenDatagram`, and the ops behind Node's
-  `net`/`http` servers) is denied at the op layer. Outbound networking
-  (`fetch`, `Deno.connect`, WebSocket clients) works normally, subject to
-  permissions.
+  `net`/`http` servers) is denied at the op layer. Outbound networking (`fetch`,
+  `Deno.connect`, WebSocket clients) works normally, subject to permissions.
 - **No web workers**: workers cannot spawn nested workers.
 - **Console**: worker `console.*` output is routed through the host process's
   logging (each line attributed to the worker), so worker logs appear in flow's
@@ -170,8 +169,8 @@ $ flow run -A --dispatch-beforeunload-cpu-ratio 90 main.ts
 ## A note on `export default { fetch }`
 
 Flow has **no HTTP ingress into workers**. The declarative server of the
-edge-runtime lineage is gone: a default-exported fetch handler is not
-registered as a server — it is simply ignored — and the serving APIs
-themselves throw (see [Sandbox behavior](#sandbox-behavior)). Communicate with
-workers over the `MessagePort` channel instead — it needs no ports, no HTTP
-framing, and supports zero-copy binary transfer.
+edge-runtime lineage is gone: a default-exported fetch handler is not registered
+as a server — it is simply ignored — and the serving APIs themselves throw (see
+[Sandbox behavior](#sandbox-behavior)). Communicate with workers over the
+`MessagePort` channel instead — it needs no ports, no HTTP framing, and supports
+zero-copy binary transfer.

@@ -181,5 +181,4 @@ impl WorkerDriver for User {
     }
     .into()
   }
-
 }

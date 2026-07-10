@@ -155,11 +155,8 @@ async fn run_s3_op(env_vars: &[(&str, String)]) -> Vec<String> {
     panic!("timed out waiting for the fixture's op marker; logs: {logs:?}");
   }
 
-  let _ = timeout(
-    Duration::from_secs(30),
-    termination_token.cancel_and_wait(),
-  )
-  .await;
+  let _ =
+    timeout(Duration::from_secs(30), termination_token.cancel_and_wait()).await;
   drop(surface);
 
   logs
@@ -261,14 +258,10 @@ async fn test_write_and_get_over_50_mib() {
   }
   remove("", true).await;
 
-  expect_op_ok(
-    &op_env("write", "meow.bin", Some(51 * MIB), None),
-    "op ",
-  )
-  .await;
+  expect_op_ok(&op_env("write", "meow.bin", Some(51 * MIB), None), "op ").await;
 
-  let logs = run_s3_op(&op_env("verify", "meow.bin", Some(51 * MIB), None))
-    .await;
+  let logs =
+    run_s3_op(&op_env("verify", "meow.bin", Some(51 * MIB), None)).await;
   let last = logs.last().cloned().unwrap_or_default();
   assert!(
     last.starts_with("op failed:") && last.contains("NotFound"),
@@ -295,10 +288,14 @@ async fn test_mkdir_and_read_dir() {
 async fn test_mkdir_recursive_and_read_dir() {
   remove("", true).await;
 
-  expect_op_ok(&op_env("mkdir", "a/b/c/meow", None, Some(true)), "op mkdir ok")
-    .await;
+  expect_op_ok(
+    &op_env("mkdir", "a/b/c/meow", None, Some(true)),
+    "op mkdir ok",
+  )
+  .await;
 
-  for [dir, expected] in [["", "a"], ["a", "b"], ["a/b", "c"], ["a/b/c", "meow"]]
+  for [dir, expected] in
+    [["", "a"], ["a", "b"], ["a/b", "c"], ["a/b/c", "meow"]]
   {
     let value = read_dir(dir).await;
     assert!(value.contains_key(expected));
@@ -329,8 +326,11 @@ async fn test_mkdir_with_no_recursive_opt_must_check_parent_path_exists() {
 async fn test_mkdir_recursive_and_remove_recursive() {
   remove("", true).await;
 
-  expect_op_ok(&op_env("mkdir", "a/b/c/meow", None, Some(true)), "op mkdir ok")
-    .await;
+  expect_op_ok(
+    &op_env("mkdir", "a/b/c/meow", None, Some(true)),
+    "op mkdir ok",
+  )
+  .await;
   expect_op_ok(
     &op_env("write", "a/b/c/meeeeow.bin", Some(11 * MIB), None),
     "op write ok",

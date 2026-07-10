@@ -9,9 +9,13 @@ use deno_core::op2;
 deno_core::extension!(
   runtime_net,
   middleware = |op| match op.name {
-    "op_net_listen_tcp" | "op_net_accept_tcp" | "op_net_listen_tls"
-    | "op_net_listen_udp" | "op_node_unstable_net_listen_udp"
-    | "op_net_listen_unix" | "op_net_listen_unixpacket"
+    "op_net_listen_tcp"
+    | "op_net_accept_tcp"
+    | "op_net_listen_tls"
+    | "op_net_listen_udp"
+    | "op_node_unstable_net_listen_udp"
+    | "op_net_listen_unix"
+    | "op_net_listen_unixpacket"
     | "op_node_unstable_net_listen_unixpacket" =>
       op.with_implementation_from(&op_net_unsupported()),
     _ => op,

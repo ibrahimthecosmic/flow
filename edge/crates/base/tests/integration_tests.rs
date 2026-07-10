@@ -148,9 +148,10 @@ impl TestWorker {
 
   async fn expect_shutdown_reason(&mut self, reason: ShutdownReason) {
     self
-      .expect_event(&format!("shutdown with reason {reason:?}"), |ev| {
-        matches!(ev, WorkerEvents::Shutdown(s) if s.reason == reason)
-      })
+      .expect_event(
+        &format!("shutdown with reason {reason:?}"),
+        |ev| matches!(ev, WorkerEvents::Shutdown(s) if s.reason == reason),
+      )
       .await;
   }
 
@@ -178,7 +179,9 @@ async fn test_worker_boot_and_json_imports() {
   )
   .await;
 
-  worker.expect_log_containing("json_import test passed").await;
+  worker
+    .expect_log_containing("json_import test passed")
+    .await;
   worker.terminate().await;
 }
 
@@ -200,10 +203,8 @@ async fn test_worker_imports_npm() {
 #[tokio::test]
 #[serial]
 async fn test_worker_boot_invalid_imports() {
-  let result = create_test_user_worker(base_init_opts(
-    "test_cases/invalid_imports",
-  ))
-  .await;
+  let result =
+    create_test_user_worker(base_init_opts("test_cases/invalid_imports")).await;
 
   assert!(result.is_err());
   assert!(
@@ -255,7 +256,9 @@ async fn test_serve_and_listen_are_denied() {
   )
   .await;
 
-  worker.expect_log_containing("serve-denied test passed").await;
+  worker
+    .expect_log_containing("serve-denied test passed")
+    .await;
   worker.terminate().await;
 }
 
@@ -447,7 +450,9 @@ async fn test_wait_until_keeps_worker_alive() {
   )
   .await;
 
-  worker.expect_log_containing("background-task main finished").await;
+  worker
+    .expect_log_containing("background-task main finished")
+    .await;
   worker.expect_log_containing("background task done").await;
   worker.terminate().await;
 }

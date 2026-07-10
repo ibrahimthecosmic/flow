@@ -3173,7 +3173,6 @@ mod test {
     .await
     .unwrap();
 
-
     let (result, _) = runtime
       .run(
         RunOptionsBuilder::new()
@@ -3248,7 +3247,6 @@ mod test {
     .await
     .unwrap();
 
-
     let (result, _) = runtime
       .run(
         RunOptionsBuilder::new()
@@ -3269,7 +3267,6 @@ mod test {
       .set_worker_runtime_conf(Box::default())
       .build()
       .await;
-
 
     let (result, _) = runtime
       .run(
@@ -3301,7 +3298,6 @@ mod test {
       .build()
       .await;
 
-
     let (result, _) = main_rt
       .run(
         RunOptionsBuilder::new()
@@ -3324,7 +3320,6 @@ mod test {
       .build()
       .await;
 
-
     let (result, _) = main_rt
       .run(
         RunOptionsBuilder::new()
@@ -3345,7 +3340,6 @@ mod test {
       .set_path("./test_cases/node-built-in")
       .build()
       .await;
-
 
     let (result, _) = main_rt
       .run(
@@ -3370,7 +3364,6 @@ mod test {
       .build()
       .await;
 
-
     let (result, _) = user_rt
       .run(
         RunOptionsBuilder::new()
@@ -3391,7 +3384,6 @@ mod test {
       .set_worker_runtime_conf(Box::default())
       .build()
       .await;
-
 
     let (result, _) = user_rt
       .run(
@@ -3415,7 +3407,6 @@ mod test {
       .set_path("./test_cases/envVarsPassed")
       .build()
       .await;
-
 
     let (result, _) = main_rt
       .run(
@@ -3441,7 +3432,6 @@ mod test {
       .set_worker_runtime_conf(Box::default())
       .build()
       .await;
-
 
     let (result, _) = user_rt
       .run(
@@ -3694,7 +3684,6 @@ mod test {
     .build()
     .await;
 
-
     user_rt
       .run(
         RunOptionsBuilder::new()
@@ -3731,7 +3720,6 @@ mod test {
       .build()
       .await;
 
-
     let (result, _) = main_rt
       .run(
         RunOptionsBuilder::new()
@@ -3760,7 +3748,6 @@ mod test {
       .set_worker_runtime_conf(Box::default())
       .build()
       .await;
-
 
     user_rt
       .run(

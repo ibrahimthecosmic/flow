@@ -14,8 +14,8 @@ use super::WorkerSurface;
 use super::pool::SupervisorPolicy;
 use super::termination_token::TerminationToken;
 use super::utils::send_event_if_event_worker_available;
-use crate::inspector_server::Inspector;
 use crate::flags::WorkerFlags;
+use crate::inspector_server::Inspector;
 
 pub type WorkerBuilderHook =
   Box<dyn FnOnce(&mut WorkerBuilder) -> Result<(), anyhow::Error> + Send>;
@@ -148,8 +148,9 @@ impl WorkerSurfaceBuilder {
       eager_module_init,
     } = self;
 
-    let (worker_boot_result_tx, worker_boot_result_rx) =
-      oneshot::channel::<Result<tokio_util::sync::CancellationToken, anyhow::Error>>();
+    let (worker_boot_result_tx, worker_boot_result_rx) = oneshot::channel::<
+      Result<tokio_util::sync::CancellationToken, anyhow::Error>,
+    >();
 
     let flags = flags.unwrap_or_default();
     let init_opts = init_opts.context("init_opts must be specified")?;

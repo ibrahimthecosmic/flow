@@ -30,8 +30,8 @@ use uuid::Uuid;
 
 use super::pool::SupervisorPolicy;
 use super::termination_token::TerminationToken;
-use crate::runtime::DenoRuntime;
 use crate::flags::WorkerFlags;
+use crate::runtime::DenoRuntime;
 use crate::utils::units::percentage_value;
 
 pub mod strategy_per_request;

@@ -42,8 +42,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::termination_token::TerminationToken;
-use crate::inspector_server::Inspector;
 use crate::flags::WorkerFlags;
+use crate::inspector_server::Inspector;
 use crate::worker::WorkerSurfaceBuilder;
 
 #[derive(Debug, Clone, Copy, Default, EnumAsInner)]
