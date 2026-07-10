@@ -14,7 +14,9 @@ Run the JS/TS linter (much faster than the full `./x lint`):
 ```
 
 Fix errors and re-run until clean. Needs the `tests/util/std` submodule
-(`git submodule update --init --depth 1 tests/util/std`).
+(`git submodule update --init --depth 1 tests/util/std`), and `deno` on PATH —
+not installed on this machine; symlink the built binary first
+(`ln -sf $PWD/target/debug/flow <scratch>/bin/deno`, prepend to PATH).
 
 ## File selection
 

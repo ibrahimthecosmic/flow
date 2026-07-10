@@ -15,6 +15,26 @@ Run the full linter (Rust + JS/TS):
 Fix errors and re-run until clean. A full pass takes ~10 min; use the iteration
 strategy below instead of re-running blindly.
 
+## On this machine: don't run the workspace clippy locally
+
+The all-features workspace clippy is the exact build shape that has
+OOM-crashed this box. Local pre-commit verification (agreed with the user,
+2026-07-10): run `./x lint-js` in full, plus clippy scoped to the touched
+crates with lint.js's deny flags, capped:
+
+```sh
+CARGO_PROFILE_DEV_DEBUG=line-tables-only cargo clippy -j 2 --all-targets --locked \
+  -p base -p fs -p ext_runtime -p ext_workers -p base_rt -- \
+  -D warnings --deny clippy::unused_async --deny clippy::print_stderr \
+  --deny clippy::print_stdout --deny clippy::large_futures \
+  --deny clippy::allow_attributes_without_reason
+```
+
+(Adjust the `-p` list to the crates you touched.) Leave the full workspace
+pass to CI. Also: `deno` is not on PATH — `./x` and `tools/lint.js` shell out
+to it; symlink the built binary first
+(`ln -sf $PWD/target/debug/flow <scratch>/bin/deno`, prepend to PATH).
+
 ## Prerequisite
 
 Needs the `tests/util/std` submodule:

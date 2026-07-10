@@ -15,7 +15,16 @@ Run the Deno code formatter:
 
 If any files were changed, stage and report them.
 
-## Prerequisite
+## Prerequisites
+
+`./x` is a `deno run` script and `deno` is not on PATH on this machine —
+symlink the built binary first (formatting via dprint does not rebuild
+anything, so a stale flow binary is fine):
+
+```sh
+ln -sf "$PWD/target/debug/flow" <scratch>/bin/deno   # then prepend to PATH
+# equivalent: PATH=<scratch>/bin:$PATH ./target/debug/flow run -A tools/format.js
+```
 
 The formatter needs the `tests/util/std` submodule. If it fails with "Module not
 found ... tests/util/std":
