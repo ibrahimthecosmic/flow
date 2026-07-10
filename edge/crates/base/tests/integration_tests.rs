@@ -118,18 +118,26 @@ impl TestWorker {
     what: &str,
     mut pred: impl FnMut(&WorkerEvents) -> bool,
   ) -> WorkerEventWithMetadata {
+    let seen = std::cell::RefCell::new(Vec::<String>::new());
     let fut = async {
       while let Some(ev) = self.events_rx.recv().await {
         if pred(&ev.event) {
-          return ev;
+          return Some(ev);
         }
+        seen.borrow_mut().push(format!("{:?}", ev.event));
       }
-      panic!("events channel closed before observing: {what}");
+      None
     };
 
     match timeout(EVENT_DEADLINE, fut).await {
-      Ok(ev) => ev,
-      Err(_) => panic!("timed out waiting for: {what}"),
+      Ok(Some(ev)) => ev,
+      Ok(None) => panic!(
+        "events channel closed before observing: {what}; saw: {:#?}",
+        seen.borrow()
+      ),
+      Err(_) => {
+        panic!("timed out waiting for: {what}; saw: {:#?}", seen.borrow())
+      }
     }
   }
 

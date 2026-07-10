@@ -65,7 +65,19 @@ const collectingDone = (async () => {
 })();
 
 // 4. worker keys: pool reuse hands back the same worker, forceCreate does not
-const a = await FlowRuntime.userWorkers.create({ servicePath: "./service" });
+// Generous limits: the pool defaults (50ms CPU soft / 100ms hard) are tuned
+// for production functions, and this driver makes dozens of RPCs per worker -
+// without headroom the supervisor reaps workers mid-test.
+const LIMITS = {
+  workerTimeoutMs: 120_000,
+  cpuTimeSoftLimitMs: 10_000,
+  cpuTimeHardLimitMs: 20_000,
+};
+
+const a = await FlowRuntime.userWorkers.create({
+  servicePath: "./service",
+  ...LIMITS,
+});
 assert(
   typeof a.key === "string" && a.key.length > 0,
   "worker.key is a non-empty string",
@@ -75,6 +87,7 @@ assert(b.key === a.key, "same servicePath reuses the worker (same key)");
 const c = await FlowRuntime.userWorkers.create({
   servicePath: "./service",
   forceCreate: true,
+  ...LIMITS,
 });
 assert(c.key !== a.key, "forceCreate boots a distinct worker");
 
@@ -145,6 +158,7 @@ const p = await FlowRuntime.userWorkers.create({
   servicePath: "./service",
   forceCreate: true,
   permissions: { allow_all: true, deny_net: ["127.0.0.1"] },
+  ...LIMITS,
 });
 const conn = await rpc(p.port, {
   kind: "connect",
@@ -160,6 +174,7 @@ assert(
 const m = await FlowRuntime.userWorkers.create({
   servicePath: "./service",
   forceCreate: true,
+  ...LIMITS,
   maybeModuleCode: "FlowRuntime.parentPort.onmessage = (e) => {" +
     " FlowRuntime.parentPort.postMessage({ kind: 'echo', payload: e.data.payload });" +
     " };",
@@ -183,24 +198,25 @@ const eszipBytes = new Uint8Array(total);
   }
 }
 assert(eszipBytes.byteLength > 0, "bundle produced an eszip");
-const z = await FlowRuntime.userWorkers.create({ maybeEszip: eszipBytes });
+const z = await FlowRuntime.userWorkers.create({
+  maybeEszip: eszipBytes,
+  ...LIMITS,
+});
 const viaZ = await rpc(z.port, { kind: "echo", payload: "eszip" });
 assert(viaZ.payload === "eszip", "maybeEszip worker echoes");
 
-// 13. tryCleanupIdleWorkers resolves (nothing is idle for 10 minutes)
-await FlowRuntime.userWorkers.tryCleanupIdleWorkers(600_000);
-
-// 14. scheduleTermination() surfaces as a TerminationRequested shutdown
-const shutdownsBefore =
-  seenEvents.filter((ev) => ev.event_type === "Shutdown").length;
+// 13. scheduleTermination() gracefully shuts the worker down — the worker's
+// only self-exit — and surfaces as a TerminationRequested shutdown for that
+// isolate.
 await rpc(c.port, { kind: "terminate" });
 let sawTermination = false;
 const deadline = Date.now() + 30_000;
 while (Date.now() < deadline) {
-  sawTermination = seenEvents
-    .filter((ev) => ev.event_type === "Shutdown")
-    .slice(shutdownsBefore)
-    .some((ev) => ev.event.reason === "TerminationRequested");
+  sawTermination = seenEvents.some((ev) =>
+    ev.event_type === "Shutdown" &&
+    ev.metadata?.execution_id === c.key &&
+    ev.event.reason === "TerminationRequested"
+  );
   if (sawTermination) break;
   await new Promise((r) => setTimeout(r, 250));
 }
@@ -213,7 +229,7 @@ assert(
   })`,
 );
 
-// 15. stop the collector and check the lifecycle event types went through
+// 14. stop the collector and check the lifecycle event types went through
 stopCollecting = true;
 await rpc(a.port, { kind: "log", payload: "collector-stop" });
 await collectingDone;
@@ -230,6 +246,16 @@ assert(
     ev.event_type === "Log" && String(ev.event.msg).includes("worker booted")
   ),
   "worker logs flow through the events stream",
+);
+
+// 15. tryCleanupIdleWorkers tears down every worker with no in-flight work
+// (`timeoutMs` is the ack wait, not an idle-age threshold) — run it LAST,
+// because it kills all of the workers above. `c` is already gone (test 13),
+// but a/p/m/z are idle, so at least one drop must be acknowledged.
+const cleaned = await FlowRuntime.userWorkers.tryCleanupIdleWorkers(10_000);
+assert(
+  typeof cleaned === "number" && cleaned >= 1,
+  `tryCleanupIdleWorkers reports acknowledged drops (got ${cleaned})`,
 );
 
 console.log("ALL TESTS PASSED");

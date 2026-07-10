@@ -268,8 +268,13 @@ declare const FlowRuntime: {
   userWorkers: {
     /** Boot (or reuse) a user worker. */
     create(opts: FlowUserWorkerCreateOptions): Promise<FlowUserWorker>;
-    /** Tear down workers idle longer than `timeoutMs`. */
-    tryCleanupIdleWorkers(timeoutMs: number): Promise<unknown>;
+    /**
+     * Request teardown of every worker with no in-flight work, waiting up to
+     * `timeoutMs` for each to acknowledge. `timeoutMs` is NOT an idle-age
+     * threshold; a worker that is idle right now is torn down. Resolves with
+     * the number of workers that acknowledged the drop.
+     */
+    tryCleanupIdleWorkers(timeoutMs: number): Promise<number>;
   };
   /**
    * Single-consumer async iterable over user-worker events. While nobody

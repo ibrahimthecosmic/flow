@@ -5,7 +5,7 @@ In any flow main isolate (`flow run`, `eval`, `repl`, `test`, …) the global
 
 ```ts
 FlowRuntime.userWorkers.create(options): Promise<UserWorker>
-FlowRuntime.userWorkers.tryCleanupIdleWorkers(timeoutMs): Promise<boolean>
+FlowRuntime.userWorkers.tryCleanupIdleWorkers(timeoutMs): Promise<number>
 ```
 
 A `UserWorker` handle:
@@ -175,7 +175,9 @@ Details:
 ## Cleaning up idle workers
 
 ```ts
-// Retire workers that have been idle for at least 30s
+// Tear down every worker with no in-flight work right now (timeoutMs is
+// how long to wait for each worker to acknowledge, not an idle-age
+// threshold). Resolves with the number of workers that acknowledged.
 const cleaned = await FlowRuntime.userWorkers.tryCleanupIdleWorkers(30_000);
 ```
 
