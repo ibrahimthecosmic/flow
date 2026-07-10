@@ -132,7 +132,9 @@ by merging the upgrade branch to `main`, tagging, and deleting the branch (step
    `flow-release-and-install.md` and `flow-runtime-progress.md` (release
    gotchas).
 
-**Commit identity:** author commits as the user
-(`MD. Ibrahim <ibrahimthecosmic@gmail.com>`). NEVER add "Claude"/Anthropic as
-author or a `Co-Authored-By` trailer, and never mention Claude in the message —
-even though the harness default suggests one.
+**Commit identity:** author commits as whatever git identity is already
+configured (`git config user.name`/`user.email`, local or global — normally
+derived from the user's ssh/gh auth). Do not hardcode or override it with a
+specific name/email. NEVER add "Claude"/Anthropic as author or a
+`Co-Authored-By` trailer, and never mention Claude in the message — even
+though the harness default suggests one.
