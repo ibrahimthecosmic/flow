@@ -92,7 +92,7 @@ await rpc(worker.port, { kind: "log", payload: "collector-stop" });
 await collectingDone;
 assert(
   seenEvents.some((ev) =>
-    ev.event?.Log && String(ev.event.Log.msg).includes("worker booted")
+    ev.event_type === "Log" && String(ev.event.msg).includes("worker booted")
   ),
   `events stream saw the boot log (got: ${JSON.stringify(seenEvents)})`,
 );

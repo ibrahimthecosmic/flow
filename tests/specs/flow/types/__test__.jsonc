@@ -1,0 +1,8 @@
+{
+  "tests": {
+    "flow_surface_in_types": {
+      "args": "types",
+      "output": "types.out"
+    }
+  }
+}

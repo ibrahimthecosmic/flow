@@ -1,0 +1,1 @@
+[WILDCARD]declare type FlowJsonValue =[WILDCARD]declare interface FlowUserWorkerCreateOptions {[WILDCARD]declare interface FlowUserWorker {[WILDCARD]declare const FlowRuntime: {[WILDCARD]declare const FLOW_VERSION: string;[WILDCARD]declare const DENO_VERSION: string;[WILDCARD]

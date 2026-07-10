@@ -4,6 +4,10 @@
     "message_port_comms": {
       "args": "run -A main.js",
       "output": "main.out"
+    },
+    "surface_api": {
+      "args": "run -A surface.js",
+      "output": "surface.out"
     }
   }
 }

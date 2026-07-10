@@ -104,7 +104,37 @@ try {
 }
 assert(bundleErrored, "bundling a missing entrypoint errors the stream");
 
-// 7. unbundling garbage fires "error" and rejects `done`
+// 7. staticPatterns + checksum: static assets survive the round trip with
+//    kind "static"
+const eszipWithStatic = await collect(
+  FlowRuntime.bundle("entry.js", {
+    staticPatterns: ["./static.txt"],
+    checksum: "sha256",
+  }),
+);
+const staticPaths = [];
+const staticJob = FlowRuntime.unbundle(eszipWithStatic);
+staticJob.on("file", (meta, stream) => {
+  if (meta.kind === "static") staticPaths.push(meta.path);
+  stream.cancel();
+});
+await staticJob.done;
+assert(
+  staticPaths.some((p) => p.includes("static.txt")),
+  `static asset emitted with kind "static" (got: ${staticPaths})`,
+);
+
+// 8. off() detaches a listener before any event fires
+const offJob = FlowRuntime.unbundle(eszipBytes);
+let offCount = 0;
+const counter = () => offCount++;
+offJob.on("file", counter);
+offJob.off("file", counter);
+offJob.on("file", (_meta, stream) => stream.cancel());
+await offJob.done;
+assert(offCount === 0, "off() removed the listener");
+
+// 9. unbundling garbage fires "error" and rejects `done`
 let unbundleErrored = false;
 const badJob = FlowRuntime.unbundle(new Uint8Array([1, 2, 3, 4]));
 badJob.on("error", () => {

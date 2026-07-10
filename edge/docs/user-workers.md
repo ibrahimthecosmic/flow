@@ -36,13 +36,13 @@ work normally.
 
 ### Options
 
-Source of the worker (exactly one of these shapes):
+Source of the worker:
 
 | Option                                      | Type         | Notes                                                                                 |
 | ------------------------------------------- | ------------ | ------------------------------------------------------------------------------------- |
 | `servicePath`                               | `string`     | Directory containing `index.{ts,tsx,js,mjs,jsx}`                                      |
-| `maybeEszip` (+ optional `maybeEntrypoint`) | `Uint8Array` | Boot from an eszip artifact (see [cli.md](./cli.md#flow-eszip--deployment-artifacts)) |
-| `maybeModuleCode`                           | `string`     | Inline module source                                                                  |
+| `maybeEszip` (+ optional `maybeEntrypoint`) | `Uint8Array` | Boot from an eszip artifact (see [cli.md](./cli.md#flow-eszip--deployment-artifacts)); `servicePath` optional |
+| `maybeModuleCode`                           | `string`     | Inline module source; still needs a `servicePath` (pool key / base directory)         |
 
 Resource limits (per worker):
 

@@ -93,8 +93,8 @@ class UserWorker {
   }
 }
 
-// Mirrors the edge `UserWorker.create` option defaults, minus the eszip/HTTP
-// request-passing surface (that path is being replaced by MessagePort comms).
+// Mirrors the edge `UserWorker.create` option defaults, minus the HTTP
+// request-passing surface (replaced by the MessagePort channel).
 async function createUserWorker(opts) {
   const readyOptions = {
     noModuleCache: false,
@@ -107,6 +107,12 @@ async function createUserWorker(opts) {
   const { servicePath, maybeEszip } = readyOptions;
   if (!maybeEszip && (!servicePath || servicePath === "")) {
     throw new TypeError("service path must be defined");
+  }
+  // The op requires `servicePath` (it doubles as the pool key). An eszip
+  // carries its own entrypoint, so for an eszip-only create the path has no
+  // directory meaning - default it instead of failing deserialization.
+  if (readyOptions.servicePath == null) {
+    readyOptions.servicePath = "";
   }
 
   const [key, _reused, mainPortRid] = await op_user_worker_create(readyOptions);
@@ -373,6 +379,11 @@ function unbundle(eszip, output) {
   return emitter;
 }
 
+// The main isolate is not created via `userWorkers.create`, so its `context`
+// is always empty - the getter exists so `FlowRuntime.context` reads the same
+// way in both isolates (a worker sees what its create() passed).
+const HOST_CONTEXT = Object.freeze({});
+
 // Host surface. The user-worker pool sender is injected into op_state by the
 // post-bootstrap hook before this runs, so `create` is functional immediately.
 define("FlowRuntime", {
@@ -383,4 +394,7 @@ define("FlowRuntime", {
   events,
   bundle,
   unbundle,
+  get context() {
+    return HOST_CONTEXT;
+  },
 });

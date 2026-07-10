@@ -142,6 +142,8 @@ declare interface FlowUserWorkerCreateOptions {
   /** Precompiled eszip payload (alternative to `servicePath`). */
   maybeEszip?: Uint8Array | null;
   maybeEntrypoint?: string | null;
+  /** Inline module source. Still requires a `servicePath`, which acts as the
+   * worker's pool key and base directory. */
   maybeModuleCode?: string | null;
 
   memoryLimitMb?: number;
@@ -321,7 +323,9 @@ declare const FlowRuntime: {
   scheduleTermination?(): void;
 };
 
-/** flow runtime version string. */
+/** flow runtime version string. (Installed in USER workers; the host isolate
+ * is plain Deno and does not define this global.) */
 declare const FLOW_VERSION: string;
-/** Version of the Deno runtime flow is built on. */
+/** Version of the Deno runtime flow is built on. (Installed in USER workers;
+ * on the host use `Deno.version.deno`.) */
 declare const DENO_VERSION: string;
