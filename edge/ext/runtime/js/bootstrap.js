@@ -699,7 +699,7 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
   );
   setLanguage("en");
 
-  core.addMainModuleHandler((main) => {
+  core.addMainModuleHandler(() => {
     if (migrated && !ctx?.suppressEszipMigrationWarning) {
       globalThis.console.warn(
         "It appears this function was deployed using an older version of Flow CLI.\n",

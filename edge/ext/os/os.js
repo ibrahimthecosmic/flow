@@ -1,3 +1,8 @@
+// Side-effect import: `exit.js` publishes `internals.flowOsExit` for the
+// `30_os.js` lazy script facade, and deno_core requires every declared `esm`
+// module to be reachable from this entry point.
+import "ext:os/exit.js";
+
 class DenoCommand {
   constructor(command, options) {
     this.command = command;

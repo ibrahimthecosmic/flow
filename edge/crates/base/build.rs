@@ -21,6 +21,7 @@ use std::path::PathBuf;
 mod flow_startup_snapshot {
   use std::collections::HashSet;
   use std::io::Write;
+  use std::path::Path;
   use std::rc::Rc;
 
   use deno_core::Extension;
@@ -246,6 +247,24 @@ mod flow_startup_snapshot {
     out
   }
 
+  /// Extension sources must be 7-bit ASCII: `deno_core` hands them to v8 as
+  /// external one-byte strings, and the constructor asserts it. Enforced here
+  /// so a stray non-ASCII byte fails the build instead of aborting every worker
+  /// the first time one boots.
+  fn assert_ascii_extension_source(specifier: &str, path: &Path) {
+    let source = std::fs::read_to_string(path).unwrap();
+    let Some((offset, ch)) = source.char_indices().find(|(_, c)| !c.is_ascii())
+    else {
+      return;
+    };
+    let line = source[..offset].bytes().filter(|&b| b == b'\n').count() + 1;
+    panic!(
+      "extension source must be 7-bit ASCII, found {ch:?} at {}:{line} \
+       (specifier {specifier}). Replace it with an ASCII equivalent.",
+      path.display(),
+    );
+  }
+
   /// Emit a table embedding the raw source text of every fs-loaded worker
   /// extension file, keyed by specifier. `src/runtime/mod.rs` uses it to
   /// rewrite each extension's file sources from `LoadedFromFsDuringSnapshot`
@@ -269,6 +288,7 @@ mod flow_startup_snapshot {
     .unwrap();
     for (specifier, path) in &files {
       println!("cargo:rerun-if-changed={}", path.display());
+      assert_ascii_extension_source(specifier, path);
       writeln!(
         f,
         "  ({specifier:?}, include_str!({:?})),",

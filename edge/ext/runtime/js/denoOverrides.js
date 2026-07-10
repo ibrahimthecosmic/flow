@@ -11,7 +11,7 @@ const io = core.loadExtScript("ext:deno_io/12_io.js");
 import * as permissions from "ext:runtime/permissions.js";
 import { errors } from "ext:runtime/errors.js";
 
-// flow: user workers have no HTTP ingress — the host<->worker comms run over
+// flow: user workers have no HTTP ingress - the host<->worker comms run over
 // MessagePorts (`FlowRuntime.parentPort`). The edge-runtime serve stack was
 // removed, so the server-side HTTP APIs are explicit denials.
 function serverApiUnsupported() {

@@ -64,7 +64,7 @@ function installEdgeRuntimeNamespace(ctx) {
       ops.op_cancel_drop_token(terminationRequestTokenRid),
   };
 
-  // The JSON `context` this worker was created with — deep-frozen and
+  // The JSON `context` this worker was created with - deep-frozen and
   // memoized, runtime-owned keys stripped.
   let frozenContext;
   ObjectDefineProperty(props, "context", {
