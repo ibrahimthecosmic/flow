@@ -18,14 +18,7 @@ function waitUntil(maybePromise) {
   return waitUntilInner(maybePromise);
 }
 
-/**
- * @param {"user" | "main" | "event"} kind
- */
-function installPromiseHook(kind) {
-  if (kind !== "user") {
-    return;
-  }
-
+function installPromiseHook() {
   core.setPromiseHooks(
     null,
     null,

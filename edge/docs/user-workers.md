@@ -182,8 +182,8 @@ const cleaned = await FlowRuntime.userWorkers.tryCleanupIdleWorkers(30_000);
 ## Observing workers: `FlowRuntime.events`
 
 `FlowRuntime.events` is an async iterable over every worker's lifecycle and
-console output — the same event stream edge/trex feed to their dedicated "events
-worker" (`new EventManager()`), collapsed into a host API on the main isolate:
+console output — the event stream edge/trex fed to their dedicated "events
+worker" (removed in flow), collapsed into a host API on the main isolate:
 
 ```ts
 for await (const ev of FlowRuntime.events) {

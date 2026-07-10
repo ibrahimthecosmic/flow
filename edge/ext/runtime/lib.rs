@@ -302,9 +302,8 @@ deno_core::extension!(
   // the `deno_*` extensions whose modules `js/*.js` import (bootstrap.js,
   // navigator.js, denoOverrides.js, ...). Without it the user worker panics at
   // boot: "ext:deno_webidl/00_webidl.js was not passed as an extension module".
-  // (The edge-internal `env`/`user_workers`/`user_event_worker` are eager
-  // ESM and intentionally omitted — `user_workers` imports back into `runtime`,
-  // so listing it would form a dependency cycle.)
+  // (The edge-internal `env` extension is eager ESM but imports nothing from
+  // other extensions, so it is intentionally omitted.)
   deps = [
     os,
     deno_telemetry,
