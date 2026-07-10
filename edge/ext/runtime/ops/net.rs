@@ -22,11 +22,17 @@ deno_core::extension!(
   }
 );
 
+// The error class must be one the worker registers via
+// `core.registerErrorClass` (see js/errors.js). An unregistered class (the
+// old `RuntimeError::Runtime` mapped to "Runtime") makes deno_core's
+// buildCustomError return undefined, so JS callers saw `throw undefined`
+// instead of an error.
 #[op2(fast)]
 pub fn op_net_unsupported(
   _state: &mut OpState,
-) -> Result<(), crate::RuntimeError> {
-  Err(crate::RuntimeError::Runtime(
-    "Operation not supported".into(),
+) -> Result<(), deno_error::JsErrorBox> {
+  Err(deno_error::JsErrorBox::new(
+    "NotSupported",
+    "Listening on network sockets is not supported in flow user workers",
   ))
 }
