@@ -1,0 +1,9 @@
+{
+  "tempDir": true,
+  "tests": {
+    "eszip_forms": {
+      "args": "run -A main.js",
+      "output": "main.out"
+    }
+  }
+}

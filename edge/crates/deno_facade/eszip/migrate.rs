@@ -17,6 +17,15 @@ pub async fn try_migrate_if_needed(
   options: Option<MigrateOptions>,
 ) -> Result<LazyLoadableEszip, AnyError> {
   if let Err(err) = eszip.ensure_version().await {
+    if eszip.is_file_backed() {
+      // In-place migration mutates the header, but a file-backed header is
+      // shared and immutable (and the migration readers would hang on its
+      // never-woken source slots). Old formats must be re-bundled.
+      return Err(err.context(
+        "this eszip uses an unsupported format for file-backed loading; \
+         re-bundle it with `flow eszip bundle`",
+      ));
+    }
     match err.downcast_ref::<EszipError>() {
       Some(err) => {
         warn!("{}: will attempt migration", err);

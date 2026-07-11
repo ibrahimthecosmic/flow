@@ -90,26 +90,33 @@ impl StaticFs {
     normalized: &Path,
   ) -> Option<FsResult<Cow<'static, [u8]>>> {
     let eszip = self.vfs.eszip.as_ref();
-    let file = self
-      .static_files
-      .get(normalized)
-      .and_then(|it| eszip.ensure_module(it))?;
+    let key = self.static_files.get(normalized)?;
+    // Missing module keeps the historical "not a static file" `None`
+    // (the caller then reports "path not found").
+    let module = eszip.ensure_module(key)?;
 
-    let Some(res) = std::thread::scope(|s| {
-      s.spawn(move || IO_RT.block_on(async move { file.source().await }))
-        .join()
-        .unwrap()
-    }) else {
-      return Some(Err(
+    // `read_source` instead of `Module::source()`: file-backed eszips never
+    // wake source slots, so awaiting a slot would hang forever.
+    let res = std::thread::scope(|s| {
+      s.spawn(move || {
+        IO_RT
+          .block_on(async move { eszip.read_source(&module.specifier).await })
+      })
+      .join()
+      .unwrap()
+    });
+
+    match res {
+      Ok(Some(bytes)) => Some(Ok(Cow::Owned(bytes.to_vec()))),
+      Ok(None) => Some(Err(
         std::io::Error::new(
           std::io::ErrorKind::NotFound,
           "No content available",
         )
         .into(),
-      ));
-    };
-
-    Some(Ok(Cow::Owned(res.to_vec())))
+      )),
+      Err(err) => Some(Err(err.into())),
+    }
   }
 
   pub fn is_valid_npm_package(&self, path: &Path) -> bool {

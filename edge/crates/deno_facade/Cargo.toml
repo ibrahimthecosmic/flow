@@ -56,6 +56,7 @@ url.workspace = true
 dashmap = "5.5.3"
 hashlink = "0.8"
 pathdiff = "0.2"
+xxhash-rust = { workspace = true, features = ["xxh3"] }
 
 [dev-dependencies]
 enum-as-inner.workspace = true

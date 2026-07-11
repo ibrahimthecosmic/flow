@@ -737,6 +737,9 @@ const NOT_IMPORTED_OPS = [
   "op_eszip_bundle",
   "op_eszip_unbundle_open",
   "op_eszip_unbundle_next",
+  "op_eszip_spill_open",
+  "op_eszip_spill_write",
+  "op_eszip_spill_finish",
 ];
 
 function removeImportedOps() {

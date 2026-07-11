@@ -32,6 +32,9 @@ import { core } from "ext:core/mod.js";
 // during bootstrap (before this file runs).
 const {
   op_eszip_bundle,
+  op_eszip_spill_finish,
+  op_eszip_spill_open,
+  op_eszip_spill_write,
   op_eszip_unbundle_next,
   op_eszip_unbundle_open,
   op_flow_events_accept,
@@ -93,6 +96,28 @@ class UserWorker {
   }
 }
 
+// Pumps a ReadableStream<Uint8Array> eszip into the runtime's bundle cache
+// via the spill ops; resolves with the content-addressed cache path. On any
+// error the spill resource is closed, which unlinks its temp file.
+async function spillEszipStream(stream) {
+  const rid = await op_eszip_spill_open();
+  try {
+    for await (const chunk of stream) {
+      if (!(chunk instanceof Uint8Array)) {
+        throw new TypeError(
+          "a maybeEszip stream must yield Uint8Array chunks",
+        );
+      }
+      await op_eszip_spill_write(rid, chunk);
+    }
+    // Takes the resource out of the table; no close needed on success.
+    return await op_eszip_spill_finish(rid);
+  } catch (e) {
+    core.tryClose(rid);
+    throw e;
+  }
+}
+
 // Mirrors the edge `UserWorker.create` option defaults, minus the HTTP
 // request-passing surface (replaced by the MessagePort channel).
 async function createUserWorker(opts) {
@@ -113,6 +138,17 @@ async function createUserWorker(opts) {
   // directory meaning - default it instead of failing deserialization.
   if (readyOptions.servicePath == null) {
     readyOptions.servicePath = "";
+  }
+
+  // The op takes eszip bytes (`maybeEszip`) or an on-disk path
+  // (`maybeEszipPath`); both converge file-backed on the Rust side. Map the
+  // path/stream forms of `maybeEszip` onto `maybeEszipPath` here.
+  if (typeof maybeEszip === "string") {
+    readyOptions.maybeEszipPath = maybeEszip;
+    readyOptions.maybeEszip = undefined;
+  } else if (maybeEszip instanceof ReadableStream) {
+    readyOptions.maybeEszipPath = await spillEszipStream(maybeEszip);
+    readyOptions.maybeEszip = undefined;
   }
 
   const [key, _reused, mainPortRid] = await op_user_worker_create(readyOptions);

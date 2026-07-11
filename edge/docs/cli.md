@@ -52,20 +52,22 @@ instead.
 Environment variables form the base layer; the CLI flags above override them per
 invocation.
 
-| Variable                                   | Matching flag / effect                                                                       |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------- |
-| `FLOW_WORKER_POOL_POLICY`                  | `--policy`                                                                                   |
-| `FLOW_WORKER_MAX_PARALLELISM`              | `--max-parallelism`                                                                          |
-| `FLOW_REQUEST_WAIT_TIMEOUT_MS`             | `--request-wait-timeout`                                                                     |
-| `FLOW_BEFOREUNLOAD_CPU_RATIO`              | `--dispatch-beforeunload-cpu-ratio`                                                          |
-| `FLOW_BEFOREUNLOAD_MEMORY_RATIO`           | `--dispatch-beforeunload-memory-ratio`                                                       |
-| `FLOW_BEFOREUNLOAD_WALL_CLOCK_RATIO`       | `--dispatch-beforeunload-wall-clock-ratio`                                                   |
-| `FLOW_USER_WORKER_INSPECTOR_ADDRESS`       | `--user-worker-inspect`                                                                      |
-| `FLOW_USER_WORKER_MAX_HEAP_SIZE_MIB`       | Default worker heap limit (MiB) when `create()` omits `memoryLimitMb`. Built-in default: 512 |
-| `FLOW_INCLUDE_MALLOCED_MEMORY_ON_MEMCHECK` | Include malloc'd (external) memory in the worker memory check (`1`/`true`/`yes`/`on`)        |
-| `FLOW_ESZIP_CHECKSUM`                      | Default for `flow eszip bundle --checksum`                                                   |
-| `DENO_NO_DEPRECATION_WARNINGS`             | Suppress deprecated-API warnings inside user workers                                         |
-| `DENO_VERBOSE_WARNINGS`                    | Verbose deprecated-API warnings inside user workers                                          |
+| Variable                                   | Matching flag / effect                                                                                                                             |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FLOW_WORKER_POOL_POLICY`                  | `--policy`                                                                                                                                         |
+| `FLOW_WORKER_MAX_PARALLELISM`              | `--max-parallelism`                                                                                                                                |
+| `FLOW_REQUEST_WAIT_TIMEOUT_MS`             | `--request-wait-timeout`                                                                                                                           |
+| `FLOW_BEFOREUNLOAD_CPU_RATIO`              | `--dispatch-beforeunload-cpu-ratio`                                                                                                                |
+| `FLOW_BEFOREUNLOAD_MEMORY_RATIO`           | `--dispatch-beforeunload-memory-ratio`                                                                                                             |
+| `FLOW_BEFOREUNLOAD_WALL_CLOCK_RATIO`       | `--dispatch-beforeunload-wall-clock-ratio`                                                                                                         |
+| `FLOW_USER_WORKER_INSPECTOR_ADDRESS`       | `--user-worker-inspect`                                                                                                                            |
+| `FLOW_USER_WORKER_MAX_HEAP_SIZE_MIB`       | Default worker heap limit (MiB) when `create()` omits `memoryLimitMb`. Built-in default: 512                                                       |
+| `FLOW_INCLUDE_MALLOCED_MEMORY_ON_MEMCHECK` | Include malloc'd (external) memory in the worker memory check (`1`/`true`/`yes`/`on`)                                                              |
+| `FLOW_ESZIP_CHECKSUM`                      | Default for `flow eszip bundle --checksum`                                                                                                         |
+| `FLOW_BUNDLE_CACHE_DIR`                    | Where `maybeEszip` bytes/streams are spilled to disk. Default: `<tmpdir>/flow-bundles` (see [user-workers.md](./user-workers.md#the-bundle-cache)) |
+| `FLOW_BUNDLE_CACHE_TTL_SECS`               | Age after which bundle-cache entries are swept. Default: `604800` (7 days)                                                                         |
+| `DENO_NO_DEPRECATION_WARNINGS`             | Suppress deprecated-API warnings inside user workers                                                                                               |
+| `DENO_VERBOSE_WARNINGS`                    | Verbose deprecated-API warnings inside user workers                                                                                                |
 
 ```console
 $ FLOW_WORKER_POOL_POLICY=oneshot FLOW_USER_WORKER_MAX_HEAP_SIZE_MIB=256 \
@@ -75,9 +77,24 @@ $ FLOW_WORKER_POOL_POLICY=oneshot FLOW_USER_WORKER_MAX_HEAP_SIZE_MIB=256 \
 ## `flow eszip` — deployment artifacts
 
 An _eszip_ is a single binary artifact containing a module graph (all local and
-remote modules of an entrypoint), suitable for shipping a worker service as one
-file. A worker can be booted directly from an eszip via `create()`'s
-`maybeEszip` option (see [user-workers.md](./user-workers.md)).
+remote modules of an entrypoint, plus npm packages, static assets, and
+metadata), suitable for shipping a worker service as one file. A worker can be
+booted directly from an eszip via `create()`'s `maybeEszip` option — the
+artifact is then served **file-backed**: module sources are read from disk on
+demand instead of holding the whole bundle in memory (see
+[user-workers.md](./user-workers.md#booting-from-an-eszip-maybeeszip) for the
+loading, caching, and integrity semantics).
+
+Two compatibility notes:
+
+- Only **current-format** eszips (flow version `2.0`) can boot workers. Archives
+  produced by older flow/edge-runtime versions still unpack with
+  `flow eszip unbundle`, so `unbundle` + `bundle` re-creates any old artifact in
+  the current format.
+- Bundling with `--checksum xxhash3` (or `sha256`) is recommended for artifacts
+  that cross a network or shared storage: every module read at boot and import
+  time is then verified against its stored hash, and corruption fails the worker
+  with an `invalid source hash` boot error instead of running altered code.
 
 The `eszip` group is listed in the `Flow:` section of `flow --help`.
 

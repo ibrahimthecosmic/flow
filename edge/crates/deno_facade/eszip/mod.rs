@@ -47,7 +47,6 @@ use fs::virtual_fs::VfsBuilder;
 use fs::virtual_fs::VfsEntry;
 use futures::AsyncReadExt;
 use futures::AsyncSeekExt;
-use futures::future::OptionFuture;
 use futures::io::AllowStdIo;
 use futures::io::BufReader;
 use glob::glob;
@@ -69,6 +68,7 @@ use crate::metadata::Metadata;
 
 mod parse;
 
+pub mod bundle_cache;
 pub mod error;
 pub mod migrate;
 pub mod vfs;
@@ -79,6 +79,10 @@ const READ_ALL_BARRIER_MAX_PERMITS: usize = 10;
 pub enum EszipPayloadKind {
   JsBufferKind(JsBuffer),
   VecKind(Vec<u8>),
+  /// An `.eszip` file used in place: the archive header is parsed once (and
+  /// shared across workers via [`bundle_cache`]); module sources are served
+  /// from disk with positional reads instead of being held resident.
+  FileKind(PathBuf),
   Eszip(EszipV2),
 }
 
@@ -94,6 +98,10 @@ async fn read_u32<R: futures::io::AsyncRead + Unpin>(
 pub struct LazyLoadableEszip {
   eszip: EszipV2,
   maybe_data_section: Option<Arc<EszipDataSection>>,
+  /// Keeps the registry's shared parse alive for file-backed bundles (the
+  /// header modules and data section are shared with every other worker
+  /// created from the same bundle path).
+  shared: Option<Arc<bundle_cache::SharedBundle>>,
   migrated: bool,
 }
 
@@ -120,6 +128,7 @@ impl Clone for LazyLoadableEszip {
         options: self.eszip.options,
       },
       maybe_data_section: self.maybe_data_section.clone(),
+      shared: self.shared.clone(),
       migrated: false,
     }
   }
@@ -145,6 +154,79 @@ impl AsyncEszipDataRead for LazyLoadableEszip {
 
     Some(module)
   }
+
+  fn read_source<'a>(
+    &'a self,
+    specifier: &'a str,
+  ) -> futures::future::BoxFuture<'a, std::io::Result<Option<Arc<[u8]>>>> {
+    Box::pin(async move {
+      let Some(module) = self.ensure_data(specifier) else {
+        return Ok(None);
+      };
+      // When a file-backed read finds no extent, the source slot was `Ready`
+      // at parse time (zero-length source), so the awaits below resolve
+      // immediately.
+      if let Some(section) = self.file_backed_data_section()
+        && let Some(bytes) =
+          section.read_source_direct(&module.specifier).await?
+      {
+        return Ok(Some(bytes));
+      }
+      Ok(module.source().await)
+    })
+  }
+
+  fn read_source_map<'a>(
+    &'a self,
+    specifier: &'a str,
+  ) -> futures::future::BoxFuture<'a, std::io::Result<Option<Arc<[u8]>>>> {
+    Box::pin(async move {
+      let Some(module) = self.ensure_data(specifier) else {
+        return Ok(None);
+      };
+      // Same as `read_source`: absent from the data section means the slot
+      // is already `Ready` (empty source map).
+      if let Some(section) = self.file_backed_data_section()
+        && let Some(bytes) =
+          section.read_source_map_direct(&module.specifier).await?
+      {
+        return Ok(Some(bytes));
+      }
+      Ok(module.source_map().await)
+    })
+  }
+
+  fn read_source_range<'a>(
+    &'a self,
+    specifier: &'a str,
+    pos: u64,
+    limit: usize,
+  ) -> futures::future::BoxFuture<'a, std::io::Result<Vec<u8>>> {
+    Box::pin(async move {
+      if let Some(section) = self.file_backed_data_section() {
+        let Some(module) = self.ensure_data(specifier) else {
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no content available for {specifier}"),
+          ));
+        };
+        if let Some(chunk) = section
+          .read_source_range_direct(&module.specifier, pos, limit)
+          .await?
+        {
+          return Ok(chunk);
+        }
+      }
+      // Memory-backed (or `Ready` slot): whole read + slice.
+      let source = self.read_source(specifier).await?.ok_or_else(|| {
+        std::io::Error::new(
+          std::io::ErrorKind::NotFound,
+          format!("no content available for {specifier}"),
+        )
+      })?;
+      Ok(eszip_trait::slice_source_range(&source, pos, limit))
+    })
+  }
 }
 
 impl LazyLoadableEszip {
@@ -155,8 +237,36 @@ impl LazyLoadableEszip {
     Self {
       eszip,
       maybe_data_section,
+      shared: None,
       migrated: false,
     }
+  }
+
+  /// A per-worker view of a shared file-backed bundle: the (immutable) header
+  /// modules and data section are shared; the npm snapshot is cloned so
+  /// `take_npm_snapshot` can't strip it from other workers.
+  fn new_shared(shared: Arc<bundle_cache::SharedBundle>) -> Self {
+    Self {
+      eszip: EszipV2 {
+        modules: shared.modules.clone(),
+        npm_snapshot: shared.npm_snapshot.clone(),
+        options: shared.options,
+      },
+      maybe_data_section: Some(shared.data_section.clone()),
+      shared: Some(shared),
+      migrated: false,
+    }
+  }
+
+  pub fn is_file_backed(&self) -> bool {
+    self.file_backed_data_section().is_some()
+  }
+
+  fn file_backed_data_section(&self) -> Option<&Arc<EszipDataSection>> {
+    self
+      .maybe_data_section
+      .as_ref()
+      .filter(|it| it.is_file_backed())
   }
 
   pub fn ensure_data(&self, specifier: &str) -> Option<Module> {
@@ -165,6 +275,12 @@ impl LazyLoadableEszip {
       .or_else(|| self.get_import_map(specifier))?;
 
     if let Some(section) = self.maybe_data_section.clone() {
+      // File-backed bundles never wake source slots (the header is shared and
+      // stays immutable); sources are read on demand via `read_source*`.
+      if section.is_file_backed() {
+        return Some(module);
+      }
+
       let specifier = module.specifier.clone();
       let sem = section.read_all_barrier.clone();
 
@@ -190,6 +306,10 @@ impl LazyLoadableEszip {
   }
 
   pub async fn ensure_read_all(&mut self) -> Result<(), ParseError> {
+    if self.is_file_backed() {
+      // Nothing to pin: file-backed sources are read (and dropped) on demand.
+      return Ok(());
+    }
     if let Some(section) = self.maybe_data_section.take() {
       section.read_data_section_all().await
     } else {
@@ -198,13 +318,7 @@ impl LazyLoadableEszip {
   }
 
   pub async fn ensure_version(&self) -> Result<(), anyhow::Error> {
-    let version = OptionFuture::<_>::from(
-      self
-        .ensure_module(FLOW_ESZIP_VERSION_KEY)
-        .map(|it| async move { it.source().await }),
-    )
-    .await
-    .flatten();
+    let version = self.read_source(FLOW_ESZIP_VERSION_KEY).await?;
 
     if !matches!(version, Some(ref v) if v.as_ref() == FLOW_ESZIP_VERSION) {
       bail!(EszipError::UnsupportedVersion {
@@ -240,9 +354,66 @@ pub enum EszipDataSectionMetadata {
   PendingOrAlreadyLoaded,
 }
 
+/// What an [`EszipDataSection`] reads from.
+///
+/// `Memory` is the historical mode: the whole archive is resident and slot
+/// reads wake the header's source slots (which then pin as `Ready`). `File`
+/// serves positional reads straight from the archive file — the header stays
+/// immutable (slots remain `Pending` as offset metadata), nothing pins, and
+/// the OS page cache is the only cache.
+#[derive(Debug, Clone)]
+enum DataBacking {
+  Memory(Arc<Mutex<Cursor<Vec<u8>>>>),
+  File {
+    file: Arc<std::fs::File>,
+    /// Source/source-map extents per specifier, built eagerly from the parsed
+    /// header. A specifier is present iff at least one of its slots was
+    /// `Pending` at parse time.
+    locs: Arc<HashMap<String, EszipDataLoc>>,
+    /// Total byte length of the sources block (the 4-byte prefix of the data
+    /// section), needed to locate source maps.
+    sources_len: u64,
+  },
+}
+
+/// Reads exactly `buf.len()` bytes at `offset` without touching any shared
+/// cursor (safe for concurrent readers of a shared file handle).
+fn read_exact_at(
+  file: &std::fs::File,
+  buf: &mut [u8],
+  offset: u64,
+) -> std::io::Result<()> {
+  #[cfg(unix)]
+  {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+  }
+  #[cfg(windows)]
+  {
+    let mut buf = buf;
+    let mut offset = offset;
+    while !buf.is_empty() {
+      match std::os::windows::fs::FileExt::seek_read(file, buf, offset) {
+        Ok(0) => {
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+          ));
+        }
+        Ok(n) => {
+          buf = &mut buf[n..];
+          offset += n as u64;
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+        Err(e) => return Err(e),
+      }
+    }
+    Ok(())
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct EszipDataSection {
-  inner: Arc<Mutex<Cursor<Vec<u8>>>>,
+  inner: DataBacking,
   modules: EszipV2Modules,
   options: eszip::v2::Options,
   initial_offset: u64,
@@ -261,7 +432,7 @@ impl EszipDataSection {
     options: eszip::v2::Options,
   ) -> Self {
     Self {
-      inner: Arc::new(Mutex::new(inner)),
+      inner: DataBacking::Memory(Arc::new(Mutex::new(inner))),
       modules,
       options,
       initial_offset,
@@ -272,10 +443,221 @@ impl EszipDataSection {
     }
   }
 
+  /// A file-backed data section over the archive at `file` whose header was
+  /// parsed into `modules`. Reads the 4-byte sources length eagerly; module
+  /// extents come from the (still `Pending`) header slots.
+  pub fn new_file(
+    file: std::fs::File,
+    initial_offset: u64,
+    modules: EszipV2Modules,
+    options: eszip::v2::Options,
+  ) -> Result<Self, anyhow::Error> {
+    let mut len_buf = [0u8; 4];
+    read_exact_at(&file, &mut len_buf, initial_offset)
+      .context("failed to read the eszip sources length")?;
+    let sources_len = u32::from_be_bytes(len_buf) as u64;
+
+    let locs = modules
+      .0
+      .lock()
+      .unwrap()
+      .iter()
+      .filter_map(|(specifier, m)| {
+        let EszipV2Module::Module {
+          source, source_map, ..
+        } = m
+        else {
+          return None;
+        };
+
+        let mut loc = EszipDataLoc::default();
+        let mut has_pending = false;
+        if let EszipV2SourceSlot::Pending { offset, length, .. } = source {
+          loc.source_offset = *offset;
+          loc.source_length = *length;
+          has_pending = true;
+        }
+        if let EszipV2SourceSlot::Pending { offset, length, .. } = source_map {
+          loc.source_map_offset = *offset;
+          loc.source_map_length = *length;
+          has_pending = true;
+        }
+
+        has_pending.then(|| (specifier.clone(), loc))
+      })
+      .collect::<HashMap<_, _>>();
+
+    Ok(Self {
+      inner: DataBacking::File {
+        file: Arc::new(file),
+        locs: Arc::new(locs),
+        sources_len,
+      },
+      modules,
+      options,
+      initial_offset,
+      sources_len: Arc::default(),
+      locs_by_specifier: Arc::default(),
+      loaded_locs_by_specifier: Arc::default(),
+      read_all_barrier: Arc::new(Semaphore::new(READ_ALL_BARRIER_MAX_PERMITS)),
+    })
+  }
+
+  pub fn is_file_backed(&self) -> bool {
+    matches!(self.inner, DataBacking::File { .. })
+  }
+
+  /// Reads and checksum-validates the whole source of `specifier` (which must
+  /// be redirect-resolved) straight from the archive file. `Ok(None)` means
+  /// the specifier has no pending extent (zero-length source) or the section
+  /// is memory-backed. Every call re-reads from disk; nothing is cached.
+  pub async fn read_source_direct(
+    &self,
+    specifier: &str,
+  ) -> std::io::Result<Option<Arc<[u8]>>> {
+    let DataBacking::File { file, locs, .. } = &self.inner else {
+      return Ok(None);
+    };
+    let Some(loc) = locs.get(specifier).copied() else {
+      return Ok(None);
+    };
+    if loc.source_length == 0 && loc.source_offset == 0 {
+      // The source slot was `Ready` at parse time (only the source map has a
+      // pending extent).
+      return Ok(None);
+    }
+
+    self
+      .read_section_at(
+        file.clone(),
+        self.initial_offset + 4 + loc.source_offset as u64,
+        loc.source_length,
+        specifier,
+      )
+      .await
+      .map(Some)
+  }
+
+  /// Source-map counterpart of [`Self::read_source_direct`].
+  pub async fn read_source_map_direct(
+    &self,
+    specifier: &str,
+  ) -> std::io::Result<Option<Arc<[u8]>>> {
+    let DataBacking::File {
+      file,
+      locs,
+      sources_len,
+    } = &self.inner
+    else {
+      return Ok(None);
+    };
+    let Some(loc) = locs.get(specifier).copied() else {
+      return Ok(None);
+    };
+    if loc.source_map_length == 0 && loc.source_map_offset == 0 {
+      return Ok(None);
+    }
+
+    self
+      .read_section_at(
+        file.clone(),
+        // The data section layout is:
+        //   sources len (4) | sources | source maps len (4) | source maps
+        self.initial_offset
+          + 4
+          + sources_len
+          + 4
+          + loc.source_map_offset as u64,
+        loc.source_map_length,
+        specifier,
+      )
+      .await
+      .map(Some)
+  }
+
+  /// Reads up to `limit` bytes of the source of `specifier` starting at byte
+  /// `pos`. Partial reads skip checksum validation (whole-read paths keep
+  /// validating). `Ok(None)` means no pending extent / memory backing;
+  /// `pos >= len` yields an empty vec.
+  pub async fn read_source_range_direct(
+    &self,
+    specifier: &str,
+    pos: u64,
+    limit: usize,
+  ) -> std::io::Result<Option<Vec<u8>>> {
+    let DataBacking::File { file, locs, .. } = &self.inner else {
+      return Ok(None);
+    };
+    let Some(loc) = locs.get(specifier).copied() else {
+      return Ok(None);
+    };
+    if loc.source_length == 0 && loc.source_offset == 0 {
+      return Ok(None);
+    }
+
+    let source_len = loc.source_length as u64;
+    if pos >= source_len {
+      return Ok(Some(Vec::new()));
+    }
+
+    let read_len = (source_len - pos).min(limit as u64) as usize;
+    let offset = self.initial_offset + 4 + loc.source_offset as u64 + pos;
+    let file = file.clone();
+
+    fs::IO_RT
+      .spawn_blocking(move || {
+        let mut buf = vec![0u8; read_len];
+        read_exact_at(&file, &mut buf, offset)?;
+        Ok(Some(buf))
+      })
+      .await
+      .map_err(|_| std::io::Error::other("the eszip read task failed"))?
+  }
+
+  /// Reads a `Body (n) | Hash (checksum_size)` section at `offset` and
+  /// validates its checksum.
+  async fn read_section_at(
+    &self,
+    file: Arc<std::fs::File>,
+    offset: u64,
+    length: usize,
+    specifier: &str,
+  ) -> std::io::Result<Arc<[u8]>> {
+    let options = self.options;
+    let checksum_size = options
+      .checksum_size()
+      .expect("checksum size must be known") as usize;
+    let specifier = specifier.to_string();
+
+    fs::IO_RT
+      .spawn_blocking(move || {
+        let mut buf = vec![0u8; length + checksum_size];
+        read_exact_at(&file, &mut buf, offset)?;
+
+        let section = eszip::v2::Section(buf, options);
+        if !section.is_checksum_valid() {
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid source hash for {specifier}"),
+          ));
+        }
+
+        Ok(Arc::from(section.into_content()))
+      })
+      .await
+      .map_err(|_| std::io::Error::other("the eszip read task failed"))?
+  }
+
   pub async fn read_data_section_by_specifier(
     &self,
     specifier: &str,
   ) -> Result<(), anyhow::Error> {
+    let DataBacking::Memory(inner_mutex) = &self.inner else {
+      bail!(
+        "cannot wake source slots on a file-backed data section; use the \
+         `read_source*` APIs instead"
+      );
+    };
     let mut locs_guard = self.locs_by_specifier.lock().await;
     let locs = locs_guard.get_or_insert_with(|| {
       self
@@ -346,7 +728,7 @@ impl EszipDataSection {
 
     drop(locs_guard);
 
-    let mut inner = self.inner.lock().await;
+    let mut inner = inner_mutex.lock().await;
     let mut io = AllowStdIo::new({
       // NOTE: 4 byte offset in the middle represents the full source length.
       inner.set_position(self.initial_offset + 4 + loc.source_offset as u64);
@@ -458,6 +840,11 @@ impl EszipDataSection {
   ) -> Result<(), ParseError> {
     // NOTE: Below codes is roughly originated from eszip@0.72.2/src/v2.rs
 
+    if self.is_file_backed() {
+      // File-backed sections never pin sources into the header slots.
+      return Ok(());
+    }
+
     let sem = self.read_all_barrier.clone();
     let this = loop {
       let permit = sem
@@ -485,7 +872,10 @@ impl EszipDataSection {
       .unwrap()
       .into_inner();
 
-    let mut inner = this.inner.try_lock_owned().unwrap();
+    let DataBacking::Memory(inner_mutex) = this.inner else {
+      unreachable!("file-backed sections early-return above");
+    };
+    let mut inner = inner_mutex.try_lock_owned().unwrap();
     let mut io = AllowStdIo::new({
       inner.set_position(this.initial_offset);
       inner.by_ref()
@@ -675,6 +1065,9 @@ pub async fn payload_to_eszip(
 ) -> Result<LazyLoadableEszip, anyhow::Error> {
   match eszip_payload_kind {
     EszipPayloadKind::Eszip(eszip) => Ok(LazyLoadableEszip::new(eszip, None)),
+    EszipPayloadKind::FileKind(path) => Ok(LazyLoadableEszip::new_shared(
+      bundle_cache::open_shared(&path).await?,
+    )),
     _ => {
       let bytes = match eszip_payload_kind {
         EszipPayloadKind::JsBufferKind(js_buffer) => Vec::from(&*js_buffer),
@@ -1240,19 +1633,16 @@ impl EszipEntryReader {
       .await
       .context("failed to read the eszip data section")?;
 
-    let mut metadata = OptionFuture::<_>::from(
-      eszip
-        .ensure_module(eszip_trait::v2::METADATA_KEY)
-        .map(|it| async move { it.source().await }),
-    )
-    .await
-    .flatten()
-    .map(|it| {
-      rkyv::from_bytes::<Metadata>(it.as_ref())
-        .map_err(|_| anyhow!("failed to deserialize metadata from eszip"))
-    })
-    .transpose()?
-    .unwrap_or_default();
+    let mut metadata = eszip
+      .read_source(eszip_trait::v2::METADATA_KEY)
+      .await
+      .context("failed to read metadata from eszip")?
+      .map(|it| {
+        rkyv::from_bytes::<Metadata>(it.as_ref())
+          .map_err(|_| anyhow!("failed to deserialize metadata from eszip"))
+      })
+      .transpose()?
+      .unwrap_or_default();
     let node_modules = metadata.node_modules()?;
     let use_byonm = matches!(node_modules, Some(NodeModules::Byonm { .. }));
 
@@ -1327,13 +1717,18 @@ impl EszipEntryReader {
     let Some(pending) = self.pending.pop_front() else {
       return Ok(None);
     };
-    let module =
-      self.eszip.get_module(&pending.specifier).ok_or_else(|| {
-        anyhow!("eszip is missing a module for {}", pending.specifier)
+    // Slot-safe read: works for the (usual) fully pinned in-memory archive
+    // and for file-backed ones, whose slots are never woken.
+    let data = self
+      .eszip
+      .read_source(&pending.specifier)
+      .await
+      .with_context(|| {
+        format!("failed to read the source for {}", pending.specifier)
+      })?
+      .ok_or_else(|| {
+        anyhow!("eszip is missing the source for {}", pending.specifier)
       })?;
-    let data = module.source().await.ok_or_else(|| {
-      anyhow!("eszip is missing the source for {}", pending.specifier)
-    })?;
     Ok(Some(EszipEntry {
       specifier: pending.specifier,
       relative_path: pending.relative_path,
