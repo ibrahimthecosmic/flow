@@ -38,11 +38,11 @@ work normally.
 
 Source of the worker:
 
-| Option                                      | Type         | Notes                                                                                                         |
-| ------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------- |
-| `servicePath`                               | `string`     | Directory containing `index.{ts,tsx,js,mjs,jsx}`                                                              |
-| `maybeEszip` (+ optional `maybeEntrypoint`) | `Uint8Array` | Boot from an eszip artifact (see [cli.md](./cli.md#flow-eszip--deployment-artifacts)); `servicePath` optional |
-| `maybeModuleCode`                           | `string`     | Inline module source; still needs a `servicePath` (pool key / base directory)                                 |
+| Option                                      | Type                                                 | Notes                                                                                                |
+| ------------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `servicePath`                               | `string`                                             | Directory containing `index.{ts,tsx,js,mjs,jsx}`                                                     |
+| `maybeEszip` (+ optional `maybeEntrypoint`) | `Uint8Array \| string \| ReadableStream<Uint8Array>` | Boot from an eszip artifact (see [below](#booting-from-an-eszip-maybeeszip)); `servicePath` optional |
+| `maybeModuleCode`                           | `string`                                             | Inline module source; still needs a `servicePath` (pool key / base directory)                        |
 
 Resource limits (per worker):
 
@@ -81,6 +81,127 @@ Sandbox & platform:
 | `s3FsConfig`, `tmpFsConfig` | unset                | Alternative filesystem backends (S3 / temp fs). `s3FsConfig` takes one config object (mounted at `/s3`) or an array of config objects, each with its own `mountPoint` (default `/s3`); mount points must be absolute, non-`/`, and must not equal or nest inside `/tmp` or one another                                                                         |
 | `httpFs`                    | unset                | HttpFS mounts: one config or an array of `{ mountPoint, baseUrl, headers?, query?, socketPath? }`, each backed by an HTTP API implementing the [HttpFS Protocol v1](./httpfs-protocol.md). `mountPoint` is required per entry and follows the same collision rules as the S3 mount points. `socketPath` routes the mount over an AF_UNIX socket instead of TCP |
 | `otelConfig`                | unset                | OpenTelemetry tracing/metrics for the worker                                                                                                                                                                                                                                                                                                                   |
+
+## Booting from an eszip: `maybeEszip`
+
+An eszip (built with
+[`flow eszip bundle`](./cli.md#flow-eszip--deployment-artifacts) or
+`FlowRuntime.bundle`) carries the worker's entire module graph — code, npm
+packages, static assets, metadata — as one artifact. `maybeEszip` accepts three
+forms:
+
+```ts
+// 1. bytes — e.g. just downloaded from object storage
+await FlowRuntime.userWorkers.create({ maybeEszip: eszipBytes });
+
+// 2. a path — an .eszip file already on disk, used in place
+await FlowRuntime.userWorkers.create({ maybeEszip: "./service.eszip" });
+
+// 3. a stream — spilled to disk incrementally, chunk by chunk
+const { body } = await fetch("https://artifacts.example.com/service.eszip");
+await FlowRuntime.userWorkers.create({ maybeEszip: body });
+```
+
+`servicePath` is optional for eszip boots (the artifact carries its own
+entrypoint in its metadata); pass `maybeEntrypoint` to override it.
+
+### File-backed loading
+
+Whatever the input form, the bundle is served **from disk, not from memory**:
+
+- Only the archive **header** (module index, npm-resolution snapshot, metadata)
+  is parsed into memory. Module sources, npm-package files, and static assets
+  are read with positional reads (`pread`) when — and each time — they are
+  needed, then dropped. The OS page cache is the only cache.
+- A worker's resident memory therefore scales with its **touched working set**,
+  not with the bundle size: booting from a 50 MiB bundle adds a few MiB of RSS,
+  where prior flow versions kept the entire bundle (plus every touched module,
+  permanently) resident per bundle.
+- **Streams never materialize in memory at all**: each chunk is hashed and
+  appended to a temp file, which makes `ReadableStream` the right form for large
+  artifacts fetched over the network.
+- Cold-start cost is unchanged (within noise of an in-memory boot).
+
+### The bundle cache
+
+`Uint8Array` and `ReadableStream` inputs are spilled into a **content-addressed
+cache directory**; `string` paths are used in place and bypass the cache
+entirely.
+
+| Environment variable         | Default                 | Meaning                                      |
+| ---------------------------- | ----------------------- | -------------------------------------------- |
+| `FLOW_BUNDLE_CACHE_DIR`      | `<tmpdir>/flow-bundles` | Where spilled bundles land                   |
+| `FLOW_BUNDLE_CACHE_TTL_SECS` | `604800` (7 days)       | Age (by mtime) after which entries are swept |
+
+Behaviors:
+
+- Entries are named `<xxh3-64-of-content>.eszip`, so **identical bundles
+  converge on a single file** no matter how many times (or from how many
+  concurrent `create()` calls) they are submitted. A cache hit just refreshes
+  the file's mtime.
+- Writes are atomic (temp file + rename); a crashed or aborted spill leaves only
+  a `*.tmp` file that the sweep removes after an hour.
+- The sweep runs at most once per process, on first cache use, and unlinks
+  `*.eszip` entries older than the TTL. Deleting a cache entry out from under a
+  **running** worker is harmless on Unix — the worker holds an open file handle
+  — but a later `create()` with the same bytes rewrites it.
+
+### Sharing across workers
+
+Bundles are deduplicated by **canonicalized path**: every concurrent or later
+`create()` for the same `.eszip` file shares one parsed header and one file
+handle (each worker gets its own copy of the npm-resolution snapshot). The
+shared parse is dropped when the last worker using it goes away. If the file is
+**replaced on disk** (different size/mtime/inode), the next `create()` reparses
+it — but note the pool may still hand you the already-running worker for the
+same pool key; use `forceCreate: true` to boot the new artifact.
+
+### Integrity checking
+
+If the bundle was built with a checksum
+(`flow eszip bundle --checksum xxhash3 | sha256`), every whole-entry read —
+module sources, source maps, static assets, whole-file npm reads — is verified
+against its stored hash, on every read. A corrupted extent fails the worker's
+module init with `invalid source hash for <specifier>` (see failure surfacing
+below). Partial (ranged) reads inside npm-package files skip verification.
+Bundles built without a checksum are not verified; prefer checksummed bundles
+for artifacts that cross a network or shared storage.
+
+### Old formats
+
+Only current-format flow eszips (version `2.0`) can boot workers. Archives
+produced by older flow/edge-runtime versions (v0, v1, v1.1) are rejected at
+`create()` with an error asking you to re-bundle:
+
+```
+this eszip uses an unsupported format for file-backed loading; re-bundle it
+with `flow eszip bundle` (old bundles can still be unpacked with `flow eszip
+unbundle`)
+```
+
+`flow eszip unbundle` (and `FlowRuntime.unbundle`) still read old formats, so a
+re-bundle is always possible: unbundle → bundle.
+
+### Failure surfacing
+
+`create()` itself rejects on malformed input: an unreadable path, a truncated or
+non-eszip file, an old format, or passing both bytes and a path. Failures inside
+the module graph (a corrupted extent caught by the checksum, a missing module)
+happen while the freshly booted worker initializes its entrypoint, so `create()`
+still resolves — the failure follows on
+[`FlowRuntime.events`](#observing-workers-flowruntimeevents) as a `BootFailure`
+event (right after the worker's `Boot` event), and the worker never serves:
+messages posted to its port go unanswered.
+
+```ts
+for await (const ev of FlowRuntime.events) {
+  if (ev.event_type === "BootFailure") {
+    // e.g. "worker boot error: failed to read module source for
+    //       file:///src/index.ts: invalid source hash for file:///src/index.ts"
+    console.error("worker failed to start:", ev.event.msg);
+  }
+}
+```
 
 ## Talking to a worker: `worker.port`
 

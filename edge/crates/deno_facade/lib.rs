@@ -28,6 +28,7 @@ pub use eszip::EszipEntryKind;
 pub use eszip::EszipEntryReader;
 pub use eszip::EszipPayloadKind;
 pub use eszip::LazyLoadableEszip;
+pub use eszip::bundle_cache;
 pub use eszip::generate_binary_eszip;
 pub use eszip::migrate;
 pub use eszip::payload_to_eszip;

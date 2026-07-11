@@ -45,6 +45,7 @@ use deno_facade::EmitterFactory;
 use deno_facade::EszipEntryReader;
 use deno_facade::EszipPayloadKind;
 use deno_facade::Metadata;
+use deno_facade::bundle_cache::SpillFile;
 use deno_facade::generate_binary_eszip;
 use serde::Deserialize;
 use serde::Serialize;
@@ -335,6 +336,73 @@ async fn op_eszip_unbundle_next(
   }))
 }
 
+/// An in-progress spill of a streamed `maybeEszip` into the bundle cache
+/// (see `createUserWorker` in flow_main.js). Closing the resource before
+/// `op_eszip_spill_finish` drops the [`SpillFile`], which unlinks its temp
+/// file.
+struct EszipSpillResource {
+  spill: AsyncRefCell<Option<SpillFile>>,
+}
+
+impl Resource for EszipSpillResource {
+  fn name(&self) -> std::borrow::Cow<'_, str> {
+    "eszipSpill".into()
+  }
+}
+
+/// Opens a spill file in the bundle cache and returns its resource id.
+#[op2]
+#[smi]
+async fn op_eszip_spill_open(
+  state: Rc<RefCell<OpState>>,
+) -> Result<ResourceId, JsErrorBox> {
+  let spill = SpillFile::create().await.map_err(generic_err)?;
+  Ok(state.borrow_mut().resource_table.add(EszipSpillResource {
+    spill: AsyncRefCell::new(Some(spill)),
+  }))
+}
+
+/// Appends a chunk to an open spill.
+#[op2]
+async fn op_eszip_spill_write(
+  state: Rc<RefCell<OpState>>,
+  #[smi] rid: ResourceId,
+  #[buffer] chunk: JsBuffer,
+) -> Result<(), JsErrorBox> {
+  let resource = state
+    .borrow()
+    .resource_table
+    .get::<EszipSpillResource>(rid)
+    .map_err(generic_err)?;
+  let mut guard = RcRef::map(&resource, |r| &r.spill).borrow_mut().await;
+  match (*guard).as_mut() {
+    Some(spill) => spill.write(Vec::from(&*chunk)).await.map_err(generic_err),
+    None => Err(generic_err("the spill is already finished")),
+  }
+}
+
+/// Finalizes a spill into its content-addressed `<hash>.eszip` cache path and
+/// returns that path (for `maybeEszipPath`). Removes the resource.
+#[op2]
+#[string]
+async fn op_eszip_spill_finish(
+  state: Rc<RefCell<OpState>>,
+  #[smi] rid: ResourceId,
+) -> Result<String, JsErrorBox> {
+  let resource = state
+    .borrow_mut()
+    .resource_table
+    .take::<EszipSpillResource>(rid)
+    .map_err(generic_err)?;
+  let mut guard = RcRef::map(&resource, |r| &r.spill).borrow_mut().await;
+  let spill = (*guard)
+    .take()
+    .ok_or_else(|| generic_err("the spill is already finished"))?;
+  drop(guard);
+  let path = spill.finish().await.map_err(generic_err)?;
+  Ok(path.to_string_lossy().into_owned())
+}
+
 deno_core::extension!(
   // flow: OPS-ONLY for the same reason as `user_workers_ops` - an ESM-bearing
   // extension can't link against Deno's CLI snapshot. The JS surface
@@ -345,6 +413,9 @@ deno_core::extension!(
   ops = [
     op_eszip_bundle,
     op_eszip_unbundle_open,
-    op_eszip_unbundle_next
+    op_eszip_unbundle_next,
+    op_eszip_spill_open,
+    op_eszip_spill_write,
+    op_eszip_spill_finish
   ],
 );

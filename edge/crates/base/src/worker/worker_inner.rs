@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use anyhow::Error;
 use base_rt::error::CloneableError;
+use ext_event_worker::events::BootFailureEvent;
 use ext_event_worker::events::EventMetadata;
 use ext_event_worker::events::ShutdownEvent;
 use ext_event_worker::events::UncaughtExceptionEvent;
@@ -269,6 +270,16 @@ impl Worker {
               let err_msg = apply_source_maps(&format!("{err:#}"));
               let err_msg = translate_vfs_paths(&err_msg, boot_service_path.as_deref());
               let err = CloneableError::from(anyhow::anyhow!("{}", err_msg).context("worker boot error"));
+              // The boot itself already succeeded (the booter signal fired
+              // before module init), so this failure would otherwise be
+              // invisible to the host: report it on the events channel.
+              send_event_if_event_worker_available(
+                events_msg_tx.as_ref(),
+                WorkerEvents::BootFailure(BootFailureEvent {
+                  msg: format!("{err:#}"),
+                }),
+                event_metadata.clone(),
+              );
               drop(new_runtime);
               let _ = supervise_fut.await;
               return Err(err.into());

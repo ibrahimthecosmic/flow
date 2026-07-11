@@ -685,7 +685,22 @@ where
           .map(str::to_string);
 
         let eszip = if let Some(eszip_payload) = maybe_eszip {
-          eszip_payload
+          // Belt and braces for embedders/tests that hand in raw bytes: every
+          // buffer payload converges file-backed via the bundle cache, so the
+          // bytes don't stay resident for the worker's lifetime. (The op
+          // already converts JS-provided buffers before the pool channel.)
+          match eszip_payload {
+            EszipPayloadKind::JsBufferKind(buffer) => {
+              EszipPayloadKind::FileKind(
+                deno_facade::bundle_cache::store_bytes(Vec::from(&*buffer))
+                  .await?,
+              )
+            }
+            EszipPayloadKind::VecKind(bytes) => EszipPayloadKind::FileKind(
+              deno_facade::bundle_cache::store_bytes(bytes).await?,
+            ),
+            other => other,
+          }
         } else {
           let Ok(base_dir_url) = Url::from_directory_path(&base_dir_path)
           else {

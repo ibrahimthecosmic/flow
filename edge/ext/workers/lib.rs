@@ -257,6 +257,10 @@ pub struct UserWorkerCreateOptions {
   permissions: Option<JsPermissionsOptions>,
 
   maybe_eszip: Option<JsBuffer>,
+  /// Path of an `.eszip` file on disk, used in place of `maybe_eszip` bytes
+  /// (mutually exclusive with it). Kept as a separate field because `JsBuffer`
+  /// can't participate in an untagged serde union.
+  maybe_eszip_path: Option<String>,
   maybe_entrypoint: Option<String>,
   maybe_module_code: Option<String>,
 
@@ -329,8 +333,32 @@ impl JsPermissionsOptions {
 #[serde]
 pub async fn op_user_worker_create(
   state: Rc<RefCell<OpState>>,
-  #[serde] opts: UserWorkerCreateOptions,
+  #[serde] mut opts: UserWorkerCreateOptions,
 ) -> Result<(String, bool, Option<u32>), JsErrorBox> {
+  // flow: every eszip input converges file-backed. Byte buffers are spilled
+  // into the content-addressed bundle cache up front so the buffer is dropped
+  // here instead of staying resident for the worker's lifetime; paths are used
+  // in place. Done before any resource setup so an error leaks nothing.
+  let maybe_eszip_payload =
+    match (opts.maybe_eszip.take(), opts.maybe_eszip_path.take()) {
+      (Some(_), Some(_)) => {
+        return Err(JsErrorBox::type_error(
+          "`maybeEszip` bytes and an eszip path are mutually exclusive",
+        ));
+      }
+      (Some(buffer), None) => {
+        let path = deno_facade::bundle_cache::store_bytes(Vec::from(&*buffer))
+          .await
+          .map_err(|e| JsErrorBox::generic(format!("{e:#}")))?;
+        drop(buffer);
+        Some(EszipPayloadKind::FileKind(path))
+      }
+      (None, Some(path)) => {
+        Some(EszipPayloadKind::FileKind(PathBuf::from(path)))
+      }
+      (None, None) => None,
+    };
+
   // flow: set up the duplex MessagePort channel for main<->worker comms. The
   // main half is registered in this (main) isolate and its rid returned to JS;
   // the worker half is stashed in the global registry under a token that
@@ -360,7 +388,8 @@ pub async fn op_user_worker_create(
       custom_module_root,
       permissions,
 
-      maybe_eszip,
+      maybe_eszip: _,
+      maybe_eszip_path: _,
       maybe_entrypoint,
       maybe_module_code,
 
@@ -432,7 +461,7 @@ pub async fn op_user_worker_create(
       static_patterns,
       timing: None,
 
-      maybe_eszip: maybe_eszip.map(EszipPayloadKind::JsBufferKind),
+      maybe_eszip: maybe_eszip_payload,
       maybe_module_code: maybe_module_code.map(String::into),
       maybe_entrypoint,
 

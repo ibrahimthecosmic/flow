@@ -233,9 +233,14 @@ async fn test_worker_boot_with_0_byte_eszip() {
   let result = create_test_user_worker(opts).await;
 
   assert!(result.is_err());
-  assert!(format!("{:#}", result.unwrap_err()).starts_with(
-    "worker boot error: failed to bootstrap runtime: unexpected end of file"
+  // The payload converges file-backed (spilled into the bundle cache), so the
+  // parse failure now carries the cache-path context.
+  let err = format!("{:#}", result.unwrap_err());
+  assert!(err.starts_with(
+    "worker boot error: failed to bootstrap runtime: failed to parse the \
+     eszip bundle at"
   ));
+  assert!(err.ends_with("unexpected end of file"));
 }
 
 #[tokio::test]

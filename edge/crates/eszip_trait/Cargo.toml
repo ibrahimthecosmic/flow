@@ -10,3 +10,4 @@ path = "lib.rs"
 
 [dependencies]
 eszip.workspace = true
+futures.workspace = true

@@ -23,7 +23,6 @@ use deno_io::fs::FsError;
 use deno_io::fs::FsResult;
 use deno_io::fs::FsStat;
 use eszip_trait::AsyncEszipDataRead;
-use futures::future::OptionFuture;
 use rkyv::Archive;
 use rkyv::Deserialize;
 use rkyv::Serialize;
@@ -450,24 +449,18 @@ impl VirtualFile {
   pub async fn read_file(
     &self,
     eszip: &dyn AsyncEszipDataRead,
-    _pos: u64,
+    pos: u64,
     buf: &mut [u8],
   ) -> std::io::Result<usize> {
-    let content: OptionFuture<_> = eszip
-      .ensure_module(self.key.as_str())
-      .map(|it| async move { it.source().await })
-      .into();
+    // Ranged read of the module extent backing this file (`vfs://N`); safe on
+    // file-backed eszips (whose source slots are never woken) and honors
+    // `pos`, which the previous whole-source read silently ignored.
+    let chunk = eszip
+      .read_source_range(self.key.as_str(), pos, buf.len())
+      .await?;
+    let read_length = chunk.len().min(buf.len());
 
-    let Some(Some(content)) = content.await else {
-      return Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "No content available",
-      ));
-    };
-
-    let read_length = buf.len().min(content.len());
-
-    buf[..read_length].copy_from_slice(&content[..read_length]);
+    buf[..read_length].copy_from_slice(&chunk[..read_length]);
 
     Ok(read_length)
   }
@@ -973,9 +966,16 @@ impl FileBackedVfs {
     &self,
     file: &VirtualFile,
   ) -> std::io::Result<Vec<u8>> {
-    let mut buf = vec![0; file.len as usize];
-    self.read_file(file, 0, &mut buf).await?;
-    Ok(buf)
+    // Whole-file reads go through `read_source` so they stay
+    // checksum-validated (ranged reads via `read_file` are not).
+    let source = self
+      .eszip
+      .read_source(file.key.as_str())
+      .await?
+      .ok_or_else(|| {
+        std::io::Error::new(io::ErrorKind::NotFound, "No content available")
+      })?;
+    Ok(source.to_vec())
   }
 
   pub async fn read_file(
@@ -1009,16 +1009,21 @@ impl FileBackedVfs {
   /// This is needed for sys_traits implementations which require sync reads.
   pub fn read_file_all_sync(&self, path: &Path) -> std::io::Result<Vec<u8>> {
     let file = self.file_entry(path)?;
-    let file_clone = file.clone();
+    let key = file.key.clone();
     let eszip = self.eszip.clone();
 
     // Use IO_RT.block_on to convert async read to sync
     std::thread::scope(|s| {
       s.spawn(move || {
         IO_RT.block_on(async move {
-          let mut buf = vec![0; file_clone.len as usize];
-          file_clone.read_file(eszip.as_ref(), 0, &mut buf).await?;
-          Ok(buf)
+          let source =
+            eszip.read_source(key.as_str()).await?.ok_or_else(|| {
+              std::io::Error::new(
+                io::ErrorKind::NotFound,
+                "No content available",
+              )
+            })?;
+          Ok(source.to_vec())
         })
       })
       .join()

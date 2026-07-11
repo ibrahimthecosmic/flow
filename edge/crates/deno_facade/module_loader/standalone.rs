@@ -73,7 +73,6 @@ use ext_runtime::cert::get_root_cert_store;
 use fs::VfsSys;
 use fs::deno_compile_fs::DenoCompileFileSystem;
 use fs::virtual_fs::FileBackedVfs;
-use futures_util::future::OptionFuture;
 use tracing::instrument;
 
 use super::RuntimeProviders;
@@ -672,12 +671,25 @@ impl ModuleLoader for EmbeddedModuleLoader {
 
     deno_core::ModuleLoadResponse::Async(
       async move {
-        let code = module.inner.source().await.ok_or_else(|| {
-          JsErrorBox::type_error(format!(
-            "Module not found: {}",
-            original_specifier
-          ))
-        })?;
+        // `read_source` instead of `Module::source()`: file-backed eszips
+        // never wake source slots, so awaiting a slot would hang forever.
+        let code = shared
+          .eszip
+          .eszip
+          .read_source(&module.inner.specifier)
+          .await
+          .map_err(|err| {
+            JsErrorBox::generic(format!(
+              "failed to read module source for {}: {:#}",
+              original_specifier, err
+            ))
+          })?
+          .ok_or_else(|| {
+            JsErrorBox::type_error(format!(
+              "Module not found: {}",
+              original_specifier
+            ))
+          })?;
 
         if module.inner.kind == ModuleKind::Wasm {
           return Ok(deno_core::ModuleSource::new_with_redirect(
@@ -715,7 +727,6 @@ impl ModuleLoader for EmbeddedModuleLoader {
             None,
           ))
         } else {
-          let source_map = module.inner.source_map().await;
           let maybe_code_with_source_map = 'scope: {
             if !include_source_map {
               break 'scope code;
@@ -723,6 +734,20 @@ impl ModuleLoader for EmbeddedModuleLoader {
             if !matches!(module.inner.kind, ModuleKind::JavaScript) {
               break 'scope code;
             }
+
+            // Slot-safe counterpart of `Module::source_map()`; also skips the
+            // read entirely when source maps aren't wanted.
+            let source_map = shared
+              .eszip
+              .eszip
+              .read_source_map(&module.inner.specifier)
+              .await
+              .map_err(|err| {
+                JsErrorBox::generic(format!(
+                  "failed to read the source map for {}: {:#}",
+                  original_specifier, err
+                ))
+              })?;
 
             let Some(source_map) = source_map else {
               break 'scope code;
@@ -872,19 +897,16 @@ pub async fn create_module_loader_for_eszip(
   let permissions_container =
     PermissionsContainer::new(permission_desc_parser.clone(), permissions);
 
-  let mut metadata = OptionFuture::<_>::from(
-    eszip
-      .ensure_module(eszip_trait::v2::METADATA_KEY)
-      .map(|it| async move { it.source().await }),
-  )
-  .await
-  .flatten()
-  .map(|it| {
-    rkyv::from_bytes::<Metadata>(it.as_ref())
-      .map_err(|_| anyhow!("failed to deserialize metadata from eszip"))
-  })
-  .transpose()?
-  .unwrap_or_default();
+  let mut metadata = eszip
+    .read_source(eszip_trait::v2::METADATA_KEY)
+    .await
+    .context("failed to read metadata from eszip")?
+    .map(|it| {
+      rkyv::from_bytes::<Metadata>(it.as_ref())
+        .map_err(|_| anyhow!("failed to deserialize metadata from eszip"))
+    })
+    .transpose()?
+    .unwrap_or_default();
 
   let root_path = if cfg!(target_family = "unix") {
     // Canonicalize /var/tmp to resolve symlinks (e.g., /var -> /private/var on macOS)
@@ -1243,11 +1265,26 @@ pub async fn create_module_loader_for_standalone_from_eszip_kind(
   service_path: Option<&str>,
   disable_fs_fallback: bool,
 ) -> Result<RuntimeProviders, AnyError> {
-  let eszip = migrate::try_migrate_if_needed(
-    payload_to_eszip(eszip_payload_kind).await?,
-    options,
-  )
-  .await?;
+  let is_file_backed =
+    matches!(eszip_payload_kind, EszipPayloadKind::FileKind(_));
+  let eszip = payload_to_eszip(eszip_payload_kind).await?;
+
+  let eszip = if is_file_backed {
+    // File-backed bundles are served straight off disk and share an immutable
+    // header across workers, so the in-place migration machinery can't run on
+    // them (and would hang on their never-woken source slots). Old formats
+    // must be re-bundled.
+    eszip.ensure_version().await.map_err(|err| {
+      anyhow!(
+        "{err:#}: this eszip uses an unsupported format for file-backed \
+         loading; re-bundle it with `flow eszip bundle` (old bundles can \
+         still be unpacked with `flow eszip unbundle`)"
+      )
+    })?;
+    eszip
+  } else {
+    migrate::try_migrate_if_needed(eszip, options).await?
+  };
 
   create_module_loader_for_eszip(
     eszip,

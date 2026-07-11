@@ -3277,6 +3277,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -5461,6 +5462,7 @@ name = "eszip_trait"
 version = "0.1.0"
 dependencies = [
  "eszip",
+ "futures",
 ]
 
 [[package]]

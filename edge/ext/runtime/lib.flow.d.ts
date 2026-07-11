@@ -139,8 +139,32 @@ declare interface FlowUserWorkerCreateOptions {
   customModuleRoot?: string;
   permissions?: FlowUserWorkerPermissions;
 
-  /** Precompiled eszip payload (alternative to `servicePath`). */
-  maybeEszip?: Uint8Array | null;
+  /** Precompiled eszip payload (alternative to `servicePath`; the artifact
+   * carries its own entrypoint, overridable via `maybeEntrypoint`).
+   *
+   * All forms end up **file-backed** — only the archive header is parsed
+   * into memory; module sources, npm packages, and static assets are read
+   * from disk on demand (OS page cache only, nothing pins), so worker RSS
+   * scales with the touched working set instead of the bundle size:
+   * - `Uint8Array`: the bytes are spilled into the runtime's
+   *   content-addressed bundle cache (`$FLOW_BUNDLE_CACHE_DIR`, defaulting
+   *   to `<tmpdir>/flow-bundles`; entries are swept after
+   *   `$FLOW_BUNDLE_CACHE_TTL_SECS`, default 7 days). Identical bundles
+   *   converge on one cache file.
+   * - `string`: path of an `.eszip` file on disk, used in place (never
+   *   copied into the cache). Concurrent/later creates for the same
+   *   canonical path share one parsed header and file handle.
+   * - `ReadableStream<Uint8Array>`: streamed into the bundle cache chunk by
+   *   chunk without ever materializing the whole bundle in memory.
+   *
+   * Bundles built with a checksum (`flow eszip bundle --checksum`) are
+   * verified on every module read; corruption fails the worker's module
+   * init with an `invalid source hash` `BootFailure` event. Old bundle
+   * formats (pre-flow-2.0) are rejected with a re-bundle error —
+   * `FlowRuntime.unbundle` still reads them. Module-graph failures happen
+   * after `create()` resolves and surface as `BootFailure` on
+   * `FlowRuntime.events`. */
+  maybeEszip?: Uint8Array | string | ReadableStream<Uint8Array> | null;
   maybeEntrypoint?: string | null;
   /** Inline module source. Still requires a `servicePath`, which acts as the
    * worker's pool key and base directory. */
