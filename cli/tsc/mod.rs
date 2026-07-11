@@ -400,11 +400,36 @@ impl fmt::Display for Stats {
   }
 }
 
+/// flow: the always-loaded lib we splice the embedder-registered ambient types
+/// (`embed::extra_types()`, i.e. `lib.flow.d.ts`) onto, so `FlowRuntime` et al.
+/// are visible to `deno check` and the LSP — not just to `deno types`. Both the
+/// main-isolate (`deno.window`) and worker (`deno.worker`) default libs
+/// `/// <reference lib="deno.shared_globals" />`, so this reaches every context.
+const EXTRA_TYPES_HOST_LIB: &str = "lib.deno.shared_globals.d.ts";
+
+/// Returns `base`, with the embedder's ambient types appended when `name` is the
+/// host lib. Memoized+leaked once (libs live for the whole process); a no-op for
+/// plain deno, where no extra types are registered.
+pub(crate) fn augmented_lib_source(
+  name: &str,
+  base: &'static str,
+) -> &'static str {
+  if name != EXTRA_TYPES_HOST_LIB {
+    return base;
+  }
+  let Some(extra) = crate::embed::extra_types() else {
+    return base;
+  };
+  static AUGMENTED: OnceLock<&'static str> = OnceLock::new();
+  AUGMENTED
+    .get_or_init(|| Box::leak(format!("{base}\n{extra}").into_boxed_str()))
+}
+
 /// Retrieve a static asset that are included in the binary.
 fn get_lazily_loaded_asset(asset: &str) -> Option<&'static str> {
   LAZILY_LOADED_STATIC_ASSETS
     .get(asset)
-    .map(|s| s.source.as_str())
+    .map(|s| augmented_lib_source(asset, s.source.as_str()))
 }
 
 fn get_maybe_hash(
