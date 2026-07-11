@@ -90,6 +90,7 @@ mod test {
       None,
       None,
       None,
+      None,
     )
     .await
     .unwrap();
@@ -131,6 +132,7 @@ mod test {
     let eszip = generate_binary_eszip(
       &mut metadata,
       Arc::new(emitter_factory),
+      None,
       None,
       None,
       None,

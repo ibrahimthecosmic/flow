@@ -350,6 +350,15 @@ pub struct FromGraphOptions<'a> {
   pub npm_snapshot: ValidSerializedNpmResolutionSnapshot,
 }
 
+/// Predicate deciding whether a resolved module should be left OUT of the eszip
+/// (see [`EszipV2::from_graph_with_exclude`]). Called with the module's
+/// resolved specifier and its eszip-relative key.
+pub type ModuleExcludePredicate<'a> =
+  Box<dyn Fn(&ModuleSpecifier, &str) -> bool + 'a>;
+
+/// Borrowed form of [`ModuleExcludePredicate`], threaded through the graph walk.
+type ModuleExcludeFn<'a> = &'a dyn Fn(&ModuleSpecifier, &str) -> bool;
+
 /// Provide the source code of the Npm packages to include in the eszip
 ///
 /// When building the eszip from a [`ModuleGraph`], use this struct to
@@ -1279,6 +1288,18 @@ impl EszipV2 {
   /// to the end. This allows for efficient deserialization of the archive right
   /// into an isolate.
   pub fn from_graph(opts: FromGraphOptions) -> Result<Self, anyhow::Error> {
+    Self::from_graph_with_exclude(opts, None)
+  }
+
+  /// Like [`Self::from_graph`], but omits any non-root module for which
+  /// `exclude` returns `true`: the module emits no source (its import is left
+  /// bare for runtime resolution) and its subtree is not traversed. A
+  /// dependency reachable *only* through excluded modules is therefore pruned,
+  /// while one also reachable from a non-excluded module is still bundled.
+  pub fn from_graph_with_exclude(
+    opts: FromGraphOptions,
+    exclude: Option<ModuleExcludePredicate>,
+  ) -> Result<Self, anyhow::Error> {
     let mut emit_options = opts.emit_options;
     emit_options.inline_sources = true;
     if emit_options.source_map == SourceMapOption::Inline {
@@ -1357,6 +1378,7 @@ impl EszipV2 {
       relative_file_base: Option<EszipRelativeFileBaseUrl>,
       npm_packages: Option<&mut FromGraphNpmPackages>,
       npm_snapshot: &ValidSerializedNpmResolutionSnapshot,
+      exclude: Option<ModuleExcludeFn>,
     ) -> Result<
       Option<Box<dyn DoubleEndedIterator<Item = ToVisit<'a>> + 'a>>,
       anyhow::Error,
@@ -1386,6 +1408,16 @@ impl EszipV2 {
         resolve_specifier_key(module.specifier(), relative_file_base)?;
       if modules.contains_key(specifier_key.as_ref()) {
         return Ok(None);
+      }
+
+      // Excluded modules are left as bare imports: emit no source and follow no
+      // edges, so their subtree is pruned unless reached via a non-excluded
+      // path. Roots are never excluded (that would empty the archive).
+      if let Some(exclude) = exclude {
+        let is_root = graph.roots.iter().any(|root| root == module.specifier());
+        if !is_root && exclude(module.specifier(), specifier_key.as_ref()) {
+          return Ok(None);
+        }
       }
 
       match module {
@@ -1560,6 +1592,7 @@ impl EszipV2 {
     }
 
     let mut npm_packages = opts.npm_packages;
+    let exclude = exclude.as_deref();
     let mut to_visit =
       Vec::from_iter(opts.graph.roots.iter().rev().map(|specifier| {
         ToVisit::Module {
@@ -1594,6 +1627,7 @@ impl EszipV2 {
         opts.relative_file_base,
         npm_packages.as_mut(),
         &opts.npm_snapshot,
+        exclude,
       )?;
       if let Some(dependencies) = dependencies {
         let mut level_deps = Vec::new();

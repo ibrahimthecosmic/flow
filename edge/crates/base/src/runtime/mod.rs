@@ -791,6 +791,7 @@ where
             // here we don't want to add extra cost, so we won't use a checksum
             None,
             Some(static_patterns.iter().map(|s| s.as_str()).collect()),
+            None,
           )
           .await?;
 
@@ -3139,6 +3140,7 @@ mod test {
       None,
       None,
       None,
+      None,
     )
     .await
     .unwrap();
@@ -3213,6 +3215,7 @@ mod test {
     let binary_eszip = generate_binary_eszip(
       &mut metadata,
       Arc::new(emitter_factory),
+      None,
       None,
       None,
       None,

@@ -102,6 +102,15 @@ fn get_bundle_command() -> Command {
         .action(ArgAction::Append),
     )
     .arg(
+      arg!(--"exclude" <PATTERN>)
+        .help(concat!(
+          "Specifier or glob whose module subtree is left out of the bundle ",
+          "(emitted as a bare import for runtime resolution). Repeatable. ",
+          "Deps shared with a non-excluded module stay bundled."
+        ))
+        .action(ArgAction::Append),
+    )
+    .arg(
       arg!(--"checksum" <KIND>)
         .env("FLOW_ESZIP_CHECKSUM")
         .help("Hash function to use when checksumming the contents")

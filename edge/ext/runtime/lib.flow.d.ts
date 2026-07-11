@@ -222,6 +222,21 @@ declare interface FlowBundleOptions {
   noModuleCache?: boolean;
   /** Path to an import map applied while building the module graph. */
   importMapPath?: string;
+  /**
+   * Module specifiers or globs to leave OUT of the bundle. Each excluded module
+   * is emitted as a bare import to be resolved at runtime (e.g. a centrally
+   * maintained built-in service), rather than baked into the archive.
+   *
+   * - A specifier (e.g. `"#services/shopify/mod.ts"`, a path, or a `file://`
+   *   URL) excludes that exact module; its dependency subtree is pruned only
+   *   where reachable *solely* through excluded modules.
+   * - A glob (e.g. `"services/shopify/**"`) excludes every matching module,
+   *   regardless of how it is imported.
+   *
+   * A dependency also reachable from a non-excluded module stays bundled, so
+   * its identity at runtime follows normal ESM resolution.
+   */
+  exclude?: string[];
 }
 
 /** Per-file metadata emitted by a `FlowRuntime.unbundle` "file" event. */

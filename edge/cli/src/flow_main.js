@@ -251,6 +251,7 @@ function bundle(entrypoint, options = {}) {
     timeoutMs: options.timeoutMs,
     noModuleCache: options.noModuleCache ?? false,
     importMapPath: options.importMapPath,
+    exclude: options.exclude ?? [],
   };
 
   if (typeof entrypoint === "string") {

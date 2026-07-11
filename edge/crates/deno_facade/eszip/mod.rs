@@ -706,6 +706,10 @@ pub async fn generate_binary_eszip(
   maybe_module_code: Option<FastString>,
   maybe_checksum: Option<eszip::v2::Checksum>,
   maybe_static_patterns: Option<Vec<&str>>,
+  // Specifiers/globs to leave out of the bundle; each match is emitted as a
+  // bare import to be resolved at runtime, and its subtree is pruned unless
+  // also reachable from a non-excluded module.
+  maybe_exclude_patterns: Option<Vec<String>>,
 ) -> Result<EszipV2, anyhow::Error> {
   let deno_options = emitter_factory.deno_options()?.clone();
   let args = if let Some(path) = deno_options.entrypoint() {
@@ -924,6 +928,7 @@ pub async fn generate_binary_eszip(
     graph,
     Some(emitter_factory.clone()),
     Some(root_dir_url),
+    maybe_exclude_patterns.as_deref().unwrap_or(&[]),
   )
   .await?;
 

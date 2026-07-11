@@ -27,6 +27,7 @@ pub use crate::v1::EszipV1;
 pub use crate::v2::EszipRelativeFileBaseUrl;
 pub use crate::v2::EszipV2;
 pub use crate::v2::FromGraphOptions;
+pub use crate::v2::ModuleExcludePredicate;
 
 pub enum Eszip {
   V1(EszipV1),

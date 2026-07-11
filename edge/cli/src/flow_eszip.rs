@@ -68,6 +68,10 @@ struct EszipBundleOptions {
   timeout_ms: Option<u64>,
   no_module_cache: bool,
   import_map_path: Option<String>,
+  /// Specifiers or globs whose module subtree is left out of the bundle (each
+  /// match becomes a bare import resolved at runtime). Deps shared with a
+  /// non-excluded module stay bundled.
+  exclude: Vec<String>,
 }
 
 /// Maps the JS-facing checksum names onto the same `Checksum::from_u8`
@@ -134,6 +138,7 @@ async fn bundle_eszip(
     maybe_code,
     maybe_checksum,
     Some(static_patterns),
+    Some(options.exclude),
   );
 
   let eszip = match options.timeout_ms.map(Duration::from_millis) {

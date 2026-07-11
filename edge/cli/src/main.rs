@@ -202,6 +202,10 @@ async fn bundle(sub: &clap::ArgMatches) -> Result<ExitCode, Error> {
     .get_many::<String>("static")
     .map(|vals| vals.map(|s| s.to_string()).collect())
     .unwrap_or_default();
+  let exclude_patterns: Vec<String> = sub
+    .get_many::<String>("exclude")
+    .map(|vals| vals.map(|s| s.to_string()).collect())
+    .unwrap_or_default();
   let timeout_dur = sub
     .get_one::<u64>("timeout")
     .cloned()
@@ -252,6 +256,7 @@ async fn bundle(sub: &clap::ArgMatches) -> Result<ExitCode, Error> {
     None,
     maybe_checksum_kind,
     Some(static_pattern_refs),
+    Some(exclude_patterns),
   );
 
   let eszip = if let Some(dur) = timeout_dur {
