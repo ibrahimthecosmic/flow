@@ -142,6 +142,10 @@ keep running; the dead worker's ports go silent.
 `Deno.exit` does **not** end a worker (it is a no-op); use
 `scheduleTermination()`.
 
+Whichever way it ends, the host sees a final `Shutdown` event on
+`FlowRuntime.events` whose `reason` says which of the above happened (see
+[user-workers.md](./user-workers.md#observing-workers-flowruntimeevents)).
+
 ### Lifecycle events
 
 Workers receive DOM events on `globalThis`:

@@ -74,6 +74,21 @@ $ FLOW_WORKER_POOL_POLICY=oneshot FLOW_USER_WORKER_MAX_HEAP_SIZE_MIB=256 \
     flow run -A main.ts
 ```
 
+## `flow types`
+
+`flow types` prints Deno's ambient TypeScript declarations **plus flow's own**
+(`FlowRuntime`, the `create()` option interfaces, the `FlowRuntime.events` event
+shapes, `FLOW_VERSION`, …), so the output is the complete, always-current typing
+of the runtime:
+
+```console
+$ flow types > flow.d.ts
+```
+
+`flow check` and the flow LSP already see these declarations without the
+generated file — generate it only for external tooling (a plain `tsc` build,
+editors running a non-flow language server).
+
 ## `flow eszip` — deployment artifacts
 
 An _eszip_ is a single binary artifact containing a module graph (all local and
@@ -106,14 +121,21 @@ Create an eszip from an entrypoint:
 $ flow eszip bundle --entrypoint ./service/index.ts --output service.eszip
 ```
 
-| Flag                     | Default     | Meaning                                                          |
-| ------------------------ | ----------- | ---------------------------------------------------------------- |
-| `--entrypoint <Path>`    | (required)  | Entrypoint whose module graph is bundled                         |
-| `--output <DIR>`         | `bin.eszip` | Output file (`-` for stdout)                                     |
-| `--static <Path>`        | none        | Glob pattern of static files to include; repeatable              |
-| `--checksum <KIND>`      | none        | Hash function for content checksums (env: `FLOW_ESZIP_CHECKSUM`) |
-| `--disable-module-cache` | `false`     | Do not use the local module cache while building                 |
-| `--timeout <SECONDS>`    | none        | Abort the bundle if it takes longer than this                    |
+| Flag                     | Default     | Meaning                                                                              |
+| ------------------------ | ----------- | ------------------------------------------------------------------------------------ |
+| `--entrypoint <Path>`    | (required)  | Entrypoint whose module graph is bundled                                             |
+| `--output <DIR>`         | `bin.eszip` | Output file (`-` for stdout)                                                         |
+| `--static <Path>`        | none        | Glob pattern of static files to include; repeatable                                  |
+| `--exclude <PATTERN>`    | none        | Specifier or glob whose module subtree is left out of the bundle; repeatable (below) |
+| `--checksum <KIND>`      | none        | Hash function for content checksums (env: `FLOW_ESZIP_CHECKSUM`)                     |
+| `--disable-module-cache` | `false`     | Do not use the local module cache while building                                     |
+| `--timeout <SECONDS>`    | none        | Abort the bundle if it takes longer than this                                        |
+
+Import maps: the CLI applies the workspace configuration discovered for the
+entrypoint (`deno.json` `imports`, `package.json`) — there is no flag for an
+explicit map. To bundle with one, use the programmatic
+[`FlowRuntime.bundle`](./user-workers.md#bundling-programmatically-flowruntimebundle--flowruntimeunbundle)
+and its `importMapPath` option.
 
 Include static assets alongside the code:
 
@@ -121,6 +143,30 @@ Include static assets alongside the code:
 $ flow eszip bundle --entrypoint ./svc/index.ts \
     --static "./svc/assets/**/*.html" --static "./svc/data/*.json"
 ```
+
+#### `--exclude`: leaving modules out
+
+`--exclude` prunes a module (or a whole subtree) from the artifact while keeping
+the import statements that reference it, so the excluded modules are resolved at
+boot time instead of being baked in:
+
+```console
+$ flow eszip bundle --entrypoint ./tenant/index.ts \
+    --exclude "#services/shopify/mod.ts" --exclude "services/internal/**"
+```
+
+- A **specifier** (an authored import like `#services/shopify/mod.ts`, a path,
+  or a `file://` URL) excludes that exact module; its dependency subtree is
+  pruned only where reachable _solely_ through excluded modules.
+- A **glob** (contains `*`, `?`, or `[`) is matched against each module's
+  eszip-relative key and excludes every match, however it is imported.
+- A dependency also reachable from a non-excluded module stays bundled. Patterns
+  that match nothing are silently ignored.
+
+A worker booted from such a bundle must be able to resolve the excluded imports:
+today that requires creating it with `allowHostFsAccess: true` (the module
+loader then falls back to the host filesystem); in a fully sandboxed worker the
+excluded imports fail with `Module not found`.
 
 ### `flow eszip unbundle`
 

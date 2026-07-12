@@ -14,11 +14,11 @@ and on top of it flow adds:
 These documents cover only the flow layer. For everything else, use the regular
 [Deno documentation](https://docs.deno.com/).
 
-| Document                                 | Contents                                                                                |
-| ---------------------------------------- | --------------------------------------------------------------------------------------- |
-| [cli.md](./cli.md)                       | Flow CLI flags, environment variables, `flow eszip`                                     |
-| [user-workers.md](./user-workers.md)     | Host API: creating workers, eszip boots, MessagePort comms, reuse, raw bytes, inspector |
-| [worker-runtime.md](./worker-runtime.md) | Inside a user worker: APIs, sandbox behavior, Node/npm compat, lifecycle & limits       |
+| Document                                 | Contents                                                                                                          |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| [cli.md](./cli.md)                       | Flow CLI flags, environment variables, `flow types`, `flow eszip`                                                 |
+| [user-workers.md](./user-workers.md)     | Host API: creating workers (all options), eszip boots, programmatic bundling, MessagePort comms, reuse, inspector |
+| [worker-runtime.md](./worker-runtime.md) | Inside a user worker: APIs, sandbox behavior, Node/npm compat, lifecycle & limits                                 |
 
 ## Quick taste
 

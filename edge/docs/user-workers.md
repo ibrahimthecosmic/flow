@@ -38,21 +38,22 @@ work normally.
 
 Source of the worker:
 
-| Option                                      | Type                                                 | Notes                                                                                                |
-| ------------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `servicePath`                               | `string`                                             | Directory containing `index.{ts,tsx,js,mjs,jsx}`                                                     |
-| `maybeEszip` (+ optional `maybeEntrypoint`) | `Uint8Array \| string \| ReadableStream<Uint8Array>` | Boot from an eszip artifact (see [below](#booting-from-an-eszip-maybeeszip)); `servicePath` optional |
-| `maybeModuleCode`                           | `string`                                             | Inline module source; still needs a `servicePath` (pool key / base directory)                        |
+| Option            | Type                                                 | Notes                                                                                                                                                                                                                      |
+| ----------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `servicePath`     | `string`                                             | Directory containing `index.{ts,tsx,js,mjs,jsx}`. Doubles as the **pool key** — under the default `per_worker` policy a later `create()` with the same path returns the running worker (see [Worker reuse](#worker-reuse)) |
+| `maybeEszip`      | `Uint8Array \| string \| ReadableStream<Uint8Array>` | Boot from an eszip artifact (see [below](#booting-from-an-eszip-maybeeszip)); `servicePath` optional (kept only as the pool key)                                                                                           |
+| `maybeEntrypoint` | `string`                                             | Entrypoint override for `servicePath` builds: a path resolved against `servicePath`, or a full URL. **Not** an override for eszip boots — a current-format bundle's own entrypoint key always wins                         |
+| `maybeModuleCode` | `string`                                             | Inline module source; still needs a `servicePath` (pool key / base directory)                                                                                                                                              |
 
 Resource limits (per worker):
 
-| Option                | Default                                     | Meaning                                                           |
-| --------------------- | ------------------------------------------- | ----------------------------------------------------------------- |
-| `memoryLimitMb`       | `FLOW_USER_WORKER_MAX_HEAP_SIZE_MIB` or 512 | V8 heap cap; the worker is terminated when it exceeds it          |
-| `lowMemoryMultiplier` | 5                                           | Low-memory notification factor                                    |
-| `workerTimeoutMs`     | 60000                                       | Wall-clock lifetime; the supervisor retires the worker after this |
-| `cpuTimeSoftLimitMs`  | 50                                          | CPU budget before the worker is flagged for early termination     |
-| `cpuTimeHardLimitMs`  | 100                                         | CPU budget before the worker is forcibly killed                   |
+| Option                | Default                                     | Meaning                                                                                                                         |
+| --------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `memoryLimitMb`       | `FLOW_USER_WORKER_MAX_HEAP_SIZE_MIB` or 512 | V8 heap cap; the worker is terminated when it exceeds it                                                                        |
+| `lowMemoryMultiplier` | 5                                           | Near-heap-limit allowance: V8's limit is raised `current × N` so the worker is retired gracefully instead of OOMing the process |
+| `workerTimeoutMs`     | 60000                                       | Wall-clock lifetime; the supervisor retires the worker after this                                                               |
+| `cpuTimeSoftLimitMs`  | 50                                          | CPU budget before the worker is flagged for early termination                                                                   |
+| `cpuTimeHardLimitMs`  | 100                                         | CPU budget before the worker is forcibly killed                                                                                 |
 
 > The CPU defaults are tuned for small request handlers. Module-heavy startup
 > (e.g. importing many `node:*`/npm modules) can exceed 50 ms of CPU in debug
@@ -64,23 +65,50 @@ Environment & module loading:
 | Option               | Default | Meaning                                                                                                              |
 | -------------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
 | `envVars`            | `[]`    | `[key, value]` pairs — the worker's **entire** environment (`Deno.env` / `process.env`). Host env is never inherited |
-| `noModuleCache`      | `false` | Bypass the local module cache                                                                                        |
-| `noNpm`              | unset   | Disable npm support for this worker                                                                                  |
-| `allowRemoteModules` | `true`  | Allow `https:` imports                                                                                               |
-| `customModuleRoot`   | unset   | Root for module resolution                                                                                           |
-| `staticPatterns`     | `[]`    | Glob patterns of static files available to the worker                                                                |
+| `noModuleCache`      | `false` | Build the module graph without the local Deno module cache (remote imports are re-downloaded)                        |
+| `noNpm`              | unset   | Forbid `npm:` resolution while building the module graph                                                             |
+| `allowRemoteModules` | `true`  | Allow `https:` imports while building the module graph                                                               |
+| `customModuleRoot`   | unset   | Accepted for edge-runtime compatibility; currently unused                                                            |
+| `staticPatterns`     | `[]`    | Glob patterns (resolved against the host's CWD) of static files baked into the worker's sandbox filesystem           |
+
+> The four graph-building options (`noModuleCache`, `noNpm`,
+> `allowRemoteModules`, `staticPatterns`) apply to `servicePath` /
+> `maybeModuleCode` builds only. An eszip boot never builds a graph — its
+> modules, npm packages, and static assets were fixed at bundle time.
 
 Sandbox & platform:
 
-| Option                      | Default              | Meaning                                                                                                                                                                                                                                                                                                                                                        |
-| --------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `allowHostFsAccess`         | `false`              | When `true`, the worker's `Deno` fs APIs work against the real filesystem; otherwise they are denied (see [worker-runtime.md](./worker-runtime.md#sandbox-behavior))                                                                                                                                                                                           |
-| `permissions`               | all-allowed defaults | Deno-style permission set; keys are snake_case: `allow_all`, `allow_env`, `deny_env`, `allow_net`, `deny_net`, `allow_read`, `deny_read`, `allow_write`, `deny_write`, `allow_run`, `deny_run`, `allow_sys`, `deny_sys`, `allow_ffi`, `deny_ffi`, `allow_import`                                                                                               |
-| `forceCreate`               | `false`              | Never reuse a running worker for this `servicePath`                                                                                                                                                                                                                                                                                                            |
-| `context`                   | unset                | Arbitrary JSON merged into the worker's bootstrap context; the worker reads it back via the deep-frozen `FlowRuntime.context` global (runtime-owned keys such as `terminationRequestToken` are stripped)                                                                                                                                                       |
-| `s3FsConfig`, `tmpFsConfig` | unset                | Alternative filesystem backends (S3 / temp fs). `s3FsConfig` takes one config object (mounted at `/s3`) or an array of config objects, each with its own `mountPoint` (default `/s3`); mount points must be absolute, non-`/`, and must not equal or nest inside `/tmp` or one another                                                                         |
-| `httpFs`                    | unset                | HttpFS mounts: one config or an array of `{ mountPoint, baseUrl, headers?, query?, socketPath? }`, each backed by an HTTP API implementing the [HttpFS Protocol v1](./httpfs-protocol.md). `mountPoint` is required per entry and follows the same collision rules as the S3 mount points. `socketPath` routes the mount over an AF_UNIX socket instead of TCP |
-| `otelConfig`                | unset                | OpenTelemetry tracing/metrics for the worker                                                                                                                                                                                                                                                                                                                   |
+| Option                      | Default              | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| --------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `allowHostFsAccess`         | `false`              | When `true`, the worker's `Deno` fs APIs work against the real filesystem (and module loads that miss the graph/bundle may fall back to host files); otherwise they are denied (see [worker-runtime.md](./worker-runtime.md#sandbox-behavior)). Rejected when flow runs with `--restrict-host-fs`                                                                                                                                                                                                                                           |
+| `permissions`               | all-allowed defaults | Deno-style permission set; keys are snake_case: `allow_env`, `deny_env`, `allow_net`, `deny_net`, `allow_read`, `deny_read`, `allow_write`, `deny_write`, `allow_run`, `deny_run`, `allow_sys`, `deny_sys`, `allow_ffi`, `deny_ffi`, `allow_import`. When the object is given, Deno flag semantics apply per key: omitted = denied, `[]` = blanket allow, non-empty = only the listed targets; `deny_*` carves exceptions out. No prompting — denials throw. (`allow_all` is accepted for edge-runtime compatibility but currently ignored) |
+| `forceCreate`               | `false`              | Never reuse a running worker for this `servicePath`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `context`                   | unset                | Arbitrary JSON merged into the worker's bootstrap context; the worker reads it back via the deep-frozen `FlowRuntime.context` global (runtime-owned keys such as `terminationRequestToken` are stripped). A few keys are also read by the runtime itself — see [below](#runtime-recognized-context-keys)                                                                                                                                                                                                                                    |
+| `s3FsConfig`, `tmpFsConfig` | unset                | Alternative filesystem backends (S3 / temp fs). `s3FsConfig` takes one config object (mounted at `/s3`) or an array of config objects, each with its own `mountPoint` (default `/s3`); mount points must be absolute, non-`/`, and must not equal or nest inside `/tmp` or one another. Full field reference (`credentials`, `endpointUrl`, `forcePathStyle`, `retryConfig`, …): `FlowS3FsConfig` / `FlowTmpFsConfig` in [`flow types`](./cli.md#flow-types)                                                                                |
+| `httpFs`                    | unset                | HttpFS mounts: one config or an array of `{ mountPoint, baseUrl, headers?, query?, socketPath? }`, each backed by an HTTP API implementing the [HttpFS Protocol v1](./httpfs-protocol.md). `mountPoint` is required per entry and follows the same collision rules as the S3 mount points. `socketPath` routes the mount over an AF_UNIX socket instead of TCP                                                                                                                                                                              |
+| `otelConfig`                | unset                | OpenTelemetry tracing/metrics for the worker: `{ tracing_enabled?, metrics_enabled?, console?: "Ignore" \| "Capture" \| "Replace", propagators?: ("TraceContext" \| "Baggage")[] }` — everything defaults to off. **Mind the casing**: unlike the other options these keys are snake_case and the values PascalCase; misspelled keys are silently ignored                                                                                                                                                                                   |
+
+### Runtime-recognized `context` keys
+
+`context` is passed through to the worker verbatim, but the runtime itself reads
+a few keys out of it while booting:
+
+| Key                     | Type      | Effect                                                                                                                                                                       |
+| ----------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `importMapPath`         | `string`  | Import map applied when building the module graph of a `servicePath` build (and when migrating a legacy eszip). Current-format eszip boots carry their own map and ignore it |
+| `unstableSloppyImports` | `boolean` | Enable sloppy imports for `servicePath` builds                                                                                                                               |
+| `sourceMap`             | `boolean` | Load source maps so worker stack traces map back to original sources (implied when the user-worker inspector is enabled)                                                     |
+
+```ts
+await FlowRuntime.userWorkers.create({
+  servicePath: "./svc",
+  context: {
+    importMapPath: "./svc/import_map.json",
+    sourceMap: true,
+    tenantId: "acme", // everything else is yours; the worker reads it back
+  },
+});
+```
 
 ## Booting from an eszip: `maybeEszip`
 
@@ -102,8 +130,10 @@ const { body } = await fetch("https://artifacts.example.com/service.eszip");
 await FlowRuntime.userWorkers.create({ maybeEszip: body });
 ```
 
-`servicePath` is optional for eszip boots (the artifact carries its own
-entrypoint in its metadata); pass `maybeEntrypoint` to override it.
+`servicePath` is optional for eszip boots: the artifact carries its own
+entrypoint in its metadata, and that key always wins for current-format bundles
+(`maybeEntrypoint` is only consulted for migrated legacy artifacts whose
+metadata lacks one). When given, `servicePath` still serves as the pool key.
 
 ### File-backed loading
 
@@ -202,6 +232,79 @@ for await (const ev of FlowRuntime.events) {
   }
 }
 ```
+
+## Bundling programmatically: `FlowRuntime.bundle` / `FlowRuntime.unbundle`
+
+The `flow eszip` CLI has a programmatic twin on the host isolate:
+
+```ts
+FlowRuntime.bundle(entrypoint, options?): ReadableStream<Uint8Array>
+FlowRuntime.unbundle(eszip, output?): FlowUnbundled
+```
+
+### `FlowRuntime.bundle`
+
+`entrypoint` is either a **path on disk** (string) or the entry module's
+**source code** (`Uint8Array`/`ArrayBuffer`/`ReadableStream` — bundled under a
+synthetic `/src/index.ts` specifier, imports resolved against the CWD). Bundling
+runs on a dedicated thread; failures surface as errors on the returned stream.
+
+```ts
+// Bundle to a file…
+const artifact = FlowRuntime.bundle("./service/index.ts", {
+  checksum: "xxhash3",
+  staticPatterns: ["./service/assets/**/*.html"],
+});
+const file = await Deno.open("service.eszip", { write: true, create: true });
+await artifact.pipeTo(file.writable);
+
+// …or straight into a worker (collect the stream, or spill it to disk first)
+const worker = await FlowRuntime.userWorkers.create({
+  maybeEszip: FlowRuntime.bundle("./service/index.ts"),
+});
+```
+
+Options (`FlowBundleOptions`):
+
+| Option           | Default | Meaning                                                                                                                                                                                                                                                                                       |
+| ---------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `importMapPath`  | unset   | Path to an import map (resolved against the CWD) applied while building the module graph — and serialized into the artifact, so the same mappings hold inside a worker booted from it. Without it, the entrypoint's workspace config (`deno.json` `imports`, `package.json`) applies as usual |
+| `staticPatterns` | `[]`    | Glob patterns (CWD-relative) of static files to include; same as `--static`                                                                                                                                                                                                                   |
+| `checksum`       | none    | `"sha256"` \| `"xxhash3"` — bake per-entry integrity hashes into the artifact, verified on every read at boot/import time (see [Integrity checking](#integrity-checking))                                                                                                                     |
+| `noModuleCache`  | `false` | Re-download remote modules instead of using the local module cache                                                                                                                                                                                                                            |
+| `timeoutMs`      | none    | Abort bundling after this long (stream errors)                                                                                                                                                                                                                                                |
+| `exclude`        | `[]`    | Specifiers or globs whose module subtree is left out of the bundle; same as `--exclude` (see [cli.md](./cli.md#flow-eszip-bundle))                                                                                                                                                            |
+
+The import map is the piece the CLI does **not** expose — `flow eszip bundle`
+relies on workspace discovery, so an explicit map requires this API:
+
+```ts
+// import_map.json: { "imports": { "#lib/": "./shared/lib/" } }
+const bytes = FlowRuntime.bundle("./tenant/index.ts", {
+  importMapPath: "./import_map.json",
+});
+// `import x from "#lib/util.ts"` now resolves at bundle time AND inside the
+// booted worker (the map ships in the artifact's workspace resolver).
+```
+
+### `FlowRuntime.unbundle`
+
+Extracts an eszip (path, bytes, or stream) — including legacy formats that can
+no longer boot workers. Each contained file fires a `"file"` event; pass
+`output` (a directory) to also write the tree to disk through Deno's filesystem
+APIs (so `--allow-write` applies):
+
+```ts
+const job = FlowRuntime.unbundle("service.eszip", "./extracted");
+job.on("file", ({ specifier, path, kind, size }) => {
+  // kind: "module" | "static" | "vfs" (a bundled node_modules file)
+  console.log(kind, specifier, "→", path, `(${size}B)`);
+});
+await job.done; // resolves on "finish", rejects on "error"
+```
+
+`"finish"` fires after every file was emitted (and written, when `output` was
+given); a `"file"` listener that throws aborts the job with `"error"`.
 
 ## Talking to a worker: `worker.port`
 
@@ -310,7 +413,8 @@ worker" (removed in flow), collapsed into a host API on the main isolate:
 
 ```ts
 for await (const ev of FlowRuntime.events) {
-  // ev = { timestamp, event_type, event, metadata }
+  // ev = { timestamp, event_type, event, metadata } — a discriminated
+  // union; narrowing on event_type types the payload (`FlowWorkerEvent`)
   switch (ev.event_type) {
     case "Log": // every console.* call in a worker: { msg, level }
     case "Boot": // { boot_time }
@@ -318,9 +422,27 @@ for await (const ev of FlowRuntime.events) {
     case "UncaughtException": // { exception, cpu_time_used }
     case "Shutdown": // { reason, cpu_time_used, memory_used }
   }
-  // ev.metadata = { service_path, execution_id, ... } — route per tenant
+  // ev.metadata = { service_path, execution_id, otel_attributes }
 }
 ```
+
+Per worker, the stream is `Boot` (possibly followed by `BootFailure`), then any
+number of `Log`/`UncaughtException`, then a final `Shutdown`. The payloads
+(exact types in [`flow types`](./cli.md#flow-types) output):
+
+| `event_type`        | Payload                                                                                                                                                                                                                                                                                       |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Boot`              | `boot_time` — milliseconds from `create()` to the entrypoint being ready                                                                                                                                                                                                                      |
+| `BootFailure`       | `msg` — building/evaluating the module graph failed (missing module, checksum mismatch, throw during evaluation); the worker never serves                                                                                                                                                     |
+| `Log`               | `msg` and `level`: `console.debug` → `"Debug"`, `log`/`info` → `"Info"`, `warn` → `"Warning"`, `error` → `"Error"`                                                                                                                                                                            |
+| `UncaughtException` | `exception` (rendered message + stack), `cpu_time_used` (ms)                                                                                                                                                                                                                                  |
+| `Shutdown`          | `reason`, `cpu_time_used` (lifetime CPU ms), `memory_used` (`{ total, heap, external, mem_check_captured }`, bytes). `reason`: `EventLoopCompleted`, `WallClockTime`, `CPUTime`, `Memory`, `EarlyDrop` (early retirement / idle cleanup), or `TerminationRequested` (`scheduleTermination()`) |
+
+`metadata` identifies the worker on every event: `execution_id` is the worker's
+UUID (the same value as the `FlowUserWorker.key` returned by `create()`),
+`service_path` is its pool key, and `otel_attributes` carries
+`edge_runtime.worker.kind: "user"` plus anything passed under `context.otel` —
+route events per tenant on any of these.
 
 Semantics:
 
