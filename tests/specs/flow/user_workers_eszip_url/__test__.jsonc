@@ -1,0 +1,14 @@
+{
+  "tempDir": true,
+  "tests": {
+    "eszip_url": {
+      "envs": {
+        // Per-run cache (relative to the temp cwd) so version hits / 304s
+        // are asserted against THIS run's downloads, not leftover state.
+        "FLOW_BUNDLE_CACHE_DIR": "./bundle-cache"
+      },
+      "args": "run -A main.js",
+      "output": "main.out"
+    }
+  }
+}

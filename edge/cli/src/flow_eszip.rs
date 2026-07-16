@@ -46,6 +46,7 @@ use deno_facade::EszipEntryReader;
 use deno_facade::EszipPayloadKind;
 use deno_facade::Metadata;
 use deno_facade::bundle_cache::SpillFile;
+use deno_facade::bundle_cache::UrlCacheEntry;
 use deno_facade::generate_binary_eszip;
 use serde::Deserialize;
 use serde::Serialize;
@@ -403,6 +404,30 @@ async fn op_eszip_spill_finish(
   Ok(path.to_string_lossy().into_owned())
 }
 
+/// Looks up the bundle-cache manifest entry recorded for a `(url, version)`
+/// eszip download (see `fetchEszipUrl` in flow_main.js). `None` means the
+/// URL must be (re-)downloaded.
+#[op2]
+#[serde]
+async fn op_eszip_url_cache_lookup(
+  #[string] url: String,
+  #[string] version: Option<String>,
+) -> Result<Option<UrlCacheEntry>, JsErrorBox> {
+  deno_facade::bundle_cache::url_cache_lookup(url, version)
+    .await
+    .map_err(generic_err)
+}
+
+/// Records a finished `(url, version)` download in the bundle-cache manifest.
+#[op2]
+async fn op_eszip_url_cache_record(
+  #[serde] entry: UrlCacheEntry,
+) -> Result<(), JsErrorBox> {
+  deno_facade::bundle_cache::url_cache_record(entry)
+    .await
+    .map_err(generic_err)
+}
+
 deno_core::extension!(
   // flow: OPS-ONLY for the same reason as `user_workers_ops` - an ESM-bearing
   // extension can't link against Deno's CLI snapshot. The JS surface
@@ -416,6 +441,8 @@ deno_core::extension!(
     op_eszip_unbundle_next,
     op_eszip_spill_open,
     op_eszip_spill_write,
-    op_eszip_spill_finish
+    op_eszip_spill_finish,
+    op_eszip_url_cache_lookup,
+    op_eszip_url_cache_record
   ],
 );

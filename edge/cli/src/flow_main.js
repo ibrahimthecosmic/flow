@@ -37,6 +37,8 @@ const {
   op_eszip_spill_write,
   op_eszip_unbundle_next,
   op_eszip_unbundle_open,
+  op_eszip_url_cache_lookup,
+  op_eszip_url_cache_record,
   op_flow_events_accept,
   op_flow_events_cancel,
   op_flow_events_claim,
@@ -118,6 +120,110 @@ async function spillEszipStream(stream) {
   }
 }
 
+// In-flight downloads keyed by `url\0version` — concurrent create() calls for
+// the same bundle share one fetch (the main isolate is single-threaded, so a
+// plain Map is race-free). Entries are removed on settle; later calls go
+// through the on-disk manifest instead.
+const inflightEszipDownloads = new Map();
+
+// Resolves the `{ url, headers?, version? }` form of `maybeEszip` to a
+// bundle-cache path, downloading at most once per (url, version):
+//   - `version` set + manifest hit -> cached path, no network (immutable pin);
+//   - no `version` + manifest hit  -> conditional GET (If-None-Match /
+//     If-Modified-Since); 304 reuses the cached file, a network error or 5xx
+//     falls back to it with a warning (stale-if-error), a definitive 4xx
+//     rejects (an authoritative revocation should stop new boots);
+//   - miss -> plain GET, streamed into the bundle cache, then recorded in the
+//     manifest with the response's ETag/Last-Modified.
+async function fetchEszipUrl({ url, headers, version }) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new TypeError(
+      `a maybeEszip url must be http(s), got ${parsed.protocol}`,
+    );
+  }
+  if (version != null && typeof version !== "string") {
+    throw new TypeError("a maybeEszip version must be a string");
+  }
+
+  const flightKey = `${url}\0${version ?? ""}`;
+  const inflight = inflightEszipDownloads.get(flightKey);
+  if (inflight) {
+    return await inflight;
+  }
+  const download = (async () => {
+    const cached = await op_eszip_url_cache_lookup(url, version ?? null);
+    if (cached && version != null) {
+      return cached.bundlePath;
+    }
+
+    const requestHeaders = new Headers(headers);
+    if (cached?.etag) {
+      requestHeaders.set("if-none-match", cached.etag);
+    }
+    if (cached?.lastModified) {
+      requestHeaders.set("if-modified-since", cached.lastModified);
+    }
+
+    let res;
+    try {
+      res = await fetch(url, { headers: requestHeaders });
+    } catch (e) {
+      if (cached) {
+        // deno-lint-ignore no-console
+        console.error(
+          `flow: failed to revalidate the eszip at ${url} (${
+            e?.message ?? e
+          }); using the cached copy`,
+        );
+        return cached.bundlePath;
+      }
+      throw new Error(`failed to download the eszip from ${url}`, {
+        cause: e,
+      });
+    }
+
+    if (cached && res.status === 304) {
+      res.body?.cancel()?.catch(() => {});
+      return cached.bundlePath;
+    }
+    if (!res.ok) {
+      if (cached && res.status >= 500) {
+        res.body?.cancel()?.catch(() => {});
+        // deno-lint-ignore no-console
+        console.error(
+          `flow: failed to revalidate the eszip at ${url} (HTTP ${res.status}); using the cached copy`,
+        );
+        return cached.bundlePath;
+      }
+      res.body?.cancel()?.catch(() => {});
+      throw new Error(
+        `failed to download the eszip from ${url}: HTTP ${res.status} ${res.statusText}`,
+      );
+    }
+    if (!res.body) {
+      throw new Error(`the eszip response from ${url} has no body`);
+    }
+
+    const bundlePath = await spillEszipStream(res.body);
+    await op_eszip_url_cache_record({
+      url,
+      version: version ?? null,
+      etag: res.headers.get("etag"),
+      lastModified: res.headers.get("last-modified"),
+      bundlePath,
+    });
+    return bundlePath;
+  })();
+
+  inflightEszipDownloads.set(flightKey, download);
+  try {
+    return await download;
+  } finally {
+    inflightEszipDownloads.delete(flightKey);
+  }
+}
+
 // Mirrors the edge `UserWorker.create` option defaults, minus the HTTP
 // request-passing surface (replaced by the MessagePort channel).
 async function createUserWorker(opts) {
@@ -133,21 +239,31 @@ async function createUserWorker(opts) {
   if (!maybeEszip && (!servicePath || servicePath === "")) {
     throw new TypeError("service path must be defined");
   }
+  const isEszipUrl = maybeEszip !== null &&
+    typeof maybeEszip === "object" &&
+    !(maybeEszip instanceof Uint8Array) &&
+    !(maybeEszip instanceof ReadableStream) &&
+    typeof maybeEszip.url === "string";
   // The op requires `servicePath` (it doubles as the pool key). An eszip
   // carries its own entrypoint, so for an eszip-only create the path has no
-  // directory meaning - default it instead of failing deserialization.
+  // directory meaning - default it instead of failing deserialization. The
+  // URL form has a natural identity, so it defaults to the URL itself:
+  // distinct URLs get distinct workers under the per_worker pool policy.
   if (readyOptions.servicePath == null) {
-    readyOptions.servicePath = "";
+    readyOptions.servicePath = isEszipUrl ? maybeEszip.url : "";
   }
 
   // The op takes eszip bytes (`maybeEszip`) or an on-disk path
   // (`maybeEszipPath`); both converge file-backed on the Rust side. Map the
-  // path/stream forms of `maybeEszip` onto `maybeEszipPath` here.
+  // path/stream/url forms of `maybeEszip` onto `maybeEszipPath` here.
   if (typeof maybeEszip === "string") {
     readyOptions.maybeEszipPath = maybeEszip;
     readyOptions.maybeEszip = undefined;
   } else if (maybeEszip instanceof ReadableStream) {
     readyOptions.maybeEszipPath = await spillEszipStream(maybeEszip);
+    readyOptions.maybeEszip = undefined;
+  } else if (isEszipUrl) {
+    readyOptions.maybeEszipPath = await fetchEszipUrl(maybeEszip);
     readyOptions.maybeEszip = undefined;
   }
 

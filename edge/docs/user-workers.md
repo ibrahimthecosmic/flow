@@ -38,12 +38,12 @@ work normally.
 
 Source of the worker:
 
-| Option            | Type                                                 | Notes                                                                                                                                                                                                                      |
-| ----------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `servicePath`     | `string`                                             | Directory containing `index.{ts,tsx,js,mjs,jsx}`. Doubles as the **pool key** — under the default `per_worker` policy a later `create()` with the same path returns the running worker (see [Worker reuse](#worker-reuse)) |
-| `maybeEszip`      | `Uint8Array \| string \| ReadableStream<Uint8Array>` | Boot from an eszip artifact (see [below](#booting-from-an-eszip-maybeeszip)); `servicePath` optional (kept only as the pool key)                                                                                           |
-| `maybeEntrypoint` | `string`                                             | Entrypoint override for `servicePath` builds: a path resolved against `servicePath`, or a full URL. **Not** an override for eszip boots — a current-format bundle's own entrypoint key always wins                         |
-| `maybeModuleCode` | `string`                                             | Inline module source; still needs a `servicePath` (pool key / base directory)                                                                                                                                              |
+| Option            | Type                                                                                | Notes                                                                                                                                                                                                                      |
+| ----------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `servicePath`     | `string`                                                                            | Directory containing `index.{ts,tsx,js,mjs,jsx}`. Doubles as the **pool key** — under the default `per_worker` policy a later `create()` with the same path returns the running worker (see [Worker reuse](#worker-reuse)) |
+| `maybeEszip`      | `Uint8Array \| string \| ReadableStream<Uint8Array> \| { url, headers?, version? }` | Boot from an eszip artifact (see [below](#booting-from-an-eszip-maybeeszip)); `servicePath` optional (kept only as the pool key)                                                                                           |
+| `maybeEntrypoint` | `string`                                                                            | Entrypoint override for `servicePath` builds: a path resolved against `servicePath`, or a full URL. **Not** an override for eszip boots — a current-format bundle's own entrypoint key always wins                         |
+| `maybeModuleCode` | `string`                                                                            | Inline module source; still needs a `servicePath` (pool key / base directory)                                                                                                                                              |
 
 Resource limits (per worker):
 
@@ -115,7 +115,7 @@ await FlowRuntime.userWorkers.create({
 An eszip (built with
 [`flow eszip bundle`](./cli.md#flow-eszip--deployment-artifacts) or
 `FlowRuntime.bundle`) carries the worker's entire module graph — code, npm
-packages, static assets, metadata — as one artifact. `maybeEszip` accepts three
+packages, static assets, metadata — as one artifact. `maybeEszip` accepts four
 forms:
 
 ```ts
@@ -128,6 +128,15 @@ await FlowRuntime.userWorkers.create({ maybeEszip: "./service.eszip" });
 // 3. a stream — spilled to disk incrementally, chunk by chunk
 const { body } = await fetch("https://artifacts.example.com/service.eszip");
 await FlowRuntime.userWorkers.create({ maybeEszip: body });
+
+// 4. a URL — downloaded (and cached) by the runtime itself
+await FlowRuntime.userWorkers.create({
+  maybeEszip: {
+    url: "https://artifacts.example.com/service.eszip",
+    headers: { authorization: `Bearer ${token}` }, // optional
+    version: "5.2.0", // optional: pin — a cached version is never re-fetched
+  },
+});
 ```
 
 `servicePath` is optional for eszip boots: the artifact carries its own
@@ -175,6 +184,36 @@ Behaviors:
   `*.eszip` entries older than the TTL. Deleting a cache entry out from under a
   **running** worker is harmless on Unix — the worker holds an open file handle
   — but a later `create()` with the same bytes rewrites it.
+
+### Loading from a URL
+
+The `{ url, headers?, version? }` form makes the runtime download the bundle
+itself (http/https only) and stream it straight into the bundle cache — the
+bundle never materializes in memory, and a failed download (non-2xx, network
+error) rejects `create()` with the URL and status. Alongside the blob, the
+runtime records a small manifest entry (`<xxh3-64>.url.json` in the cache dir,
+same TTL sweep) keyed by `(url, version)` so repeated creates skip the network:
+
+- **With `version`** (an opaque string): a cached `(url, version)` download is
+  reused with **no network request at all** — npm-style immutable semantics.
+  Bump the version to force a re-fetch.
+- **Without `version`**: every `create()` sends one conditional request
+  (`If-None-Match`/`If-Modified-Since` from the recorded
+  `ETag`/`Last-Modified`); `304 Not Modified` reuses the cached file, a `200`
+  replaces it. Servers without validators cause a full download each time — use
+  `version` for zero requests. `Cache-Control` is not consulted.
+- **Stale-if-error**: when revalidation fails _transiently_ (network error or
+  5xx) and a cached copy exists, the worker boots from the cache with a warning
+  on stderr. A definitive 4xx (`404`/`403`/`401`) rejects even with a cached
+  copy — an authoritative revocation stops new boots.
+- `headers` (any `HeadersInit`) are sent on every request but are **not** part
+  of the cache key — rotating a token never invalidates the cache. Redirects
+  follow standard `fetch` semantics (note: `Authorization` is dropped on
+  cross-origin redirects).
+- Concurrent `create()` calls for the same `(url, version)` share a single
+  in-flight download.
+- With no explicit `servicePath`, the URL string becomes the pool key (instead
+  of `""`), so creates for different URLs never collide in the worker pool.
 
 ### Sharing across workers
 

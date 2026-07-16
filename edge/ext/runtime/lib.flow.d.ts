@@ -249,6 +249,26 @@ declare interface FlowUserWorkerCreateOptions {
    *   canonical path share one parsed header and file handle.
    * - `ReadableStream<Uint8Array>`: streamed into the bundle cache chunk by
    *   chunk without ever materializing the whole bundle in memory.
+   * - `{ url, headers?, version? }`: the bundle is downloaded over http(s)
+   *   and streamed into the bundle cache; a failed download (non-2xx,
+   *   network error) rejects `create()`. Downloads are cached on disk keyed
+   *   by `(url, version)`:
+   *   - With a `version` (an opaque string — bump it to force a re-fetch), a
+   *     cached download is reused with NO network request, npm-style
+   *     immutable semantics.
+   *   - Without one, each `create()` revalidates with a conditional request
+   *     (`If-None-Match`/`If-Modified-Since` from the recorded
+   *     `ETag`/`Last-Modified`); `304` reuses the cached file. If the
+   *     revalidation itself fails transiently (network error or 5xx) the
+   *     cached copy is used with a warning, but a definitive 4xx rejects.
+   *   - `headers` (any `HeadersInit`, e.g. an `Authorization` token) are
+   *     sent on every request but are NOT part of the cache key. Redirects
+   *     follow `fetch` semantics (auth headers are dropped cross-origin).
+   *   - Concurrent creates for the same `(url, version)` share one
+   *     download; cache entries age out with the bundle-cache TTL sweep and
+   *     are then simply re-downloaded.
+   *   With no explicit `servicePath`, the URL string becomes the pool key
+   *   (instead of `""`), so different URLs never collide in the pool.
    *
    * Bundles built with a checksum (`flow eszip bundle --checksum`) are
    * verified on every module read; corruption fails the worker's module
@@ -257,7 +277,12 @@ declare interface FlowUserWorkerCreateOptions {
    * `FlowRuntime.unbundle` still reads them. Module-graph failures happen
    * after `create()` resolves and surface as `BootFailure` on
    * `FlowRuntime.events`. */
-  maybeEszip?: Uint8Array | string | ReadableStream<Uint8Array> | null;
+  maybeEszip?:
+    | Uint8Array
+    | string
+    | ReadableStream<Uint8Array>
+    | { url: string; headers?: HeadersInit; version?: string }
+    | null;
   /** Entrypoint override for `servicePath` builds: a path resolved against
    * `servicePath`, or a full URL. NOT an override for eszip boots — a
    * current-format bundle always carries an entrypoint key in its metadata,

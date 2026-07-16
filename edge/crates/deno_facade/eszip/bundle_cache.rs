@@ -27,6 +27,8 @@ use eszip::v2::EszipV2Modules;
 use futures::AsyncSeekExt;
 use futures::io::AllowStdIo;
 use futures::io::BufReader;
+use serde::Deserialize;
+use serde::Serialize;
 use xxhash_rust::xxh3::Xxh3;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -75,7 +77,8 @@ pub fn sweep_once() {
     for entry in entries.flatten() {
       let path = entry.path();
       let ttl = match path.extension().and_then(|it| it.to_str()) {
-        Some("eszip") => bundle_ttl(),
+        // "json" covers the `<hash>.url.json` URL-download manifests.
+        Some("eszip") | Some("json") => bundle_ttl(),
         Some("tmp") => Duration::from_secs(TMP_TTL_SECS),
         _ => continue,
       };
@@ -139,6 +142,115 @@ fn store_bytes_blocking(bytes: &[u8]) -> Result<PathBuf, anyhow::Error> {
     })?;
 
   Ok(dest)
+}
+
+/// A recorded eszip download: which content-addressed blob a URL's bundle
+/// landed in, plus what is needed to decide whether the network can be
+/// skipped next time — an explicit `version` pin, or the HTTP validators
+/// (`ETag`/`Last-Modified`) for a conditional re-fetch.
+///
+/// Serialized camelCase because entries travel through the
+/// `op_eszip_url_cache_*` ops straight to/from JS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlCacheEntry {
+  pub url: String,
+  #[serde(default)]
+  pub version: Option<String>,
+  #[serde(default)]
+  pub etag: Option<String>,
+  #[serde(default)]
+  pub last_modified: Option<String>,
+  pub bundle_path: PathBuf,
+}
+
+/// Meta file for a `(url, version)` download: `<xxh3-64>.url.json` in the
+/// cache dir. The stored entry echoes url/version so a hash collision reads
+/// as a miss instead of serving the wrong bundle.
+fn url_meta_path(url: &str, version: Option<&str>) -> PathBuf {
+  let mut hasher = Xxh3::default();
+  hasher.update(url.as_bytes());
+  hasher.update(b"\0");
+  hasher.update(version.unwrap_or("").as_bytes());
+  cache_dir().join(format!("{:016x}.url.json", hasher.digest()))
+}
+
+/// Looks up the recorded download for `(url, version)`. A hit touches both
+/// the meta file and the referenced bundle so the TTL sweep sees them as
+/// used; a meta file whose bundle was swept (or that fails to parse) is
+/// removed and reads as a miss.
+pub async fn url_cache_lookup(
+  url: String,
+  version: Option<String>,
+) -> Result<Option<UrlCacheEntry>, anyhow::Error> {
+  fs::IO_RT
+    .spawn_blocking(move || url_cache_lookup_blocking(&url, version.as_deref()))
+    .await
+    .context("the bundle cache lookup task failed")?
+}
+
+fn url_cache_lookup_blocking(
+  url: &str,
+  version: Option<&str>,
+) -> Result<Option<UrlCacheEntry>, anyhow::Error> {
+  sweep_once();
+  let meta_path = url_meta_path(url, version);
+  let bytes = match std::fs::read(&meta_path) {
+    Ok(bytes) => bytes,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(e) => {
+      return Err(e).with_context(|| {
+        format!("failed to read the url manifest at {}", meta_path.display())
+      });
+    }
+  };
+
+  let Ok(entry) = serde_json::from_slice::<UrlCacheEntry>(&bytes) else {
+    let _ = std::fs::remove_file(&meta_path);
+    return Ok(None);
+  };
+  if entry.url != url || entry.version.as_deref() != version {
+    return Ok(None);
+  }
+  if !touch(&entry.bundle_path) {
+    let _ = std::fs::remove_file(&meta_path);
+    return Ok(None);
+  }
+  let _ = touch(&meta_path);
+  Ok(Some(entry))
+}
+
+/// Records a finished download in the url manifest (atomic tmp+rename;
+/// replaces any previous entry for the same `(url, version)`).
+pub async fn url_cache_record(
+  entry: UrlCacheEntry,
+) -> Result<(), anyhow::Error> {
+  fs::IO_RT
+    .spawn_blocking(move || url_cache_record_blocking(&entry))
+    .await
+    .context("the bundle cache record task failed")?
+}
+
+fn url_cache_record_blocking(
+  entry: &UrlCacheEntry,
+) -> Result<(), anyhow::Error> {
+  let dir = cache_dir();
+  std::fs::create_dir_all(&dir).with_context(|| {
+    format!("failed to create the bundle cache dir at {}", dir.display())
+  })?;
+  let dest = url_meta_path(&entry.url, entry.version.as_deref());
+  let tmp = tmp_path(&dir, "urlmeta");
+  let json = serde_json::to_vec(entry)
+    .context("failed to serialize the url manifest entry")?;
+  std::fs::write(&tmp, json)
+    .and_then(|_| std::fs::rename(&tmp, &dest))
+    .inspect_err(|_| {
+      let _ = std::fs::remove_file(&tmp);
+    })
+    .with_context(|| {
+      format!("failed to write the url manifest at {}", dest.display())
+    })?;
+  Ok(())
 }
 
 /// Incremental spill of a streamed bundle: chunks are hashed (xxh3) while
@@ -366,4 +478,93 @@ fn parse_bundle(path: &Path) -> Result<SharedBundle, anyhow::Error> {
     npm_snapshot: eszip.npm_snapshot,
     data_section: Arc::new(data_section),
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// One test fn (not several) because `cache_dir()` reads a process-global
+  /// env var and cargo runs test fns concurrently.
+  #[test]
+  fn url_manifest_roundtrip_and_invalidation() {
+    let dir = tempfile::tempdir().unwrap();
+    // SAFETY: single-threaded at this point in the test binary aside from
+    // other tests, none of which read FLOW_BUNDLE_CACHE_DIR.
+    unsafe {
+      std::env::set_var("FLOW_BUNDLE_CACHE_DIR", dir.path());
+    }
+
+    let bundle_path = dir.path().join("cafebabe.eszip");
+    std::fs::write(&bundle_path, b"not a real bundle").unwrap();
+
+    let entry = UrlCacheEntry {
+      url: "https://example.com/app.eszip".into(),
+      version: None,
+      etag: Some("\"abc\"".into()),
+      last_modified: None,
+      bundle_path: bundle_path.clone(),
+    };
+
+    // Miss before anything is recorded.
+    assert!(
+      url_cache_lookup_blocking(&entry.url, None)
+        .unwrap()
+        .is_none()
+    );
+
+    // Record → hit, with the validators intact.
+    url_cache_record_blocking(&entry).unwrap();
+    let hit = url_cache_lookup_blocking(&entry.url, None)
+      .unwrap()
+      .unwrap();
+    assert_eq!(hit.bundle_path, bundle_path);
+    assert_eq!(hit.etag.as_deref(), Some("\"abc\""));
+
+    // A versioned entry for the same url is a distinct key.
+    assert!(
+      url_cache_lookup_blocking(&entry.url, Some("1.0.0"))
+        .unwrap()
+        .is_none()
+    );
+    let versioned = UrlCacheEntry {
+      version: Some("1.0.0".into()),
+      etag: None,
+      ..entry.clone()
+    };
+    url_cache_record_blocking(&versioned).unwrap();
+    assert!(
+      url_cache_lookup_blocking(&entry.url, Some("1.0.0"))
+        .unwrap()
+        .is_some()
+    );
+    // ... and re-recording it replaces rather than duplicates.
+    url_cache_record_blocking(&versioned).unwrap();
+
+    // The unversioned entry is still there and independent.
+    assert!(
+      url_cache_lookup_blocking(&entry.url, None)
+        .unwrap()
+        .is_some()
+    );
+
+    // A swept-away bundle turns the entry into a miss and drops the meta.
+    std::fs::remove_file(&bundle_path).unwrap();
+    assert!(
+      url_cache_lookup_blocking(&entry.url, None)
+        .unwrap()
+        .is_none()
+    );
+    assert!(!url_meta_path(&entry.url, None).exists());
+
+    // Corrupt meta reads as a miss and is cleaned up.
+    let meta = url_meta_path(&entry.url, Some("2.0.0"));
+    std::fs::write(&meta, b"{ not json").unwrap();
+    assert!(
+      url_cache_lookup_blocking(&entry.url, Some("2.0.0"))
+        .unwrap()
+        .is_none()
+    );
+    assert!(!meta.exists());
+  }
 }
