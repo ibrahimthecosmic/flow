@@ -37,6 +37,9 @@ const {
   op_eszip_spill_write,
   op_eszip_unbundle_next,
   op_eszip_unbundle_open,
+  op_eszip_cache_ingest_path,
+  op_eszip_cache_stats,
+  op_eszip_url_cache_evict,
   op_eszip_url_cache_lookup,
   op_eszip_url_cache_record,
   op_flow_events_accept,
@@ -101,8 +104,12 @@ class UserWorker {
 // Pumps a ReadableStream<Uint8Array> eszip into the runtime's bundle cache
 // via the spill ops; resolves with the content-addressed cache path. On any
 // error the spill resource is closed, which unlinks its temp file.
-async function spillEszipStream(stream) {
-  const rid = await op_eszip_spill_open();
+// `sizeHint` (bytes, when known up front; 0 = unknown) lets the cache clear
+// space under its size cap before the stream lands.
+async function spillEszipStream(stream, sizeHint = 0) {
+  const rid = await op_eszip_spill_open(
+    Number.isFinite(sizeHint) && sizeHint > 0 ? sizeHint : 0,
+  );
   try {
     for await (const chunk of stream) {
       if (!(chunk instanceof Uint8Array)) {
@@ -120,14 +127,15 @@ async function spillEszipStream(stream) {
   }
 }
 
-// In-flight downloads keyed by `url\0version` — concurrent create() calls for
-// the same bundle share one fetch (the main isolate is single-threaded, so a
-// plain Map is race-free). Entries are removed on settle; later calls go
-// through the on-disk manifest instead.
+// In-flight downloads keyed by `(cacheKey ?? url)\0version` — concurrent
+// create() calls for the same bundle share one fetch (the main isolate is
+// single-threaded, so a plain Map is race-free). Entries are removed on
+// settle; later calls go through the on-disk manifest instead.
 const inflightEszipDownloads = new Map();
 
-// Resolves the `{ url, headers?, version? }` form of `maybeEszip` to a
-// bundle-cache path, downloading at most once per (url, version):
+// Resolves the `{ url, headers?, version?, cacheKey? }` form of `maybeEszip`
+// to a bundle-cache path, downloading at most once per manifest key
+// `(cacheKey ?? url, version)`:
 //   - `version` set + manifest hit -> cached path, no network (immutable pin);
 //   - no `version` + manifest hit  -> conditional GET (If-None-Match /
 //     If-Modified-Since); 304 reuses the cached file, a network error or 5xx
@@ -135,7 +143,16 @@ const inflightEszipDownloads = new Map();
 //     rejects (an authoritative revocation should stop new boots);
 //   - miss -> plain GET, streamed into the bundle cache, then recorded in the
 //     manifest with the response's ETag/Last-Modified.
-async function fetchEszipUrl({ url, headers, version }) {
+// `cacheKey` decouples the manifest key from the URL: callers that set it
+// assert every url they pass with that key is an interchangeable view of one
+// resource, which makes rotating presigned URLs cacheable. The fetch itself
+// always uses THIS call's url + headers.
+// `forceMiss` skips the manifest lookup (a plain GET that re-records): used
+// to self-heal when the LRU evicted a blob between a manifest hit and the
+// worker actually opening it.
+async function fetchEszipUrl({ url, headers, version, cacheKey }, {
+  forceMiss = false,
+} = {}) {
   const parsed = new URL(url);
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new TypeError(
@@ -145,14 +162,29 @@ async function fetchEszipUrl({ url, headers, version }) {
   if (version != null && typeof version !== "string") {
     throw new TypeError("a maybeEszip version must be a string");
   }
+  if (
+    cacheKey != null && (typeof cacheKey !== "string" || cacheKey === "")
+  ) {
+    throw new TypeError(
+      "a maybeEszip cacheKey must be a non-empty string",
+    );
+  }
 
-  const flightKey = `${url}\0${version ?? ""}`;
+  // Mirror the Rust manifest-key namespaces (a cacheKey never collides with
+  // a plain url even when the strings are equal).
+  const flightKey = `${cacheKey != null ? `k\0${cacheKey}` : `u\0${url}`}\0${
+    version ?? ""
+  }`;
   const inflight = inflightEszipDownloads.get(flightKey);
-  if (inflight) {
+  if (inflight && !forceMiss) {
     return await inflight;
   }
   const download = (async () => {
-    const cached = await op_eszip_url_cache_lookup(url, version ?? null);
+    const cached = forceMiss ? null : await op_eszip_url_cache_lookup(
+      url,
+      cacheKey ?? null,
+      version ?? null,
+    );
     if (cached && version != null) {
       return cached.bundlePath;
     }
@@ -205,9 +237,13 @@ async function fetchEszipUrl({ url, headers, version }) {
       throw new Error(`the eszip response from ${url} has no body`);
     }
 
-    const bundlePath = await spillEszipStream(res.body);
+    const bundlePath = await spillEszipStream(
+      res.body,
+      Number(res.headers.get("content-length")),
+    );
     await op_eszip_url_cache_record({
       url,
+      cacheKey: cacheKey ?? null,
       version: version ?? null,
       etag: res.headers.get("etag"),
       lastModified: res.headers.get("last-modified"),
@@ -247,10 +283,13 @@ async function createUserWorker(opts) {
   // The op requires `servicePath` (it doubles as the pool key). An eszip
   // carries its own entrypoint, so for an eszip-only create the path has no
   // directory meaning - default it instead of failing deserialization. The
-  // URL form has a natural identity, so it defaults to the URL itself:
-  // distinct URLs get distinct workers under the per_worker pool policy.
+  // URL form has a natural identity, so it defaults to `cacheKey ?? url`:
+  // a rotating presigned url with a stable cacheKey keeps one pool identity,
+  // while distinct resources get distinct workers under per_worker policy.
   if (readyOptions.servicePath == null) {
-    readyOptions.servicePath = isEszipUrl ? maybeEszip.url : "";
+    readyOptions.servicePath = isEszipUrl
+      ? (maybeEszip.cacheKey ?? maybeEszip.url)
+      : "";
   }
 
   // The op takes eszip bytes (`maybeEszip`) or an on-disk path
@@ -267,7 +306,23 @@ async function createUserWorker(opts) {
     readyOptions.maybeEszip = undefined;
   }
 
-  const [key, _reused, mainPortRid] = await op_user_worker_create(readyOptions);
+  let key, mainPortRid;
+  try {
+    [key, , mainPortRid] = await op_user_worker_create(readyOptions);
+  } catch (e) {
+    // A URL boot can race the LRU: the manifest hit hands out a blob path,
+    // the cap eviction unlinks it before the worker opens it. Self-heal by
+    // re-downloading once (plain GET, manifest re-recorded) and retrying.
+    const evictedUnderUs = isEszipUrl &&
+      String(e?.message ?? e).includes("failed to open the eszip bundle");
+    if (!evictedUnderUs) {
+      throw e;
+    }
+    readyOptions.maybeEszipPath = await fetchEszipUrl(maybeEszip, {
+      forceMiss: true,
+    });
+    [key, , mainPortRid] = await op_user_worker_create(readyOptions);
+  }
   const port = mainPortRid != null ? createMessagePort(mainPortRid) : null;
   return new UserWorker(key, port);
 }
@@ -532,6 +587,65 @@ function unbundle(eszip, output) {
   return emitter;
 }
 
+// `FlowRuntime.bundleCache`: embedder controls over the on-disk bundle cache
+// that URL/bytes/stream `maybeEszip` boots share. `put` seeds an entry
+// without a download (a publish pipeline hands over the bundle it just
+// built), `evict` drops a superseded version immediately instead of waiting
+// out the TTL, `stats` reads the size accounting behind
+// FLOW_BUNDLE_CACHE_MAX_SIZE.
+function validateBundleCacheKey({ cacheKey, version } = {}) {
+  if (typeof cacheKey !== "string" || cacheKey === "") {
+    throw new TypeError("a bundleCache cacheKey must be a non-empty string");
+  }
+  if (version != null && typeof version !== "string") {
+    throw new TypeError("a bundleCache version must be a string");
+  }
+  return { cacheKey, version: version ?? null };
+}
+
+const bundleCache = {
+  async put(source, opts) {
+    const { cacheKey, version } = validateBundleCacheKey(opts);
+    let bundlePath;
+    if (typeof source === "string") {
+      // A path source is MOVED into the cache (rename; copy+unlink across
+      // filesystems) — build the bundle in a temp file and hand it over.
+      bundlePath = await op_eszip_cache_ingest_path(source);
+    } else if (source instanceof Uint8Array) {
+      const rid = await op_eszip_spill_open(source.byteLength);
+      try {
+        await op_eszip_spill_write(rid, source);
+        bundlePath = await op_eszip_spill_finish(rid);
+      } catch (e) {
+        core.tryClose(rid);
+        throw e;
+      }
+    } else if (source instanceof ReadableStream) {
+      bundlePath = await spillEszipStream(source);
+    } else {
+      throw new TypeError(
+        "a bundleCache.put source must be a path string, Uint8Array, or ReadableStream",
+      );
+    }
+    await op_eszip_url_cache_record({
+      url: null,
+      cacheKey,
+      version,
+      etag: null,
+      lastModified: null,
+      bundlePath,
+    });
+    return { bundlePath };
+  },
+  async evict(opts) {
+    const { cacheKey, version } = validateBundleCacheKey(opts);
+    return await op_eszip_url_cache_evict(cacheKey, version);
+  },
+  async stats() {
+    return await op_eszip_cache_stats();
+  },
+};
+
 // The main isolate is not created via `userWorkers.create`, so its `context`
 // is always empty - the getter exists so `FlowRuntime.context` reads the same
 // way in both isolates (a worker sees what its create() passed).
@@ -547,6 +661,7 @@ define("FlowRuntime", {
   events,
   bundle,
   unbundle,
+  bundleCache,
   get context() {
     return HOST_CONTEXT;
   },

@@ -152,6 +152,17 @@ fn install_flow_embedding() {
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     let relay_cmd_tx = flow_events::spawn_events_relay(events_rx);
 
+    // Bundle-cache activity (LRU/explicit evictions, over-cap admissions,
+    // TTL sweeps) rides the same event stream so embedders can observe it
+    // via `FlowRuntime.events`. deno_facade only knows the type-erased
+    // sink; the WorkerEvents mapping lives here.
+    deno_facade::bundle_cache::set_event_sink(Box::new({
+      let events_tx = events_tx.clone();
+      move |event| {
+        let _ = events_tx.send(flow_events::bundle_cache_event(event));
+      }
+    }));
+
     let (_metric_src, worker_pool_tx) = create_user_worker_pool(
       Arc::new(server_flags),
       policy,

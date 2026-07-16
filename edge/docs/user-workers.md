@@ -167,32 +167,84 @@ Whatever the input form, the bundle is served **from disk, not from memory**:
 cache directory**; `string` paths are used in place and bypass the cache
 entirely.
 
-| Environment variable         | Default                 | Meaning                                      |
-| ---------------------------- | ----------------------- | -------------------------------------------- |
-| `FLOW_BUNDLE_CACHE_DIR`      | `<tmpdir>/flow-bundles` | Where spilled bundles land                   |
-| `FLOW_BUNDLE_CACHE_TTL_SECS` | `604800` (7 days)       | Age (by mtime) after which entries are swept |
+| Environment variable         | Default                 | Meaning                                             |
+| ---------------------------- | ----------------------- | --------------------------------------------------- |
+| `FLOW_BUNDLE_CACHE_DIR`      | `<tmpdir>/flow-bundles` | Where spilled bundles land                          |
+| `FLOW_BUNDLE_CACHE_TTL_SECS` | `604800` (7 days)       | Age (by mtime) after which entries are swept        |
+| `FLOW_BUNDLE_CACHE_MAX_SIZE` | unset (uncapped)        | Soft size cap in bytes; LRU eviction under pressure |
 
 Behaviors:
 
 - Entries are named `<xxh3-64-of-content>.eszip`, so **identical bundles
   converge on a single file** no matter how many times (or from how many
   concurrent `create()` calls) they are submitted. A cache hit just refreshes
-  the file's mtime.
+  the file's mtime (the persistent LRU clock).
 - Writes are atomic (temp file + rename); a crashed or aborted spill leaves only
   a `*.tmp` file that the sweep removes after an hour.
-- The sweep runs at most once per process, on first cache use, and unlinks
-  `*.eszip` entries older than the TTL. Deleting a cache entry out from under a
-  **running** worker is harmless on Unix — the worker holds an open file handle
-  — but a later `create()` with the same bytes rewrites it.
+- **Every admission** (a spill, a URL download, a `bundleCache.put`) runs the
+  maintenance pass: expired `*.eszip` entries, dead `*.url.json` manifests and
+  stale temp files are swept, and — when `FLOW_BUNDLE_CACHE_MAX_SIZE` is set —
+  least-recently-used bundles are evicted until the incoming one fits. Pure
+  reads (cache hits, worker boots) never pay for a directory scan.
+- **Pinning**: bundles backing live workers are never LRU-evicted (the runtime
+  tracks which files have open shared parses; no API involved). The cap is
+  _soft_: when eviction can't make room — everything else is pinned, or one
+  bundle alone exceeds the cap — the admission proceeds over cap with a warning
+  instead of failing the worker boot. A download's `Content-Length` is used to
+  clear space _before_ the bytes land.
+- Deleting a cache entry out from under a **running** worker is harmless on Unix
+  — the worker holds an open file handle — but a later `create()` with the same
+  bytes rewrites it. (On Windows, unlinking an open file fails; the eviction
+  skips it and retries on a later admission.)
+
+#### `FlowRuntime.bundleCache`
+
+Embedder controls over the same cache, for hosts that manage bundles themselves
+(see the [URL form](#loading-from-a-url) for `cacheKey`):
+
+```ts
+// Publish pipeline: seed the cache with the bundle you just built —
+// the first boot via URL then needs no download at all. A path source
+// is MOVED into the cache (rename); bytes/streams are spilled.
+await FlowRuntime.bundleCache.put(tmpPath, {
+  cacheKey: "flows/42/bundles/1337.eszip",
+  version: "1337",
+});
+
+// Supersede: drop the exact (cacheKey, version) entry immediately
+// instead of waiting out the TTL. Live workers are unaffected; new
+// creates miss and re-download. Resolves false when nothing matched.
+await FlowRuntime.bundleCache.evict({
+  cacheKey: "flows/42/bundles/1336.eszip",
+  version: "1336",
+});
+
+// Accounting behind the cap (maxBytes null when uncapped; pinnedBytes
+// is the portion backing live workers).
+const { totalBytes, entryCount, maxBytes, pinnedBytes } = await FlowRuntime
+  .bundleCache.stats();
+```
+
+Seed `put` **with a `version`**: an unversioned seed has no HTTP validators, so
+URL boots against it always re-fetch.
+
+Cache activity is observable: LRU/explicit evictions, over-cap admissions and
+TTL sweeps are logged (`log` at info/warn) and emitted on `FlowRuntime.events`
+as `event_type: "BundleCache"` events
+(`action: "evicted" | "overCap" |
+"sweep"`, with byte counts; envelope
+`metadata` fields are `null` — the cache is runtime-global, not tied to a
+worker).
 
 ### Loading from a URL
 
-The `{ url, headers?, version? }` form makes the runtime download the bundle
-itself (http/https only) and stream it straight into the bundle cache — the
-bundle never materializes in memory, and a failed download (non-2xx, network
+The `{ url, headers?, version?, cacheKey? }` form makes the runtime download the
+bundle itself (http/https only) and stream it straight into the bundle cache —
+the bundle never materializes in memory, and a failed download (non-2xx, network
 error) rejects `create()` with the URL and status. Alongside the blob, the
 runtime records a small manifest entry (`<xxh3-64>.url.json` in the cache dir,
-same TTL sweep) keyed by `(url, version)` so repeated creates skip the network:
+same TTL sweep) keyed by `(cacheKey ?? url, version)` so repeated creates skip
+the network:
 
 - **With `version`** (an opaque string): a cached `(url, version)` download is
   reused with **no network request at all** — npm-style immutable semantics.
@@ -206,14 +258,39 @@ same TTL sweep) keyed by `(url, version)` so repeated creates skip the network:
   5xx) and a cached copy exists, the worker boots from the cache with a warning
   on stderr. A definitive 4xx (`404`/`403`/`401`) rejects even with a cached
   copy — an authoritative revocation stops new boots.
+- **`cacheKey`** (a non-empty opaque string) replaces the url in the cache key.
+  Bearer-style auth rotates a _header_, which the cache key already ignores —
+  but object stores (S3/GCS/Azure) sign the _URL itself_, so every presign
+  produces a different url and would miss the cache forever. With a stable
+  `cacheKey` (e.g. the object key) plus an immutable `version`, each node
+  downloads a published bundle **once**, no matter how many presigned urls point
+  at it:
+
+  ```ts
+  await FlowRuntime.userWorkers.create({
+    maybeEszip: {
+      url: await presign("flows/42/bundles/1337.eszip"), // rotates per call
+      cacheKey: "flows/42/bundles/1337.eszip", //          stable identity
+      version: "1337", //                                  immutable pin
+    },
+  });
+  ```
+
+  Setting `cacheKey` asserts that every url used with it is an interchangeable
+  view of one resource. cacheKey-keyed entries live in their own namespace (a
+  key that happens to equal some url never collides), and the recorded
+  `ETag`/`Last-Modified` revalidate whichever url the next `create()` supplies.
+  Seed or drop entries without a download via
+  [`FlowRuntime.bundleCache`](#flowruntimebundlecache).
 - `headers` (any `HeadersInit`) are sent on every request but are **not** part
   of the cache key — rotating a token never invalidates the cache. Redirects
   follow standard `fetch` semantics (note: `Authorization` is dropped on
   cross-origin redirects).
-- Concurrent `create()` calls for the same `(url, version)` share a single
-  in-flight download.
-- With no explicit `servicePath`, the URL string becomes the pool key (instead
-  of `""`), so creates for different URLs never collide in the worker pool.
+- Concurrent `create()` calls for the same `(cacheKey ?? url, version)` share a
+  single in-flight download.
+- With no explicit `servicePath`, `cacheKey ?? url` becomes the pool key
+  (instead of `""`), so creates for different resources never collide in the
+  worker pool — and a rotating presigned url keeps one pool identity.
 
 ### Sharing across workers
 

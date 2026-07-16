@@ -742,6 +742,9 @@ const NOT_IMPORTED_OPS = [
   "op_eszip_spill_finish",
   "op_eszip_url_cache_lookup",
   "op_eszip_url_cache_record",
+  "op_eszip_cache_ingest_path",
+  "op_eszip_url_cache_evict",
+  "op_eszip_cache_stats",
 ];
 
 function removeImportedOps() {

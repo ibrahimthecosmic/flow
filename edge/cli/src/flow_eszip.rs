@@ -352,12 +352,17 @@ impl Resource for EszipSpillResource {
 }
 
 /// Opens a spill file in the bundle cache and returns its resource id.
+/// `size_hint` (e.g. a download's `Content-Length`; `0` = unknown) lets the
+/// cache make room under its size cap before the bytes start landing.
 #[op2]
 #[smi]
 async fn op_eszip_spill_open(
   state: Rc<RefCell<OpState>>,
+  #[number] size_hint: u64,
 ) -> Result<ResourceId, JsErrorBox> {
-  let spill = SpillFile::create().await.map_err(generic_err)?;
+  let spill = SpillFile::create((size_hint > 0).then_some(size_hint))
+    .await
+    .map_err(generic_err)?;
   Ok(state.borrow_mut().resource_table.add(EszipSpillResource {
     spill: AsyncRefCell::new(Some(spill)),
   }))
@@ -404,26 +409,65 @@ async fn op_eszip_spill_finish(
   Ok(path.to_string_lossy().into_owned())
 }
 
-/// Looks up the bundle-cache manifest entry recorded for a `(url, version)`
-/// eszip download (see `fetchEszipUrl` in flow_main.js). `None` means the
-/// URL must be (re-)downloaded.
+/// Looks up the bundle-cache manifest entry recorded for a
+/// `(cacheKey ?? url, version)` eszip download (see `fetchEszipUrl` in
+/// flow_main.js). `None` means the URL must be (re-)downloaded.
 #[op2]
 #[serde]
 async fn op_eszip_url_cache_lookup(
   #[string] url: String,
+  #[string] cache_key: Option<String>,
   #[string] version: Option<String>,
 ) -> Result<Option<UrlCacheEntry>, JsErrorBox> {
-  deno_facade::bundle_cache::url_cache_lookup(url, version)
+  deno_facade::bundle_cache::url_cache_lookup(url, cache_key, version)
     .await
     .map_err(generic_err)
 }
 
-/// Records a finished `(url, version)` download in the bundle-cache manifest.
+/// Records a finished `(cacheKey ?? url, version)` download in the
+/// bundle-cache manifest.
 #[op2]
 async fn op_eszip_url_cache_record(
   #[serde] entry: UrlCacheEntry,
 ) -> Result<(), JsErrorBox> {
   deno_facade::bundle_cache::url_cache_record(entry)
+    .await
+    .map_err(generic_err)
+}
+
+/// Moves a locally built bundle file into the content-addressed cache and
+/// returns the blob path (`FlowRuntime.bundleCache.put` with a path source;
+/// the source file is consumed).
+#[op2]
+#[string]
+async fn op_eszip_cache_ingest_path(
+  #[string] path: String,
+) -> Result<String, JsErrorBox> {
+  let dest = deno_facade::bundle_cache::ingest_path(PathBuf::from(path))
+    .await
+    .map_err(generic_err)?;
+  Ok(dest.to_string_lossy().into_owned())
+}
+
+/// Drops the manifest for `(cacheKey, version)` and its blob when nothing
+/// else references it (`FlowRuntime.bundleCache.evict`). Returns whether an
+/// entry was removed.
+#[op2]
+async fn op_eszip_url_cache_evict(
+  #[string] cache_key: String,
+  #[string] version: Option<String>,
+) -> Result<bool, JsErrorBox> {
+  deno_facade::bundle_cache::url_cache_evict(cache_key, version)
+    .await
+    .map_err(generic_err)
+}
+
+/// Point-in-time bundle-cache numbers (`FlowRuntime.bundleCache.stats`).
+#[op2]
+#[serde]
+async fn op_eszip_cache_stats()
+-> Result<deno_facade::bundle_cache::BundleCacheStats, JsErrorBox> {
+  deno_facade::bundle_cache::stats()
     .await
     .map_err(generic_err)
 }
@@ -443,6 +487,9 @@ deno_core::extension!(
     op_eszip_spill_write,
     op_eszip_spill_finish,
     op_eszip_url_cache_lookup,
-    op_eszip_url_cache_record
+    op_eszip_url_cache_record,
+    op_eszip_cache_ingest_path,
+    op_eszip_url_cache_evict,
+    op_eszip_cache_stats
   ],
 );

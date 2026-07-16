@@ -249,10 +249,10 @@ declare interface FlowUserWorkerCreateOptions {
    *   canonical path share one parsed header and file handle.
    * - `ReadableStream<Uint8Array>`: streamed into the bundle cache chunk by
    *   chunk without ever materializing the whole bundle in memory.
-   * - `{ url, headers?, version? }`: the bundle is downloaded over http(s)
-   *   and streamed into the bundle cache; a failed download (non-2xx,
-   *   network error) rejects `create()`. Downloads are cached on disk keyed
-   *   by `(url, version)`:
+   * - `{ url, headers?, version?, cacheKey? }`: the bundle is downloaded
+   *   over http(s) and streamed into the bundle cache; a failed download
+   *   (non-2xx, network error) rejects `create()`. Downloads are cached on
+   *   disk keyed by `(cacheKey ?? url, version)`:
    *   - With a `version` (an opaque string — bump it to force a re-fetch), a
    *     cached download is reused with NO network request, npm-style
    *     immutable semantics.
@@ -261,14 +261,24 @@ declare interface FlowUserWorkerCreateOptions {
    *     `ETag`/`Last-Modified`); `304` reuses the cached file. If the
    *     revalidation itself fails transiently (network error or 5xx) the
    *     cached copy is used with a warning, but a definitive 4xx rejects.
+   *   - `cacheKey` (a non-empty opaque string) replaces the url in the
+   *     cache key. Set it when the SAME resource is fetched through
+   *     CHANGING urls — presigned S3/GCS/Azure urls rotate their signature
+   *     query on every presign — so a `version`-pinned bundle still hits
+   *     the cache with zero network. Setting `cacheKey` asserts that every
+   *     url used with it is an interchangeable view of one resource; the
+   *     recorded `ETag`/`Last-Modified` revalidate whichever url the next
+   *     `create()` supplies. Seed or drop entries programmatically via
+   *     {@linkcode FlowRuntime.bundleCache}.
    *   - `headers` (any `HeadersInit`, e.g. an `Authorization` token) are
    *     sent on every request but are NOT part of the cache key. Redirects
    *     follow `fetch` semantics (auth headers are dropped cross-origin).
-   *   - Concurrent creates for the same `(url, version)` share one
-   *     download; cache entries age out with the bundle-cache TTL sweep and
-   *     are then simply re-downloaded.
-   *   With no explicit `servicePath`, the URL string becomes the pool key
-   *   (instead of `""`), so different URLs never collide in the pool.
+   *   - Concurrent creates for the same key share one download; cache
+   *     entries age out with the bundle-cache TTL sweep and are then simply
+   *     re-downloaded.
+   *   With no explicit `servicePath`, `cacheKey ?? url` becomes the pool
+   *   key (instead of `""`), so different resources never collide in the
+   *   pool and a rotating presigned url keeps one pool identity.
    *
    * Bundles built with a checksum (`flow eszip bundle --checksum`) are
    * verified on every module read; corruption fails the worker's module
@@ -281,7 +291,12 @@ declare interface FlowUserWorkerCreateOptions {
     | Uint8Array
     | string
     | ReadableStream<Uint8Array>
-    | { url: string; headers?: HeadersInit; version?: string }
+    | {
+      url: string;
+      headers?: HeadersInit;
+      version?: string;
+      cacheKey?: string;
+    }
     | null;
   /** Entrypoint override for `servicePath` builds: a path resolved against
    * `servicePath`, or a full URL. NOT an override for eszip boots — a
@@ -479,18 +494,40 @@ declare interface FlowWorkerEventEnvelope<Type extends string, Payload> {
   metadata: FlowWorkerEventMetadata;
 }
 
+/** Runtime-global bundle-cache activity (`event_type: "BundleCache"`; its
+ * envelope `metadata` fields are all `null` — the cache is not tied to a
+ * worker). Emitted for LRU/explicit evictions, over-cap admissions, and TTL
+ * sweeps. */
+declare interface FlowBundleCacheEvent {
+  action: "evicted" | "overCap" | "sweep";
+  /** The manifest key, when the action targeted one (explicit
+   * `bundleCache.evict`). */
+  cache_key: string | null;
+  /** The blob file involved, when the action targeted one. */
+  path: string | null;
+  /** Bytes the action acted on (evicted/swept bytes; the incoming bundle
+   * size for `overCap`). */
+  bytes: number;
+  /** Cache total after the action. */
+  total_bytes: number;
+  /** The configured `FLOW_BUNDLE_CACHE_MAX_SIZE`, when set. */
+  max_bytes: number | null;
+}
+
 /**
  * A user-worker lifecycle/log event yielded by `FlowRuntime.events`.
  * Discriminate on `event_type` to narrow `event`. Per worker, the stream is
  * `Boot` (possibly followed by `BootFailure`), then any number of `Log` /
- * `UncaughtException`, then a final `Shutdown`.
+ * `UncaughtException`, then a final `Shutdown`. Runtime-global
+ * `BundleCache` events are interleaved as cache activity happens.
  */
 declare type FlowWorkerEvent =
   | FlowWorkerEventEnvelope<"Log", FlowLogEvent>
   | FlowWorkerEventEnvelope<"Boot", FlowBootEvent>
   | FlowWorkerEventEnvelope<"BootFailure", FlowBootFailureEvent>
   | FlowWorkerEventEnvelope<"UncaughtException", FlowUncaughtExceptionEvent>
-  | FlowWorkerEventEnvelope<"Shutdown", FlowShutdownEvent>;
+  | FlowWorkerEventEnvelope<"Shutdown", FlowShutdownEvent>
+  | FlowWorkerEventEnvelope<"BundleCache", FlowBundleCacheEvent>;
 
 /** Options for `FlowRuntime.bundle` (the programmatic twin of
  * `flow eszip bundle`). */
@@ -629,6 +666,50 @@ declare const FlowRuntime: {
     eszip: string | Uint8Array | ArrayBuffer | ReadableStream<Uint8Array>,
     output?: string,
   ): FlowUnbundled;
+
+  /**
+   * Embedder controls over the on-disk bundle cache shared by every
+   * `maybeEszip` form (`$FLOW_BUNDLE_CACHE_DIR`; TTL-swept per
+   * `$FLOW_BUNDLE_CACHE_TTL_SECS`, LRU-capped per
+   * `$FLOW_BUNDLE_CACHE_MAX_SIZE`). Blobs backing LIVE workers are never
+   * LRU-evicted (in-process pinning); on Unix even an explicit `evict`
+   * only stops NEW boots — running workers keep serving from their open
+   * file handle.
+   */
+  bundleCache: {
+    /**
+     * Seeds the cache without a download: stores the bundle and records it
+     * under `(cacheKey, version)`, exactly as if `{ url, cacheKey, version }`
+     * had just fetched it — a publish pipeline that built the bundle locally
+     * skips the later re-download. A `string` source is a path whose file is
+     * **MOVED** into the cache (rename; copy+unlink across filesystems);
+     * bytes/stream sources are spilled like their `maybeEszip` forms. Seed
+     * WITH a `version` for the zero-network immutable path — an unversioned
+     * seed has no HTTP validators, so URL boots against it always re-fetch.
+     */
+    put(
+      source: string | Uint8Array | ReadableStream<Uint8Array>,
+      opts: { cacheKey: string; version?: string },
+    ): Promise<{ bundlePath: string }>;
+    /**
+     * Drops the exact `(cacheKey, version)` entry (omitted `version`
+     * targets the unversioned entry) and its blob when nothing else
+     * references it. Space frees immediately unless live workers hold the
+     * blob open. Resolves with whether an entry existed. Use when a
+     * republish supersedes a version — new boots miss instead of waiting
+     * out the TTL.
+     */
+    evict(opts: { cacheKey: string; version?: string }): Promise<boolean>;
+    /** Point-in-time cache accounting (`maxBytes` is `null` when
+     * `$FLOW_BUNDLE_CACHE_MAX_SIZE` is unset; `pinnedBytes` is the portion
+     * backing live workers). */
+    stats(): Promise<{
+      totalBytes: number;
+      entryCount: number;
+      maxBytes: number | null;
+      pinnedBytes: number;
+    }>;
+  };
 
   /**
    * The JSON `context` this worker/isolate was created with (deep-frozen,

@@ -66,6 +66,7 @@ invocation.
 | `FLOW_ESZIP_CHECKSUM`                      | Default for `flow eszip bundle --checksum`                                                                                                         |
 | `FLOW_BUNDLE_CACHE_DIR`                    | Where `maybeEszip` bytes/streams are spilled to disk. Default: `<tmpdir>/flow-bundles` (see [user-workers.md](./user-workers.md#the-bundle-cache)) |
 | `FLOW_BUNDLE_CACHE_TTL_SECS`               | Age after which bundle-cache entries are swept. Default: `604800` (7 days)                                                                         |
+| `FLOW_BUNDLE_CACHE_MAX_SIZE`               | Soft bundle-cache size cap in bytes: admissions LRU-evict unpinned entries to fit under it. Default: unset (uncapped)                              |
 | `DENO_NO_DEPRECATION_WARNINGS`             | Suppress deprecated-API warnings inside user workers                                                                                               |
 | `DENO_VERBOSE_WARNINGS`                    | Verbose deprecated-API warnings inside user workers                                                                                                |
 

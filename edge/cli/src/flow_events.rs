@@ -141,9 +141,39 @@ fn print_inherit(ev: &WorkerEventWithMetadata) {
     WorkerEvents::UncaughtException(e) => {
       write_inherit(std::io::stderr().lock(), &e.exception)
     }
-    other @ (WorkerEvents::Boot(_) | WorkerEvents::Shutdown(_)) => {
+    other @ (WorkerEvents::Boot(_)
+    | WorkerEvents::Shutdown(_)
+    | WorkerEvents::BundleCache(_)) => {
       log::debug!("flow: worker event: {other:?}");
     }
+  }
+}
+
+/// Maps a bundle-cache notice onto the worker-event stream shape
+/// (`FlowRuntime.events` yields it as `event_type: "BundleCache"` with
+/// empty metadata — it is runtime-global, not tied to a worker).
+pub fn bundle_cache_event(
+  event: deno_facade::bundle_cache::CacheEvent,
+) -> WorkerEventWithMetadata {
+  use deno_facade::bundle_cache::CacheEventAction;
+
+  WorkerEventWithMetadata {
+    event: WorkerEvents::BundleCache(
+      ext_event_worker::events::BundleCacheEvent {
+        action: match event.action {
+          CacheEventAction::Evicted => "evicted",
+          CacheEventAction::OverCap => "overCap",
+          CacheEventAction::Sweep => "sweep",
+        }
+        .to_string(),
+        cache_key: event.cache_key,
+        path: event.path.map(|it| it.to_string_lossy().into_owned()),
+        bytes: event.bytes,
+        total_bytes: event.total_bytes,
+        max_bytes: event.max_bytes,
+      },
+    ),
+    metadata: Default::default(),
   }
 }
 

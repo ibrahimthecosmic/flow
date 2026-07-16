@@ -74,6 +74,26 @@ impl From<u8> for LogLevel {
   }
 }
 
+/// flow: runtime-global bundle-cache activity (LRU/TTL eviction, explicit
+/// evict, over-cap admission) relayed on the same stream as worker events.
+/// Not tied to a worker — its `metadata` is empty. `action` is one of
+/// `"evicted"`, `"overCap"`, `"sweep"`.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct BundleCacheEvent {
+  pub action: String,
+  /// The manifest key, when the action targeted one (explicit evict).
+  pub cache_key: Option<String>,
+  /// The blob file involved, when the action targeted one.
+  pub path: Option<String>,
+  /// Bytes the action acted on (evicted/swept bytes; the incoming bundle
+  /// size for `overCap`).
+  pub bytes: u64,
+  /// Cache total after the action.
+  pub total_bytes: u64,
+  /// The configured cap, when one is set.
+  pub max_bytes: Option<u64>,
+}
+
 #[derive(Serialize, Deserialize, Debug, EnumAsInner)]
 pub enum WorkerEvents {
   Boot(BootEvent),
@@ -81,6 +101,8 @@ pub enum WorkerEvents {
   UncaughtException(UncaughtExceptionEvent),
   Shutdown(ShutdownEvent),
   Log(LogEvent),
+  /// flow: bundle-cache activity (see [`BundleCacheEvent`]).
+  BundleCache(BundleCacheEvent),
 }
 
 impl WorkerEvents {

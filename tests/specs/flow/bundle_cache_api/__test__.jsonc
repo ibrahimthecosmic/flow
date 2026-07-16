@@ -1,0 +1,22 @@
+{
+  "tempDir": true,
+  "tests": {
+    "api": {
+      "envs": {
+        "FLOW_BUNDLE_CACHE_DIR": "./bundle-cache"
+      },
+      "args": "run -A api.js",
+      "output": "api.out"
+    },
+    "lru_cap": {
+      "envs": {
+        "FLOW_BUNDLE_CACHE_DIR": "./bundle-cache-lru",
+        // 1 byte: every admission is over cap, so LRU eviction and the
+        // over-cap warning path both fire deterministically.
+        "FLOW_BUNDLE_CACHE_MAX_SIZE": "1"
+      },
+      "args": "run -A lru_cap.js",
+      "output": "lru_cap.out"
+    }
+  }
+}
