@@ -25,6 +25,7 @@
   },
   "excludes": [
     ".cargo_home",
+    ".claude",
     ".git",
     "cli/tsc/*typescript.js",
     "cli/tsc/dts/lib.d.ts",

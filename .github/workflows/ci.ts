@@ -570,7 +570,9 @@ const buildItems = handleBuildItems([{
   ...Runners.linuxX86Xl,
   profile: "release",
   use_sysroot: true,
-  wpt: isNotTag,
+  // isPr (not isNotTag): keeps wpt dormant on the new `main`-push trigger —
+  // main pushes only lint + build + save cache.
+  wpt: isPr,
 } // Option A (edge/plans/ci-option-a-lean-tag-pipeline.md): debug build disabled.
   // On the tags-only trigger its test consumers (all isNotTag-gated) never run,
   // so the debug artifacts are unused. Re-enable together with a PR/main trigger.
@@ -698,9 +700,11 @@ const buildJobs = buildItems.map((rawBuildItem) => {
             sysRootStep,
           )(
             {
-              // do this on PRs as well as main so that PRs can use the cargo build cache from main
+              // isPr (not isNotTag): a `main`-push build must be flag-identical
+              // to a tag build, or the cache it saves would make the next tag
+              // build recompile everything DENO_CANARY touches.
               name: "Configure canary build",
-              if: isNotTag,
+              if: isPr,
               run: 'echo "DENO_CANARY=true" >> $GITHUB_ENV',
             },
             {
@@ -900,7 +904,9 @@ const buildJobs = buildItems.map((rawBuildItem) => {
           matrix: testMatrix,
           failFast: false,
         },
-        steps: step.if(isNotTag.and(buildItem.skip.not()).and(shouldRunShard))(
+        // isPr (not isNotTag): stays dormant on `main`-push runs (lean
+        // pipeline — see the `on:` comment).
+        steps: step.if(isPr.and(buildItem.skip.not()).and(shouldRunShard))(
           cloneRepoStep,
           cloneSubmodule("./tests/node_compat/runner/suite")
             .if(testCrateNameExpr.equals("node_compat")),
@@ -986,7 +992,7 @@ const buildJobs = buildItems.map((rawBuildItem) => {
           {
             name: "Upload test results",
             uses: "actions/upload-artifact@v6",
-            if: conditions.status.always().and(isNotTag),
+            if: conditions.status.always().and(isPr),
             with: {
               name:
                 `test-results-${buildItem.os}-${buildItem.arch}-${buildItem.profile}-${testMatrix.test_crate}${
@@ -1022,7 +1028,8 @@ const buildJobs = buildItems.map((rawBuildItem) => {
       needs: [buildJob],
       runsOn: buildItem.testRunner ?? buildItem.runner,
       timeoutMinutes: 30,
-      steps: step.if(isNotTag.and(buildItem.skip.not()))(
+      // isPr (not isNotTag): dormant on `main`-push runs.
+      steps: step.if(isPr.and(buildItem.skip.not()))(
         cloneRepoStep,
         restoreCacheStep,
         installNodeStep,
@@ -1070,7 +1077,8 @@ const buildJobs = buildItems.map((rawBuildItem) => {
         timeoutMinutes: 30,
         defaults,
         env,
-        steps: step.if(isNotTag.and(buildItem.skip.not()))(
+        // isPr (not isNotTag): dormant on `main`-push runs.
+        steps: step.if(isPr.and(buildItem.skip.not()))(
           cloneRepoStep,
           cloneStdSubmoduleStep,
           cloneSubmodule("./tests/wpt/suite"),
@@ -1230,7 +1238,8 @@ const denoCoreTestJob = job("deno-core-test", {
     RUST_BACKTRACE: "full",
     RUST_LIB_BACKTRACE: 0,
   },
-  steps: step.if(isNotTag)(
+  // isPr (not isNotTag): dormant on `main`-push runs.
+  steps: step.if(isPr)(
     cloneRepoStep,
     denoCoreTestCacheSteps.restoreCacheStep,
     installRustStep,
@@ -1298,7 +1307,8 @@ const denoCoreMiriJob = job("deno-core-miri", {
     RUST_BACKTRACE: "full",
     RUST_LIB_BACKTRACE: 0,
   },
-  steps: step.if(isNotTag)(
+  // isPr (not isNotTag): dormant on `main`-push runs.
+  steps: step.if(isPr)(
     cloneRepoStep,
     {
       name: "Install Rust (nightly)",
@@ -1356,9 +1366,18 @@ const workflow = createWorkflow({
     // flow builds from its OWN release tags (`vX.Y.Z`), never Deno's — upstream
     // tags are not imported. A build is produced when a commit on `main` is
     // tagged: either a Flow fix/feature developed on `main`, or a completed Deno
-    // upgrade merged back into `main`. Branch pushes (`main`, `upgrade/*`, and
-    // the `deno` mirror) do not trigger CI.
+    // upgrade merged back into `main`.
+    //
+    // `main` pushes run a LEAN pipeline (lint + release build + cache save,
+    // no publish, no test/wpt jobs — those are isPr-gated). This exists
+    // because GitHub cache isolation only lets a run restore caches created
+    // on ITS OWN ref or the DEFAULT branch: caches saved by one tag's run are
+    // invisible to the next tag (v2.12.0 built fully cold this way, ~39 min).
+    // Building on `main` saves the cache where every later tag build can
+    // restore it, and surfaces lint failures BEFORE a release is tagged
+    // (v2.12.0's lint failed only at tag time).
     push: {
+      branches: ["main"],
       tags: ["v*"],
     },
   },
