@@ -267,6 +267,9 @@ async fn bundle(sub: &clap::ArgMatches) -> Result<ExitCode, Error> {
     None,
     maybe_checksum_kind,
     Some(static_pattern_refs),
+    // `flow eszip bundle` is a trusted CLI operation; static globbing is left
+    // unconfined (the servicePath sandbox boundary applies to worker boots).
+    None,
     Some(exclude_patterns),
   );
 

@@ -26,6 +26,18 @@ pub struct PrefixFs<FileSystem> {
   base_fs: Option<Arc<dyn deno_fs::FileSystem>>,
   runtime_state: Option<Arc<RuntimeState>>,
   check_sync_api: bool,
+  /// Subtrees that, despite matching `prefix`, are delegated to `base_fs`
+  /// (with the original, unstripped path) rather than to `fs`. Used to carve
+  /// the servicePath workdir out of the `/tmp` scratch overlay: an unbundled
+  /// worker boot anchors its root at the real workdir (needed for real
+  /// filenames in stack traces + inspector attach), which for some embedders
+  /// (e.g. a `Deno.makeTempDir()` workdir) happens to live under `/tmp` — the
+  /// same prefix the writable tmp overlay claims. Without this carve-out, every
+  /// `Deno.readFile` of a bundled static asset under the workdir is swallowed
+  /// by the tmp overlay and never reaches `StaticFs`. Empty for every layer
+  /// except where explicitly set, and never matches when the servicePath is
+  /// not under this layer's `prefix`.
+  exclusions: Vec<PathBuf>,
 }
 
 impl<FileSystem> PrefixFs<FileSystem>
@@ -48,7 +60,28 @@ where
       base_fs,
       runtime_state: None,
       check_sync_api: false,
+      exclusions: Vec::new(),
     }
+  }
+
+  /// Registers subtrees that must fall through to `base_fs` even when they
+  /// match this layer's `prefix`. See the `exclusions` field.
+  pub fn exclude<I, P>(mut self, dirs: I) -> Self
+  where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+  {
+    self
+      .exclusions
+      .extend(dirs.into_iter().map(|p| p.as_ref().to_path_buf()));
+    self
+  }
+
+  /// True when `path` sits under this layer's `prefix` but not under any
+  /// carved-out exclusion, i.e. this layer's `fs` should serve it.
+  fn owns(&self, path: &Path) -> bool {
+    path.starts_with(&self.prefix)
+      && !self.exclusions.iter().any(|e| path.starts_with(e))
   }
 
   pub fn cwd<P>(mut self, v: P) -> Self
@@ -123,6 +156,9 @@ where
       tmp_dir: self.tmp_dir.take(),
       runtime_state: self.runtime_state.clone(),
       check_sync_api: self.check_sync_api,
+      // The new outer layer has its own (empty) exclusions; the layer being
+      // wrapped keeps its exclusions inside `base_fs`.
+      exclusions: Vec::new(),
       base_fs: Some(Arc::new(self)),
     }
   }
@@ -152,7 +188,7 @@ where
   }
 
   fn chdir(&self, path: &CheckedPath) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.chdir(&checked)
@@ -179,7 +215,7 @@ where
     options: OpenOptions,
   ) -> FsResult<Rc<dyn File>> {
     self.check_sync_api_allowed("open_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.open_sync(&checked, options)
@@ -199,7 +235,7 @@ where
     path: CheckedPathBuf,
     options: OpenOptions,
   ) -> FsResult<Rc<dyn File>> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.open_async(checked, options).await
@@ -217,7 +253,7 @@ where
     mode: Option<u32>,
   ) -> FsResult<()> {
     self.check_sync_api_allowed("mkdir_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.mkdir_sync(&checked, recursive, mode)
@@ -236,7 +272,7 @@ where
     recursive: bool,
     mode: Option<u32>,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.mkdir_async(checked, recursive, mode).await
@@ -250,7 +286,7 @@ where
   #[cfg(unix)]
   fn chmod_sync(&self, path: &CheckedPath, mode: u32) -> FsResult<()> {
     self.check_sync_api_allowed("chmod_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.chmod_sync(&checked, mode)
@@ -266,7 +302,7 @@ where
   #[cfg(not(unix))]
   fn chmod_sync(&self, path: &CheckedPath, mode: i32) -> FsResult<()> {
     self.check_sync_api_allowed("chmod_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.chmod_sync(&checked, mode)
@@ -281,7 +317,7 @@ where
 
   #[cfg(unix)]
   async fn chmod_async(&self, path: CheckedPathBuf, mode: u32) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.chmod_async(checked, mode).await
@@ -294,7 +330,7 @@ where
 
   #[cfg(not(unix))]
   async fn chmod_async(&self, path: CheckedPathBuf, mode: i32) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.chmod_async(checked, mode).await
@@ -308,7 +344,7 @@ where
   #[cfg(unix)]
   fn lchmod_sync(&self, path: &CheckedPath, mode: u32) -> FsResult<()> {
     self.check_sync_api_allowed("lchmod_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.lchmod_sync(&checked, mode)
@@ -324,7 +360,7 @@ where
   #[cfg(not(unix))]
   fn lchmod_sync(&self, path: &CheckedPath, mode: i32) -> FsResult<()> {
     self.check_sync_api_allowed("lchmod_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.lchmod_sync(&checked, mode)
@@ -343,7 +379,7 @@ where
     path: CheckedPathBuf,
     mode: u32,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.lchmod_async(checked, mode).await
@@ -360,7 +396,7 @@ where
     path: CheckedPathBuf,
     mode: i32,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.lchmod_async(checked, mode).await
@@ -378,7 +414,7 @@ where
     gid: Option<u32>,
   ) -> FsResult<()> {
     self.check_sync_api_allowed("chown_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.chown_sync(&checked, uid, gid)
@@ -397,7 +433,7 @@ where
     uid: Option<u32>,
     gid: Option<u32>,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.chown_async(checked, uid, gid).await
@@ -415,7 +451,7 @@ where
     gid: Option<u32>,
   ) -> FsResult<()> {
     self.check_sync_api_allowed("lchown_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.lchown_sync(&checked, uid, gid)
@@ -434,7 +470,7 @@ where
     uid: Option<u32>,
     gid: Option<u32>,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.lchown_async(checked, uid, gid).await
@@ -447,7 +483,7 @@ where
 
   fn remove_sync(&self, path: &CheckedPath, recursive: bool) -> FsResult<()> {
     self.check_sync_api_allowed("remove_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.remove_sync(&checked, recursive)
@@ -465,7 +501,7 @@ where
     path: CheckedPathBuf,
     recursive: bool,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.remove_async(checked, recursive).await
@@ -478,7 +514,7 @@ where
 
   fn rmdir_sync(&self, path: &CheckedPath) -> FsResult<()> {
     self.check_sync_api_allowed("rmdir_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.rmdir_sync(&checked)
@@ -492,7 +528,7 @@ where
   }
 
   async fn rmdir_async(&self, path: CheckedPathBuf) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.rmdir_async(checked).await
@@ -510,8 +546,8 @@ where
   ) -> FsResult<()> {
     self.check_sync_api_allowed("copy_file_sync")?;
 
-    let oldpath_matches = oldpath.starts_with(&self.prefix);
-    let newpath_matches = newpath.starts_with(&self.prefix);
+    let oldpath_matches = self.owns(oldpath.as_ref());
+    let newpath_matches = self.owns(newpath.as_ref());
     if oldpath_matches || newpath_matches {
       let old_stripped;
       let old = if oldpath_matches {
@@ -546,8 +582,8 @@ where
     oldpath: CheckedPathBuf,
     newpath: CheckedPathBuf,
   ) -> FsResult<()> {
-    let oldpath_matches = oldpath.starts_with(&self.prefix);
-    let newpath_matches = newpath.starts_with(&self.prefix);
+    let oldpath_matches = self.owns(oldpath.as_ref());
+    let newpath_matches = self.owns(newpath.as_ref());
     if oldpath_matches || newpath_matches {
       self
         .fs
@@ -580,8 +616,8 @@ where
   ) -> FsResult<()> {
     self.check_sync_api_allowed("cp_sync")?;
 
-    let path_matches = path.starts_with(&self.prefix);
-    let new_path_matches = new_path.starts_with(&self.prefix);
+    let path_matches = self.owns(path.as_ref());
+    let new_path_matches = self.owns(new_path.as_ref());
     if path_matches || new_path_matches {
       let p_stripped;
       let p = if path_matches {
@@ -616,8 +652,8 @@ where
     path: CheckedPathBuf,
     new_path: CheckedPathBuf,
   ) -> FsResult<()> {
-    let path_matches = path.starts_with(&self.prefix);
-    let new_path_matches = new_path.starts_with(&self.prefix);
+    let path_matches = self.owns(path.as_ref());
+    let new_path_matches = self.owns(new_path.as_ref());
     if path_matches || new_path_matches {
       let p = if path_matches {
         let stripped = path.strip_prefix(&self.prefix).unwrap();
@@ -641,7 +677,7 @@ where
 
   fn stat_sync(&self, path: &CheckedPath) -> FsResult<FsStat> {
     self.check_sync_api_allowed("stat_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.stat_sync(&checked)
@@ -655,7 +691,7 @@ where
   }
 
   async fn stat_async(&self, path: CheckedPathBuf) -> FsResult<FsStat> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.stat_async(checked).await
@@ -668,7 +704,7 @@ where
 
   fn lstat_sync(&self, path: &CheckedPath) -> FsResult<FsStat> {
     self.check_sync_api_allowed("lstat_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.lstat_sync(&checked)
@@ -682,7 +718,7 @@ where
   }
 
   async fn lstat_async(&self, path: CheckedPathBuf) -> FsResult<FsStat> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.lstat_async(checked).await
@@ -695,7 +731,7 @@ where
 
   fn realpath_sync(&self, path: &CheckedPath) -> FsResult<PathBuf> {
     self.check_sync_api_allowed("realpath_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       // the inner fs resolves mount-relative paths; restore the mount prefix
@@ -713,7 +749,7 @@ where
   }
 
   async fn realpath_async(&self, path: CheckedPathBuf) -> FsResult<PathBuf> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       // the inner fs resolves mount-relative paths; restore the mount prefix
@@ -731,7 +767,7 @@ where
 
   fn read_dir_sync(&self, path: &CheckedPath) -> FsResult<Vec<FsDirEntry>> {
     self.check_sync_api_allowed("read_dir_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.read_dir_sync(&checked)
@@ -748,7 +784,7 @@ where
     &self,
     path: CheckedPathBuf,
   ) -> FsResult<deno_fs::FsReadDirRc> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.read_dir_async(checked).await
@@ -764,7 +800,7 @@ where
     path: &CheckedPath,
     bigint: bool,
   ) -> FsResult<deno_io::fs::FsStatFs> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.statfs_sync(&checked, bigint)
@@ -782,7 +818,7 @@ where
     path: CheckedPathBuf,
     bigint: bool,
   ) -> FsResult<deno_io::fs::FsStatFs> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.statfs_async(checked, bigint).await
@@ -800,8 +836,8 @@ where
   ) -> FsResult<()> {
     self.check_sync_api_allowed("rename_sync")?;
 
-    let oldpath_matches = oldpath.starts_with(&self.prefix);
-    let newpath_matches = newpath.starts_with(&self.prefix);
+    let oldpath_matches = self.owns(oldpath.as_ref());
+    let newpath_matches = self.owns(newpath.as_ref());
     if oldpath_matches || newpath_matches {
       let old_stripped;
       let old = if oldpath_matches {
@@ -836,8 +872,8 @@ where
     oldpath: CheckedPathBuf,
     newpath: CheckedPathBuf,
   ) -> FsResult<()> {
-    let oldpath_matches = oldpath.starts_with(&self.prefix);
-    let newpath_matches = newpath.starts_with(&self.prefix);
+    let oldpath_matches = self.owns(oldpath.as_ref());
+    let newpath_matches = self.owns(newpath.as_ref());
     if oldpath_matches || newpath_matches {
       self
         .fs
@@ -870,8 +906,8 @@ where
   ) -> FsResult<()> {
     self.check_sync_api_allowed("link_sync")?;
 
-    let oldpath_matches = oldpath.starts_with(&self.prefix);
-    let newpath_matches = newpath.starts_with(&self.prefix);
+    let oldpath_matches = self.owns(oldpath.as_ref());
+    let newpath_matches = self.owns(newpath.as_ref());
     if oldpath_matches || newpath_matches {
       let old_stripped;
       let old = if oldpath_matches {
@@ -906,8 +942,8 @@ where
     oldpath: CheckedPathBuf,
     newpath: CheckedPathBuf,
   ) -> FsResult<()> {
-    let oldpath_matches = oldpath.starts_with(&self.prefix);
-    let newpath_matches = newpath.starts_with(&self.prefix);
+    let oldpath_matches = self.owns(oldpath.as_ref());
+    let newpath_matches = self.owns(newpath.as_ref());
     if oldpath_matches || newpath_matches {
       self
         .fs
@@ -941,8 +977,8 @@ where
   ) -> FsResult<()> {
     self.check_sync_api_allowed("symlink_sync")?;
 
-    let oldpath_matches = oldpath.starts_with(&self.prefix);
-    let newpath_matches = newpath.starts_with(&self.prefix);
+    let oldpath_matches = self.owns(oldpath.as_ref());
+    let newpath_matches = self.owns(newpath.as_ref());
     if oldpath_matches || newpath_matches {
       if oldpath_matches && newpath_matches {
         let old_stripped = oldpath.strip_prefix(&self.prefix).unwrap();
@@ -974,8 +1010,8 @@ where
     newpath: CheckedPathBuf,
     file_type: Option<FsFileType>,
   ) -> FsResult<()> {
-    let oldpath_matches = oldpath.starts_with(&self.prefix);
-    let newpath_matches = newpath.starts_with(&self.prefix);
+    let oldpath_matches = self.owns(oldpath.as_ref());
+    let newpath_matches = self.owns(newpath.as_ref());
     if oldpath_matches || newpath_matches {
       self
         .fs
@@ -1004,7 +1040,7 @@ where
 
   fn read_link_sync(&self, path: &CheckedPath) -> FsResult<PathBuf> {
     self.check_sync_api_allowed("read_link_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.read_link_sync(&checked)
@@ -1018,7 +1054,7 @@ where
   }
 
   async fn read_link_async(&self, path: CheckedPathBuf) -> FsResult<PathBuf> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.read_link_async(checked).await
@@ -1031,7 +1067,7 @@ where
 
   fn truncate_sync(&self, path: &CheckedPath, len: u64) -> FsResult<()> {
     self.check_sync_api_allowed("truncate_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.truncate_sync(&checked, len)
@@ -1049,7 +1085,7 @@ where
     path: CheckedPathBuf,
     len: u64,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.truncate_async(checked, len).await
@@ -1069,7 +1105,7 @@ where
     mtime_nanos: u32,
   ) -> FsResult<()> {
     self.check_sync_api_allowed("utime_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.utime_sync(
@@ -1098,7 +1134,7 @@ where
     mtime_secs: i64,
     mtime_nanos: u32,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self
@@ -1122,7 +1158,7 @@ where
     mtime_nanos: u32,
   ) -> FsResult<()> {
     self.check_sync_api_allowed("lutime_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.lutime_sync(
@@ -1151,7 +1187,7 @@ where
     mtime_secs: i64,
     mtime_nanos: u32,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self
@@ -1173,7 +1209,7 @@ where
     data: &[u8],
   ) -> FsResult<()> {
     self.check_sync_api_allowed("write_file_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.write_file_sync(&checked, options, data)
@@ -1192,7 +1228,7 @@ where
     options: OpenOptions,
     data: Box<[u8]>,
   ) -> FsResult<()> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.write_file_async(checked, options, data).await
@@ -1209,7 +1245,7 @@ where
     options: OpenOptions,
   ) -> FsResult<Cow<'static, [u8]>> {
     self.check_sync_api_allowed("read_file_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.read_file_sync(&checked, options)
@@ -1227,7 +1263,7 @@ where
     path: CheckedPathBuf,
     options: OpenOptions,
   ) -> FsResult<Cow<'static, [u8]>> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.read_file_async(checked, options).await
@@ -1242,7 +1278,7 @@ where
     if self.check_sync_api_allowed("is_file_sync").is_err() {
       return false;
     }
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.is_file_sync(&checked)
@@ -1259,7 +1295,7 @@ where
     if self.check_sync_api_allowed("is_dir_sync").is_err() {
       return false;
     }
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.is_dir_sync(&checked)
@@ -1276,7 +1312,7 @@ where
     if self.check_sync_api_allowed("exists_sync").is_err() {
       return false;
     }
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.exists_sync(&checked)
@@ -1290,7 +1326,7 @@ where
   }
 
   async fn exists_async(&self, path: CheckedPathBuf) -> FsResult<bool> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       Ok(true)
     } else if let Some(fs) = self.base_fs.as_ref() {
       fs.exists_async(path).await
@@ -1304,7 +1340,7 @@ where
     path: &CheckedPath,
   ) -> FsResult<Cow<'static, str>> {
     self.check_sync_api_allowed("read_text_file_lossy_sync")?;
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPath::unsafe_new(Cow::Borrowed(stripped));
       self.fs.read_text_file_lossy_sync(&checked)
@@ -1321,7 +1357,7 @@ where
     &'a self,
     path: CheckedPathBuf,
   ) -> FsResult<Cow<'static, str>> {
-    if path.starts_with(&self.prefix) {
+    if self.owns(path.as_ref()) {
       let stripped = path.strip_prefix(&self.prefix).unwrap();
       let checked = CheckedPathBuf::unsafe_new(stripped.to_path_buf());
       self.fs.read_text_file_lossy_async(checked).await

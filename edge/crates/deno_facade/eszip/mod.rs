@@ -1099,6 +1099,11 @@ pub async fn generate_binary_eszip(
   maybe_module_code: Option<FastString>,
   maybe_checksum: Option<eszip::v2::Checksum>,
   maybe_static_patterns: Option<Vec<&str>>,
+  // Confinement root for `maybe_static_patterns` (the servicePath workdir for
+  // on-the-fly worker boots). When set, static files that resolve outside it
+  // are refused; see `include_glob_patterns_in_eszip`. `None` = unconfined
+  // (trusted CLI / `FlowRuntime.bundle`).
+  maybe_static_root: Option<&Path>,
   // Specifiers/globs to leave out of the bundle; each match is emitted as a
   // bare import to be resolved at runtime, and its subtree is pruned unless
   // also reachable from a non-excluded module.
@@ -1426,6 +1431,7 @@ pub async fn generate_binary_eszip(
       metadata,
       static_patterns,
       root_dir_url,
+      maybe_static_root,
     )?;
   }
 
@@ -1441,35 +1447,133 @@ fn include_glob_patterns_in_eszip(
   metadata: &mut Metadata,
   patterns: Vec<&str>,
   relative_file_base: EszipRelativeFileBaseUrl<'_>,
+  // Security boundary for on-the-fly (unbundled) worker boots: when set, only
+  // files that resolve — *after* symlink canonicalization — to a location
+  // within this directory are embedded. Any match outside it (an absolute or
+  // `..`-bearing pattern, or a symlink pointing out of the tree) is dropped
+  // with a warning. Because a sandboxed worker can read back exactly what was
+  // embedded (and nothing else — `StaticFs` has no real-disk fallback), the
+  // embed step IS the enforcement point: an un-embedded file can never be
+  // read. `None` (trusted CLI / `FlowRuntime.bundle`) keeps the historical
+  // unconfined behavior.
+  confinement_root: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
-  let cwd = std::env::current_dir();
+  // Fail closed: if a confinement root was requested but cannot be resolved,
+  // embed nothing rather than risk leaking out-of-root files.
+  let canonical_root = match confinement_root {
+    Some(root) => match std::fs::canonicalize(root) {
+      Ok(root) => Some(root),
+      Err(err) => {
+        log::warn!(
+          "static assets: confinement root {} could not be resolved ({}); \
+           skipping all static patterns",
+          root.display(),
+          err
+        );
+        metadata.static_asset_specifiers = vec![];
+        return Ok(());
+      }
+    },
+    None => None,
+  };
+
+  let cwd = std::env::current_dir()?;
   let mut specifiers: Vec<String> = vec![];
 
   for pattern in patterns {
-    for entry in glob(pattern).expect("Failed to read pattern") {
-      match entry {
-        Ok(path) => {
-          let path = cwd.as_ref().unwrap().join(path);
-          let path_url = Url::from_file_path(&path)
-            .map_err(|_| anyhow!("failed to convert to file path from url"))?;
-          let relative_path = relative_file_base.specifier_key(&path_url);
+    let entries = match glob(pattern) {
+      Ok(entries) => entries,
+      Err(err) => {
+        log::error!("invalid static-file pattern {pattern}: {err}");
+        continue;
+      }
+    };
 
-          if path.exists() && path.is_file() {
-            let specifier = format!("static:{}", relative_path);
-
-            eszip.add_opaque_data(
-              specifier.clone(),
-              Arc::from(std::fs::read(path).unwrap().into_boxed_slice()),
-            );
-
-            specifiers.push(specifier);
-          }
-        }
-
-        Err(_) => {
-          log::error!("Error reading pattern {} for static files", pattern)
+    for entry in entries {
+      let path = match entry {
+        Ok(path) => cwd.join(path),
+        Err(err) => {
+          log::error!(
+            "error reading pattern {pattern} for static files: {err}"
+          );
+          continue;
         }
       };
+
+      if !(path.exists() && path.is_file()) {
+        continue;
+      }
+
+      // Resolve symlinks/`..` before the containment test so a link inside the
+      // root cannot redirect to a target outside it.
+      let resolved = match std::fs::canonicalize(&path) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+          log::warn!(
+            "static assets: cannot canonicalize {}: {}",
+            path.display(),
+            err
+          );
+          continue;
+        }
+      };
+
+      if let Some(root) = &canonical_root
+        && !resolved.starts_with(root)
+      {
+        log::warn!(
+          "static assets: refusing to embed {} — outside the servicePath root {}",
+          resolved.display(),
+          root.display()
+        );
+        continue;
+      }
+
+      // Build the specifier key so it round-trips through the load-side
+      // `Metadata::static_assets_lookup`, which does
+      // `normalize_path(base.join(Url::parse(specifier).path()))`.
+      //
+      // When a confinement root is set (servicePath / unbundled boots), key the
+      // asset RELATIVE TO THAT ROOT. The alternative — `relative_file_base`
+      // (the module graph's workspace `root_dir_url`) — is NOT the servicePath
+      // for on-the-fly builds (a workdir with no `deno.json` resolves its
+      // workspace root elsewhere), so `specifier_key` fails to relativize and
+      // yields an absolute `file://` URL; the load side then parses that back
+      // as the specifier's path and joins it onto the real root, producing a
+      // garbage key (`<workdir>/file:///<workdir>/assets/...`) that no read can
+      // ever match. The confinement root, by contrast, is exactly the base the
+      // load side rebases against (`root_path` == canonicalized servicePath),
+      // so a root-relative key round-trips cleanly. Containment above already
+      // guarantees `resolved` is within `root`, so `strip_prefix` succeeds.
+      let specifier = match &canonical_root {
+        Some(root) => {
+          let rel = resolved.strip_prefix(root).unwrap_or(&resolved);
+          format!("static:{}", rel.to_string_lossy())
+        }
+        None => {
+          let path_url = Url::from_file_path(&path)
+            .map_err(|_| anyhow!("failed to convert to file path from url"))?;
+          format!("static:{}", relative_file_base.specifier_key(&path_url))
+        }
+      };
+
+      let bytes = match std::fs::read(&resolved) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+          log::error!(
+            "static assets: failed to read {}: {}",
+            resolved.display(),
+            err
+          );
+          continue;
+        }
+      };
+
+      eszip.add_opaque_data(
+        specifier.clone(),
+        Arc::from(bytes.into_boxed_slice()),
+      );
+      specifiers.push(specifier);
     }
   }
 

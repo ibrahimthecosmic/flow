@@ -78,6 +78,7 @@ async fn generate_test_eszip(
     maybe_checksum,
     None,
     None,
+    None,
   )
   .await
   .unwrap();

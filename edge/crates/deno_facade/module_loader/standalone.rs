@@ -889,9 +889,28 @@ pub async fn create_module_loader_for_eszip(
   let _current_exe_name =
     current_exe_path.file_name().unwrap().to_string_lossy();
 
-  let permission_desc_parser =
-    Arc::new(RuntimePermissionDescriptorParser::new(Arc::new(RealFs)))
-      as Arc<dyn PermissionDescriptorParser>;
+  // For a servicePath boot backed by a REAL on-disk directory (unbundled/draft
+  // runs, where `service_path` is the caller's ephemeral workdir), anchor both
+  // the module loader's root AND relative-path permission resolution there
+  // instead of the synthetic sb-compile-trex placeholder / the host process's
+  // real OS cwd — otherwise relative module specifiers, StaticFs's
+  // `compile_base_dir`, and relative `Deno.readFile()` calls all resolve
+  // against a root that shares no prefix with the eszip's embedded
+  // static-asset keys (which are absolute paths rooted at the real workdir,
+  // per `staticPatterns`), so a relative read can never match. Synthetic,
+  // non-directory servicePath values (e.g. `exec:<id>`, `introspect:<id>:<uuid>`
+  // used by published/introspection boots, which load an on-disk/S3 eszip
+  // file rather than building one from a real directory) fall through to the
+  // historical behavior, unchanged.
+  let real_service_dir = service_path
+    .map(PathBuf::from)
+    .filter(|p| p.is_absolute() && p.is_dir())
+    .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir));
+
+  let permission_desc_parser = Arc::new(RuntimePermissionDescriptorParser::new(
+    Arc::new(RealFs),
+    real_service_dir.clone(),
+  )) as Arc<dyn PermissionDescriptorParser>;
   let permissions =
     Permissions::from_options(&*permission_desc_parser, &permissions_options)?;
   let permissions_container =
@@ -908,15 +927,20 @@ pub async fn create_module_loader_for_eszip(
     .transpose()?
     .unwrap_or_default();
 
-  let root_path = if cfg!(target_family = "unix") {
-    // Canonicalize /var/tmp to resolve symlinks (e.g., /var -> /private/var on macOS)
-    // This ensures VFS paths match the canonical paths Deno resolves to
-    std::fs::canonicalize("/var/tmp")
-      .unwrap_or_else(|_| PathBuf::from("/var/tmp"))
-  } else {
-    std::env::temp_dir()
-  }
-  .join("sb-compile-trex");
+  let root_path = match real_service_dir {
+    Some(dir) => dir,
+    None => {
+      if cfg!(target_family = "unix") {
+        // Canonicalize /var/tmp to resolve symlinks (e.g., /var -> /private/var on macOS)
+        // This ensures VFS paths match the canonical paths Deno resolves to
+        std::fs::canonicalize("/var/tmp")
+          .unwrap_or_else(|_| PathBuf::from("/var/tmp"))
+      } else {
+        std::env::temp_dir()
+      }
+      .join("sb-compile-trex")
+    }
+  };
 
   let node_modules = metadata.node_modules()?;
   let root_dir_url =

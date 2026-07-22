@@ -806,6 +806,9 @@ where
             // here we don't want to add extra cost, so we won't use a checksum
             None,
             Some(static_patterns.iter().map(|s| s.as_str()).collect()),
+            // Confine static-asset globbing to the servicePath workdir so a
+            // draft can't embed (and then read back) host files outside it.
+            Some(base_dir_path.as_path()),
             None,
           )
           .await?;
@@ -886,8 +889,28 @@ where
           let tmp_fs =
             TmpFs::try_from(maybe_tmp_fs_config.unwrap_or_default())?;
           let tmp_fs_actual_path = tmp_fs.actual_path().to_path_buf();
+
+          // Carve the servicePath workdir out of the writable `/tmp` overlay.
+          // Unbundled (servicePath) boots anchor the module-loader root at the
+          // real workdir so stack traces keep real filenames and the inspector
+          // can attach; some embedders place that workdir under the system temp
+          // dir (e.g. a `Deno.makeTempDir()` path under `/tmp`), which collides
+          // with the `/tmp` scratch mount. Without this, a `Deno.readFile` of a
+          // bundled static asset under the workdir would be intercepted by the
+          // tmp overlay and never reach the base fs (`StaticFs`). Both the raw
+          // and canonicalized forms are excluded so the carve-out matches
+          // however the path arrives (symlinked temp roots, etc.). When the
+          // workdir is not under `/tmp` this is an inert no-op.
+          let mut workdir_exclusions = vec![base_dir_path.clone()];
+          if let Ok(canonical) = std::fs::canonicalize(&base_dir_path) {
+            if canonical != base_dir_path {
+              workdir_exclusions.push(canonical);
+            }
+          }
+
           let mut fs = PrefixFs::new("/tmp", tmp_fs.clone(), Some(base_fs))
             .tmp_dir("/tmp")
+            .exclude(workdir_exclusions)
             .add_fs(tmp_fs_actual_path, tmp_fs);
 
           fs.set_runtime_state(&runtime_state);
@@ -3156,6 +3179,7 @@ mod test {
       None,
       None,
       None,
+      None,
     )
     .await
     .unwrap();
@@ -3230,6 +3254,7 @@ mod test {
     let binary_eszip = generate_binary_eszip(
       &mut metadata,
       Arc::new(emitter_factory),
+      None,
       None,
       None,
       None,

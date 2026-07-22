@@ -261,7 +261,7 @@ impl EmitterFactory {
   ) -> Result<&Arc<RuntimePermissionDescriptorParser>, AnyError> {
     self.permission_desc_parser.get_or_try_init(|| {
       let fs = self.fs().clone();
-      Ok(Arc::new(RuntimePermissionDescriptorParser::new(fs)))
+      Ok(Arc::new(RuntimePermissionDescriptorParser::new(fs, None)))
     })
   }
 

@@ -1,0 +1,9 @@
+{
+  "tempDir": true,
+  "tests": {
+    "static_asset_read": {
+      "args": "run -A main.js",
+      "output": "main.out"
+    }
+  }
+}

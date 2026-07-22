@@ -140,6 +140,10 @@ async fn bundle_eszip(
     maybe_code,
     maybe_checksum,
     Some(static_patterns),
+    // `FlowRuntime.bundle` is a trusted bundling op (no worker sandbox yet), so
+    // static globbing is left unconfined here; the servicePath boundary is
+    // enforced on the on-the-fly boot path in `base/src/runtime/mod.rs`.
+    None,
     Some(options.exclude),
   );
 

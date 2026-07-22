@@ -527,6 +527,34 @@ impl deno_fs::FileSystem for StaticFs {
     path: &CheckedPath,
     _options: OpenOptions,
   ) -> FsResult<Cow<'static, [u8]>> {
+    // An explicitly-registered static asset is authoritative and MUST win over
+    // the npm/VFS classification below. When the module-loader root is the real
+    // `servicePath` workdir (unbundled/draft boots), the npm VFS root
+    // (`vfs_path`) can be that same workdir — so `is_valid_npm_package` would
+    // otherwise report `true` for every workdir-relative asset (e.g.
+    // `assets/top.txt`) and route it into the asset-less VFS, surfacing a
+    // spurious "No such file or directory". Pre-bundled boots never hit this:
+    // their root is the synthetic `sb-compile-trex` placeholder, disjoint from
+    // where assets resolve, so the ordering was previously immaterial.
+    let path_buf = if path.is_relative() {
+      self.base_dir_path.join(path)
+    } else {
+      path.to_path_buf()
+    };
+    let normalized = normalize_path(Cow::Owned(path_buf));
+
+    // Try direct lookup first, then remap real source paths to compile-target paths
+    if let Some(result) = self.lookup_static_file(&normalized) {
+      return result;
+    }
+    if let Some(remapped) = self.remap_to_compile_path(&normalized) {
+      let remapped = normalize_path(Cow::Owned(remapped));
+      if let Some(result) = self.lookup_static_file(&remapped) {
+        return result;
+      }
+    }
+
+    // Not a static asset: fall back to the embedded npm/VFS package tree.
     let is_npm = self.is_valid_npm_package(path);
     let is_byonm_path = self
       .byonm_node_modules_path
@@ -538,36 +566,16 @@ impl deno_fs::FileSystem for StaticFs {
       let options = OpenOptions::read();
       let file = self.open_sync(path, options)?;
       let buf = file.read_all_sync()?;
-      Ok(buf)
-    } else {
-      let path_ref = path;
-      let path_buf = if path_ref.is_relative() {
-        self.base_dir_path.join(path_ref)
-      } else {
-        path_ref.to_path_buf()
-      };
-
-      let normalized = normalize_path(Cow::Owned(path_buf));
-
-      // Try direct lookup first, then remap real source paths to compile-target paths
-      if let Some(result) = self.lookup_static_file(&normalized) {
-        return result;
-      }
-      if let Some(remapped) = self.remap_to_compile_path(&normalized) {
-        let remapped = normalize_path(Cow::Owned(remapped));
-        if let Some(result) = self.lookup_static_file(&remapped) {
-          return result;
-        }
-      }
-
-      Err(
-        std::io::Error::new(
-          std::io::ErrorKind::NotFound,
-          format!("path not found: {}", normalized.to_string_lossy()),
-        )
-        .into(),
-      )
+      return Ok(buf);
     }
+
+    Err(
+      std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("path not found: {}", normalized.to_string_lossy()),
+      )
+      .into(),
+    )
   }
 
   async fn read_file_async<'a>(

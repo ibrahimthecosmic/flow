@@ -31,23 +31,49 @@ pub struct RuntimePermissionDescriptorParser {
     reason = "retained for the user-worker FS-sandbox permission redesign; path descriptors currently resolve via `sys`"
   )]
   fs: deno_fs::FileSystemRc,
+  /// For a worker booted with a real, on-disk `servicePath` (unbundled/draft
+  /// runs), overrides cwd resolution for relative path/run descriptors so
+  /// they resolve against the worker's logical workdir instead of the host
+  /// process's actual OS cwd — the two can differ, since many workers with
+  /// distinct `servicePath`s share one host process. `None` preserves the
+  /// historical behavior (real process cwd), used for the main worker and
+  /// synthetic-servicePath (published/introspection) boots.
+  cwd_override: Option<PathBuf>,
 }
 
 impl RuntimePermissionDescriptorParser {
-  pub fn new(fs: deno_fs::FileSystemRc) -> Self {
-    Self { sys: RealSys, fs }
+  pub fn new(fs: deno_fs::FileSystemRc, cwd_override: Option<PathBuf>) -> Self {
+    Self {
+      sys: RealSys,
+      fs,
+      cwd_override,
+    }
   }
 
   fn resolve_cwd(&self) -> Result<PathBuf, PathResolveError> {
+    if let Some(cwd) = &self.cwd_override {
+      return Ok(cwd.clone());
+    }
     sys_traits::EnvCurrentDir::env_current_dir(&self.sys)
       .map_err(PathResolveError::CwdResolve)
+  }
+
+  /// Joins a relative path against `cwd_override` (when set), so callers
+  /// that resolve cwd-relative paths via `&self.sys` internally (which has
+  /// no notion of `cwd_override`) see an already-absolute path and skip
+  /// their own real-cwd resolution.
+  fn resolve_relative<'a>(&self, path: Cow<'a, Path>) -> Cow<'a, Path> {
+    match &self.cwd_override {
+      Some(cwd) if path.is_relative() => Cow::Owned(cwd.join(path.as_ref())),
+      _ => path,
+    }
   }
 
   fn parse_path_descriptor(
     &self,
     path: Cow<'_, Path>,
   ) -> Result<PathDescriptor, PathResolveError> {
-    PathDescriptor::new(&self.sys, path)
+    PathDescriptor::new(&self.sys, self.resolve_relative(path))
   }
 }
 
@@ -141,7 +167,7 @@ impl deno_permissions::PermissionDescriptorParser
     &self,
     path: Cow<'a, Path>,
   ) -> Result<PathQueryDescriptor<'a>, PathResolveError> {
-    PathQueryDescriptor::new(&self.sys, path)
+    PathQueryDescriptor::new(&self.sys, self.resolve_relative(path))
   }
 
   fn parse_special_file_descriptor<'a>(
